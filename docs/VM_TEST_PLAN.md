@@ -290,7 +290,7 @@ Policy key: same subkey, DWORD `RequireRevocationCheck` (default 0/off, fail-clo
 5. Reinstall, uninstall again with the box UNTICKED -> CA cert, user certs
    and key container all survive.
 
-## Uninstall leftovers and wrong-PIN countdown
+## Uninstall leftovers and wrong-PIN protection
 
 Uninstall (the trace consumer service used to outlive the uninstaller's delete,
 leaving `EIDTraceConsumer.exe` and the installation folder behind):
@@ -302,12 +302,18 @@ leaving `EIDTraceConsumer.exe` and the installation folder behind):
 | L3 | Repeat L1 as a silent uninstall (`EIDUninstall.exe /S`). | Same result. | ☐ | |
 | L4 | Upgrade from **v2.1.00_TEST_REL** (whose uninstaller does not wait for the service). | Install completes with no "Error opening file for writing" prompt for `EIDTraceConsumer.exe`; after the reboot `sc query EIDTraceConsumer` is RUNNING from `C:\Program Files\OpenAccess EID\EIDTraceConsumer.exe`. | ☐ | |
 
-Wrong-PIN countdown at the logon / unlock tile:
+Wrong-PIN protection at the logon / unlock tile. Use a minidriver card (for example MyEID) whose PIN allows **8** wrong attempts and that can be unblocked with its PUK; check the count first. Rows P1-P7 use the default policies (delay from the 5th wrong PIN for 10 seconds; the card's last attempt held back).
 
 | # | Step | Expected | ✓ | Notes |
 |---|------|----------|---|-------|
-| P1 | Use a card whose PIN allows **more than 6** wrong attempts (or note the card's own limit first). Enter a wrong PIN five times. | Each is refused with the usual message; no wait between attempts. | ☐ | |
-| P2 | After the fifth, dismiss the error. | The PIN box and Submit button are hidden and the tile reads "Too many incorrect PINs. Try again in N seconds.", counting down from 10 once a second. The screen stays responsive. At 0 the PIN box comes back with focus. | ☐ | |
-| P3 | Enter a sixth wrong PIN. | Another 10-second countdown. | ☐ | |
-| P4 | During a countdown, remove the card, then re-insert it. | Removal shows "Please reconnect your smart card"; re-insertion brings the PIN box straight back with no countdown, and five more wrong PINs are allowed before the next one. | ☐ | |
-| P5 | After a countdown ends, enter the correct PIN. | Logon succeeds. A later wrong PIN starts the count from one again. | ☐ | |
+| P1 | Enter a wrong PIN four times. | Each is refused with the usual "N retries" message; no wait between attempts. | ☐ | |
+| P2 | Enter a fifth wrong PIN and dismiss the error. | The PIN box and Submit button are hidden and the tile reads "Too many incorrect PINs. Try again in N seconds.", counting down from 10 once a second. The screen stays responsive. At 0 the PIN box comes back with focus. | ☐ | |
+| P3 | Enter a sixth wrong PIN. | Another 10-second countdown (the card now has 2 attempts left). | ☐ | |
+| P4 | Enter a seventh wrong PIN. | The card has 1 attempt left: no countdown; the tile reads "This card has only 1 PIN attempt left before it is blocked. Remove the card and insert it again to try again." with no PIN box, and stays like that however long you wait. The card is **not** blocked. | ☐ | |
+| P5 | Remove the card and insert it again, then enter the correct PIN. | The PIN box comes back at once, with no countdown. Logon succeeds, and the card's retry counter is back to 8 (a later wrong PIN reports 7 retries). | ☐ | |
+| P6 | Repeat P1-P4, then during a countdown (P2) remove and re-insert the card. | The PIN box comes back at once and five more wrong PINs are allowed before the next countdown. | ☐ | |
+| P7 | Repeat until the hold (P4), re-insert, and enter a wrong PIN once more. | That one attempt is allowed and the card is now blocked ("maximum number of PIN entry attempts"). Unblock it with the PUK. | ☐ | |
+| P8 | `gpedit.msc` → Computer Configuration → Administrative Templates → Windows Components → OpenAccess EID. | "Delay PIN entry after repeated wrong PINs" (5 / 10) and "Hold back the card's last PIN attempts until it is re-inserted" (1) are listed with those defaults. | ☐ | |
+| P9 | Enable the delay with 2 wrong PINs and 20 seconds, and the hold with 3 attempts. Repeat from P1. | The countdown starts at the 2nd wrong PIN and lasts 20 seconds; the hold starts as soon as the card reports 3 attempts left. | ☐ | |
+| P10 | Enable the delay with 0 seconds and the hold with 0. Repeat from P1 (unblock afterwards). | No countdown and no hold: every wrong PIN is sent to the card, which blocks after its 8th. | ☐ | |
+| P11 | With a PIV card used through the Windows built-in PIV driver (no vendor minidriver), enter wrong PINs. | The countdown applies; the hold does not (the driver does not report remaining attempts), as documented. | ☐ | |
