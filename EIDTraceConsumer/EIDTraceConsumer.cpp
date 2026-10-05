@@ -619,7 +619,15 @@ DWORD ServiceWorkerThread(LPVOID lpParam)
             wprintf(L"ProcessTrace failed: %u\n", status);
             // Try to restart trace session
             StopTraceSession();
-            Sleep(5000);
+            // Wait before retrying, but wake at once for a stop request. With diagnostics
+            // off (the default) there is no trace to process, so the service spends most of
+            // its time here; a plain Sleep kept it - and its executable, which the
+            // uninstaller deletes straight after stopping it - running for up to five
+            // seconds after the stop had been accepted.
+            if (WaitForSingleObject(g_StopEvent, 5000) == WAIT_OBJECT_0)
+            {
+                break;
+            }
             if (!StartTraceSession())
             {
                 break;
@@ -828,6 +836,81 @@ BOOL InstallService()
     return TRUE;
 }
 
+// How long -stop and -uninstall wait for the service process to exit.
+#define SERVICE_STOP_TIMEOUT_MS 30000  // NOSONAR - MACRO-01: Windows-style macro constant retained for API/preprocessor use
+
+// Ask the service to stop (unless it already is) and wait until its process has exited.
+// The uninstaller deletes EIDTraceConsumer.exe straight after -stop / -uninstall, and the file
+// stays in use until the process is gone - which is after SERVICE_STOPPED has been reported,
+// since the process still has to unwind and exit. Returning as soon as the stop request had
+// been accepted left the executable (and so the installation folder) behind.
+// hService needs SERVICE_STOP | SERVICE_QUERY_STATUS. Returns TRUE once the process has exited.
+static BOOL StopServiceAndWait(SC_HANDLE hService)
+{
+    SERVICE_STATUS_PROCESS ssp = {};
+    DWORD cbNeeded = 0;
+    if (!QueryServiceStatusEx(hService, SC_STATUS_PROCESS_INFO, reinterpret_cast<LPBYTE>(&ssp), sizeof(ssp), &cbNeeded))  // NOSONAR - CAST-01: Win32/COM interop cast, layout-verified
+    {
+        wprintf(L"QueryServiceStatusEx failed: %d\n", GetLastError());
+        return FALSE;
+    }
+    if (ssp.dwCurrentState == SERVICE_STOPPED)
+    {
+        wprintf(L"Service is already stopped\n");
+        return TRUE;
+    }
+
+    // Open the process while the service still runs, so the PID cannot have been reused.
+    HANDLE hProcess = (ssp.dwProcessId != 0) ? OpenProcess(SYNCHRONIZE, FALSE, ssp.dwProcessId) : nullptr;
+
+    if (ssp.dwCurrentState != SERVICE_STOP_PENDING)
+    {
+        wprintf(L"Stopping service...\n");
+        SERVICE_STATUS status = {};
+        if (!ControlService(hService, SERVICE_CONTROL_STOP, &status))
+        {
+            DWORD dwError = GetLastError();
+            if (dwError != ERROR_SERVICE_NOT_ACTIVE && dwError != ERROR_SERVICE_CANNOT_ACCEPT_CTRL)
+            {
+                wprintf(L"ControlService failed: %d\n", dwError);
+                if (hProcess)
+                    CloseHandle(hProcess);
+                return FALSE;
+            }
+        }
+    }
+
+    BOOL fStopped = FALSE;
+    if (hProcess)
+    {
+        fStopped = (WaitForSingleObject(hProcess, SERVICE_STOP_TIMEOUT_MS) == WAIT_OBJECT_0);
+        CloseHandle(hProcess);
+    }
+    else
+    {
+        // No handle on the process: the stopped state is the best available signal.
+        const ULONGLONG ullDeadline = GetTickCount64() + SERVICE_STOP_TIMEOUT_MS;
+        for (;;)
+        {
+            if (QueryServiceStatusEx(hService, SC_STATUS_PROCESS_INFO, reinterpret_cast<LPBYTE>(&ssp), sizeof(ssp), &cbNeeded) &&  // NOSONAR - CAST-01: Win32/COM interop cast, layout-verified
+                ssp.dwCurrentState == SERVICE_STOPPED)
+            {
+                fStopped = TRUE;
+                break;
+            }
+            if (GetTickCount64() >= ullDeadline)
+                break;
+            Sleep(250);
+        }
+    }
+
+    if (fStopped)
+        wprintf(L"Service stopped\n");
+    else
+        wprintf(L"Service did not stop within %d seconds\n", SERVICE_STOP_TIMEOUT_MS / 1000);
+    return fStopped;
+}
+
 BOOL UninstallService()
 {
     SC_HANDLE hSCManager = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
@@ -837,10 +920,12 @@ BOOL UninstallService()
         return FALSE;
     }
 
+    // SERVICE_QUERY_STATUS is needed to wait for the stop. The service used to be opened
+    // without it, so the status read before stopping it was never filled in.
     SC_HANDLE hService = OpenServiceW(
         hSCManager,
         SERVICE_NAME,
-        DELETE | SERVICE_STOP
+        DELETE | SERVICE_STOP | SERVICE_QUERY_STATUS
     );
 
     if (!hService)
@@ -858,16 +943,9 @@ BOOL UninstallService()
         return FALSE;
     }
 
-    // Stop the service
-    SERVICE_STATUS status;
-    QueryServiceStatus(hService, &status);
-    if (status.dwCurrentState != SERVICE_STOPPED)
-    {
-        wprintf(L"Stopping service...\n");
-        ControlService(hService, SERVICE_CONTROL_STOP, &status);
-        Sleep(1000);
-        QueryServiceStatus(hService, &status);
-    }
+    // Stop the service and wait for its process to exit. Delete it even if that times out:
+    // it is then removed as soon as the process does exit.
+    StopServiceAndWait(hService);
 
     // Delete the service
     if (!DeleteService(hService))
@@ -953,30 +1031,10 @@ BOOL StopServiceWrapper()
         return FALSE;
     }
 
-    SERVICE_STATUS status;
-    QueryServiceStatus(hService, &status);
-    if (status.dwCurrentState == SERVICE_STOPPED)
-    {
-        wprintf(L"Service is already stopped\n");
-        CloseServiceHandle(hService);
-        CloseServiceHandle(hSCManager);
-        return TRUE;
-    }
-
-    wprintf(L"Stopping service...\n");
-    BOOL result = ControlService(hService, SERVICE_CONTROL_STOP, &status);
+    BOOL result = StopServiceAndWait(hService);
 
     CloseServiceHandle(hService);
     CloseServiceHandle(hSCManager);
-
-    if (result)
-    {
-        wprintf(L"Service stop requested\n");
-    }
-    else
-    {
-        wprintf(L"ControlService failed: %d\n", GetLastError());
-    }
 
     return result;
 }
