@@ -40,18 +40,24 @@ enum class GPOPolicy
   EnforceCSPWhitelist,  // Security: block CSP providers not in whitelist
   RequireCardBoundCredentials,  // Security (H3): when set, only card-wrapped (crypted) credentials may be created/used/imported
   RequireRevocationCheck,  // Security (M1): when set, "revocation unknown" (no local CRL) is a hard failure (fail-closed)
+  PinDelayThreshold,  // Logon tile: wrong PINs allowed before each further one starts a countdown
+  PinDelaySeconds,  // Logon tile: length of that countdown; 0 = no countdown
+  PinAttemptsReserved,  // Logon tile: card PIN attempts held back until the card is re-inserted; 0 = none
 };
 
 // Validates that a GPOPolicy enum value is within valid bounds to prevent array overflow
 // Marked constexpr+noexcept for compile-time evaluation and LSASS compatibility
 constexpr bool IsValidPolicy(GPOPolicy policy) noexcept
 {
-    return policy >= GPOPolicy::AllowSignatureOnlyKeys && policy <= GPOPolicy::RequireRevocationCheck;
+    return policy >= GPOPolicy::AllowSignatureOnlyKeys && policy <= GPOPolicy::PinAttemptsReserved;
 }
 
 // Compile-time validation of GPOPolicy enum bounds
 static_assert(IsValidPolicy(GPOPolicy::AllowSignatureOnlyKeys), "AllowSignatureOnlyKeys must be a valid policy");
-static_assert(IsValidPolicy(GPOPolicy::RequireRevocationCheck), "RequireRevocationCheck must be a valid policy");
+static_assert(IsValidPolicy(GPOPolicy::PinAttemptsReserved), "PinAttemptsReserved must be a valid policy");
 
+// 0 when the policy is not configured.
 DWORD GetPolicyValue(GPOPolicy Policy);
+// dwDefault when the policy is not configured, so that 0 can be a configured value.
+DWORD GetPolicyValueOrDefault(GPOPolicy Policy, DWORD dwDefault);
 BOOL SetPolicyValue(GPOPolicy Policy, DWORD dwValue);

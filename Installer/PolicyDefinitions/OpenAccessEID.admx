@@ -81,6 +81,35 @@
       <disabledValue><decimal value="0" /></disabledValue>
     </policy>
 
+    <!-- Wrong-PIN protection at the logon / unlock tile. Not configured or disabled = the
+         defaults (5 wrong PINs, then 10 seconds; 1 card attempt held back). -->
+    <policy name="PinEntryDelay"
+            class="Machine"
+            displayName="$(string.PinEntryDelay)"
+            explainText="$(string.PinEntryDelay_Help)"
+            key="SOFTWARE\Policies\Microsoft\Windows\SmartCardCredentialProvider"
+            presentation="$(presentation.PinEntryDelay)">
+      <parentCategory ref="OpenAccessEID" />
+      <supportedOn ref="SUPPORTED_EIDAuth_1_0" />
+      <elements>
+        <decimal id="PinDelayThreshold_Dec" valueName="PinDelayThreshold" minValue="1" maxValue="100" />
+        <decimal id="PinDelaySeconds_Dec" valueName="PinDelaySeconds" minValue="0" maxValue="300" />
+      </elements>
+    </policy>
+
+    <policy name="PinAttemptsReserved"
+            class="Machine"
+            displayName="$(string.PinAttemptsReserved)"
+            explainText="$(string.PinAttemptsReserved_Help)"
+            key="SOFTWARE\Policies\Microsoft\Windows\SmartCardCredentialProvider"
+            presentation="$(presentation.PinAttemptsReserved)">
+      <parentCategory ref="OpenAccessEID" />
+      <supportedOn ref="SUPPORTED_EIDAuth_1_0" />
+      <elements>
+        <decimal id="PinAttemptsReserved_Dec" valueName="PinAttemptsReserved" minValue="0" maxValue="10" />
+      </elements>
+    </policy>
+
     <!-- ============ EIDLogManager settings (SOFTWARE\Policies\OpenAccessEID\LogManager) ============ -->
 
     <policy name="LogCSVEnabled" class="Machine"

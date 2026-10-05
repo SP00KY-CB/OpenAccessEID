@@ -47,6 +47,30 @@ Note: self-signed (peer-trust) card certificates have no CRL and cannot be revoc
 
 Registry: HKLM\SOFTWARE\Policies\Microsoft\Windows\SmartCardCredentialProvider!RequireRevocationCheck (DWORD)</string>
 
+      <string id="PinEntryDelay">Delay PIN entry after repeated wrong PINs</string>
+      <string id="PinEntryDelay_Help">Slows down repeated wrong PINs at the OpenAccess EID logon and unlock tile. Once the set number of wrong PINs has been entered, each further wrong PIN hides the PIN box for the set number of seconds while the tile counts down ("Too many incorrect PINs. Try again in N seconds.").
+
+Removing the smart card and inserting it again resets the count and ends the delay at once. So does a successful logon.
+
+- Enabled: the values below apply. Set the delay to 0 to turn the delay off.
+- Disabled or not configured: the default applies - a 10-second delay after each wrong PIN from the 5th on.
+
+This delay does not change the card's own PIN retry counter, which blocks the card after the number of wrong PINs it allows. To stop typing from blocking the card, see "Hold back the card's last PIN attempts until it is re-inserted".
+
+Registry: HKLM\SOFTWARE\Policies\Microsoft\Windows\SmartCardCredentialProvider!PinDelayThreshold (DWORD, 1-100) and !PinDelaySeconds (DWORD, 0-300)</string>
+
+      <string id="PinAttemptsReserved">Hold back the card's last PIN attempts until it is re-inserted</string>
+      <string id="PinAttemptsReserved_Help">Stops wrong PINs typed at the OpenAccess EID logon and unlock tile from using up the smart card's last PIN attempts and blocking the card. A blocked card can then only be used again after it is unblocked with its PUK or by its issuer.
+
+When a wrong PIN leaves the card with this many PIN attempts or fewer, the tile stops accepting PINs and asks for the card to be removed and inserted again. Each re-insertion allows one more attempt; a correct PIN resets the card's counter as usual.
+
+- Enabled: the number below applies. Set it to 0 to turn this off.
+- Disabled or not configured: the default applies - the card's last attempt is held back (1).
+
+This needs the card to report how many PIN attempts it has left after a wrong PIN, as cards used through a smart card minidriver (for example MyEID) do. Cards that do not report it, such as PIV cards used through the Windows built-in PIV driver, are not held back.
+
+Registry: HKLM\SOFTWARE\Policies\Microsoft\Windows\SmartCardCredentialProvider!PinAttemptsReserved (DWORD, 0-10)</string>
+
       <string id="Cat_EIDLogging">Logging (EID Log Manager)</string>
 
       <string id="LogCSVEnabled">Enable CSV audit logging</string>
@@ -140,6 +164,13 @@ Registry: HKLM\SOFTWARE\Policies\OpenAccessEID\LogManager!AutoStart (DWORD)</str
     </stringTable>
 
     <presentationTable>
+      <presentation id="PinEntryDelay">
+        <decimalTextBox refId="PinDelayThreshold_Dec" defaultValue="5">Wrong PINs allowed before the delay starts:</decimalTextBox>
+        <decimalTextBox refId="PinDelaySeconds_Dec" defaultValue="10">Delay after each further wrong PIN (seconds, 0 = no delay):</decimalTextBox>
+      </presentation>
+      <presentation id="PinAttemptsReserved">
+        <decimalTextBox refId="PinAttemptsReserved_Dec" defaultValue="1">Card PIN attempts to hold back (0 = none):</decimalTextBox>
+      </presentation>
       <presentation id="LogCSVLogPath">
         <textBox refId="LogCSVLogPath_Text"><label>CSV log file path:</label></textBox>
       </presentation>

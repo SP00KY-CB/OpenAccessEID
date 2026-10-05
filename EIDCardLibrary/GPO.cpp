@@ -58,24 +58,31 @@ const GPOInfo MyGPOInfo[] =  // NOSONAR - Const lookup table for GPO settings
   {szRemoveGPOKey, L"scremoveoption" },
   {szMainGPOKey, L"EnforceCSPWhitelist" },  // Security: block CSPs not in whitelist
   {szMainGPOKey, L"RequireCardBoundCredentials" },  // Security (H3): only card-wrapped credentials allowed when set
-  {szMainGPOKey, L"RequireRevocationCheck" }  // Security (M1): fail-closed when revocation cannot be confirmed offline
+  {szMainGPOKey, L"RequireRevocationCheck" },  // Security (M1): fail-closed when revocation cannot be confirmed offline
+  {szMainGPOKey, L"PinDelayThreshold" },  // Logon tile: wrong PINs before the countdown
+  {szMainGPOKey, L"PinDelaySeconds" },  // Logon tile: countdown length; 0 = off
+  {szMainGPOKey, L"PinAttemptsReserved" }  // Logon tile: card attempts held back until re-insertion; 0 = off
 };
 
 // GetPolicyValue/SetPolicyValue index this table with a GPOPolicy. If a policy is added to the
 // enum without a matching row here, every subsequent policy silently reads the wrong registry
 // value - so make that a build break rather than a runtime surprise.
-static_assert(ARRAYSIZE(MyGPOInfo) == static_cast<size_t>(GPOPolicy::RequireRevocationCheck) + 1,
+static_assert(ARRAYSIZE(MyGPOInfo) == static_cast<size_t>(GPOPolicy::PinAttemptsReserved) + 1,
 	"MyGPOInfo is out of sync with the GPOPolicy enum - add the matching row");
 
-DWORD GetPolicyValue( GPOPolicy Policy)
+// Reads the policy into *pdwValue. Returns FALSE, with *pdwValue = 0, when it is not configured
+// (no key or value) or holds something other than a DWORD.
+static BOOL ReadPolicyValue(GPOPolicy Policy, DWORD* pdwValue)
 {
+	*pdwValue = 0;
 	// Validate Policy enum bounds to prevent array overflow
 	if (!IsValidPolicy(Policy))
 	{
 		EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"Invalid policy index %d", static_cast<int>(Policy));
-		return 0;
+		return FALSE;
 	}
 	HKEY key;
+	BOOL fFound = FALSE;
 	DWORD value = 0;
 	DWORD size = sizeof(DWORD);
 	DWORD type=REG_SZ;
@@ -88,6 +95,7 @@ DWORD GetPolicyValue( GPOPolicy Policy)
 		{
 			EIDCardLibraryTrace(WINEVENT_LEVEL_INFO,L"Policy %s found = %s",MyGPOInfo[policyIndex].Value,szValue);
 			value = _tstoi(szValue);
+			fFound = TRUE;
 		}
 		else if (RegQueryValueEx(key,MyGPOInfo[policyIndex].Value,nullptr, &type,(LPBYTE) &value, &size)==ERROR_SUCCESS)
 		{
@@ -99,6 +107,7 @@ DWORD GetPolicyValue( GPOPolicy Policy)
 			}
 			else
 			{
+				fFound = TRUE;
 				EIDCardLibraryTrace(WINEVENT_LEVEL_INFO,L"Policy %s found = %x",MyGPOInfo[policyIndex].Value,value);
 			}
 		}
@@ -115,7 +124,21 @@ DWORD GetPolicyValue( GPOPolicy Policy)
 		EIDCardLibraryTrace(WINEVENT_LEVEL_INFO,L"Policy %s key not found = %x",MyGPOInfo[policyIndex].Value,value);
 
 	}
+	*pdwValue = value;
+	return fFound;
+}
+
+DWORD GetPolicyValue( GPOPolicy Policy)
+{
+	DWORD value = 0;
+	ReadPolicyValue(Policy, &value);
 	return value;
+}
+
+DWORD GetPolicyValueOrDefault(GPOPolicy Policy, DWORD dwDefault)
+{
+	DWORD value = 0;
+	return ReadPolicyValue(Policy, &value) ? value : dwDefault;
 }
 
 BOOL SetRemovePolicyValue(DWORD dwActivate)

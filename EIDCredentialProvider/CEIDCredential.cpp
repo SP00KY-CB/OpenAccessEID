@@ -28,6 +28,7 @@
 #include "../EIDCardLibrary/guid.h"
 #include "../EIDCardLibrary/EIDCardLibrary.h"
 #include "../EIDCardLibrary/Package.h"
+#include "../EIDCardLibrary/GPO.h"
 
 #include <wincred.h>
 #include <CodeAnalysis/Warnings.h>
@@ -43,17 +44,63 @@ static wchar_t s_wszUnknownError[] = L"Unknow Error";  // NOSONAR - GLOBAL-01: N
 // Message shown in place of the PIN box once the card is removed while this tile is selected.
 static const wchar_t s_szReconnectCard[] = L"Please reconnect your smart card";
 
-// Wrong-PIN countdown: wrong PINs allowed without a wait, then the wait imposed after each
-// further one. The card's own retry counter still blocks it independently.
-constexpr DWORD EID_PIN_FREE_ATTEMPTS = 5;
-constexpr DWORD EID_PIN_THROTTLE_SECONDS = 10;
+// Wrong-PIN protection policies (values under the SmartCardCredentialProvider policy key):
+// defaults when not configured, and the largest value honoured.
+constexpr DWORD EID_PIN_DELAY_THRESHOLD_DEFAULT = 5;    // wrong PINs before the countdown
+constexpr DWORD EID_PIN_DELAY_THRESHOLD_MAX = 100;
+constexpr DWORD EID_PIN_DELAY_SECONDS_DEFAULT = 10;     // countdown length; 0 = no countdown
+constexpr DWORD EID_PIN_DELAY_SECONDS_MAX = 300;
+constexpr DWORD EID_PIN_ATTEMPTS_RESERVED_DEFAULT = 1;  // card attempts held back; 0 = no hold
+constexpr DWORD EID_PIN_ATTEMPTS_RESERVED_MAX = 10;
 constexpr DWORD EID_PIN_THROTTLE_TICK_MS = 1000;
+constexpr size_t EID_PIN_MESSAGE_CCH = 192;  // room for the longest PIN-entry message
+
+struct PIN_ENTRY_POLICY
+{
+	DWORD dwDelayThreshold;
+	DWORD dwDelaySeconds;
+	DWORD dwAttemptsReserved;
+};
+
+// Read on every wrong PIN, so a policy change applies from the next one.
+static PIN_ENTRY_POLICY ReadPinEntryPolicy()
+{
+	PIN_ENTRY_POLICY policy;
+	policy.dwDelayThreshold = GetPolicyValueOrDefault(GPOPolicy::PinDelayThreshold, EID_PIN_DELAY_THRESHOLD_DEFAULT);
+	if (policy.dwDelayThreshold == 0)
+	{
+		policy.dwDelayThreshold = 1;
+	}
+	else if (policy.dwDelayThreshold > EID_PIN_DELAY_THRESHOLD_MAX)
+	{
+		policy.dwDelayThreshold = EID_PIN_DELAY_THRESHOLD_MAX;
+	}
+	policy.dwDelaySeconds = GetPolicyValueOrDefault(GPOPolicy::PinDelaySeconds, EID_PIN_DELAY_SECONDS_DEFAULT);
+	if (policy.dwDelaySeconds > EID_PIN_DELAY_SECONDS_MAX)
+	{
+		policy.dwDelaySeconds = EID_PIN_DELAY_SECONDS_MAX;
+	}
+	policy.dwAttemptsReserved = GetPolicyValueOrDefault(GPOPolicy::PinAttemptsReserved, EID_PIN_ATTEMPTS_RESERVED_DEFAULT);
+	if (policy.dwAttemptsReserved > EID_PIN_ATTEMPTS_RESERVED_MAX)
+	{
+		policy.dwAttemptsReserved = EID_PIN_ATTEMPTS_RESERVED_MAX;
+	}
+	return policy;
+}
 
 // Message shown in place of the PIN box while the countdown runs.
 static void FormatPinThrottleMessage(DWORD dwSecondsLeft, PWSTR pwszBuffer, size_t cchBuffer)
 {
 	StringCchPrintfW(pwszBuffer, cchBuffer, L"Too many incorrect PINs. Try again in %lu second%ls.",
 		dwSecondsLeft, dwSecondsLeft == 1 ? L"" : L"s");
+}
+
+// Message shown in place of the PIN box while PIN entry is held until the card is re-inserted.
+static void FormatPinHeldMessage(DWORD dwTriesLeft, PWSTR pwszBuffer, size_t cchBuffer)
+{
+	StringCchPrintfW(pwszBuffer, cchBuffer,
+		L"This card has only %lu PIN attempt%ls left before it is blocked. Remove the card and insert it again to try again.",
+		dwTriesLeft, dwTriesLeft == 1 ? L"" : L"s");
 }
 
 // Arms the countdown timer for one tick from now. One-shot: each tick re-arms it, so a slow
@@ -317,10 +364,11 @@ BOOL CEIDCredential::MarkReconnected()
 		_fDisconnected = FALSE;
 		_dwFieldStateGen++;
 		SecureClearPin();
-		// The card has been re-inserted: start the wrong-PIN count afresh. A countdown still
-		// running ends at its next tick (it sees no time left).
+		// The card has been re-inserted: release a hold and start the wrong-PIN count afresh.
+		// A countdown still running ends at its next tick (it sees no time left).
 		_dwWrongPinCount = 0;
 		_ullPinThrottleEnd = 0;
+		_fPinHeld = FALSE;
 	}
 	LeaveCriticalSection(&_csFields);
 	return fWasDisconnected;
@@ -329,29 +377,30 @@ BOOL CEIDCredential::MarkReconnected()
 void CEIDCredential::UpdateConnectionFields()
 {
 	// Several threads push - the notifier thread on a card removal or re-insertion, LogonUI's
-	// thread when a wrong-PIN countdown starts, the countdown timer when it ends - each with no
+	// thread when PIN entry is blocked after a wrong PIN, the countdown timer when it ends - each with no
 	// lock held, so two pushes can interleave and leave LogonUI showing a mix of both states.
 	// So each push checks afterwards whether the state changed while it was pushing, and if it
 	// did pushes again: whichever push finishes last leaves the current state on screen.
 	for (int iPass = 0; iPass < 3; iPass++)
 	{
+		WCHAR szBlocked[EID_PIN_MESSAGE_CCH];  // NOSONAR - LSASS-01: C-style buffer for LSASS safety
 		EnterCriticalSection(&_csFields);
 		const DWORD dwGen = _dwFieldStateGen;
 		const BOOL fDisconnected = _fDisconnected;
-		const DWORD dwThrottleSeconds = PinThrottleSecondsLeft();
+		const BOOL fBlocked = GetPinEntryBlock(szBlocked, ARRAYSIZE(szBlocked));
 		ICredentialProviderCredentialEvents* pEvents = _pCredProvCredentialEvents;
 		PWSTR pwszMessage = nullptr;
 		if (pEvents != nullptr)
 		{
 			pEvents->AddRef();
-			if (!fDisconnected && dwThrottleSeconds == 0 && _rgFieldStrings[SFI_MESSAGE])
+			if (!fDisconnected && !fBlocked && _rgFieldStrings[SFI_MESSAGE])
 			{
 				// Private copy so the string can be handed to LogonUI outside the lock.
 				SHStrDupW(_rgFieldStrings[SFI_MESSAGE], &pwszMessage);
 			}
 		}
 		LeaveCriticalSection(&_csFields);
-		EIDCardLibraryTrace(WINEVENT_LEVEL_INFO,L"EVID: UpdateConnectionFields tile=%p fDisconnected=%d throttle=%lu advised=%d",(void*)this,fDisconnected,dwThrottleSeconds,pEvents!=nullptr);
+		EIDCardLibraryTrace(WINEVENT_LEVEL_INFO,L"EVID: UpdateConnectionFields tile=%p fDisconnected=%d pinBlocked=%d advised=%d",(void*)this,fDisconnected,fBlocked,pEvents!=nullptr);
 
 		if (!pEvents)
 		{
@@ -368,14 +417,12 @@ void CEIDCredential::UpdateConnectionFields()
 			pEvents->SetFieldString(this, SFI_PIN, L"");
 			pEvents->SetFieldString(this, SFI_MESSAGE, s_szReconnectCard);
 		}
-		else if (dwThrottleSeconds != 0)
+		else if (fBlocked)
 		{
-			WCHAR szThrottle[128];  // NOSONAR - LSASS-01: C-style buffer for LSASS safety
-			FormatPinThrottleMessage(dwThrottleSeconds, szThrottle, ARRAYSIZE(szThrottle));
 			pEvents->SetFieldState(this, SFI_PIN, CPFS_HIDDEN);
 			pEvents->SetFieldState(this, SFI_SUBMIT_BUTTON, CPFS_HIDDEN);
 			pEvents->SetFieldString(this, SFI_PIN, L"");
-			pEvents->SetFieldString(this, SFI_MESSAGE, szThrottle);
+			pEvents->SetFieldString(this, SFI_MESSAGE, szBlocked);
 		}
 		else
 		{
@@ -410,25 +457,64 @@ DWORD CEIDCredential::PinThrottleSecondsLeft() const
 	return static_cast<DWORD>((_ullPinThrottleEnd - ullNow + 999) / 1000);
 }
 
-BOOL CEIDCredential::IsPinThrottled() const
+BOOL CEIDCredential::GetPinEntryBlock(PWSTR pwszMessage, size_t cchMessage) const
 {
-	EnterCriticalSection(&_csFields);
-	const BOOL fThrottled = (PinThrottleSecondsLeft() != 0);
-	LeaveCriticalSection(&_csFields);
-	return fThrottled;
+	// A hold outranks a countdown: either way no attempt is allowed, but only re-inserting
+	// the card ends a hold.
+	if (_fPinHeld)
+	{
+		if (pwszMessage)
+		{
+			FormatPinHeldMessage(_dwCardTriesLeft, pwszMessage, cchMessage);
+		}
+		return TRUE;
+	}
+	const DWORD dwSecondsLeft = PinThrottleSecondsLeft();
+	if (dwSecondsLeft != 0)
+	{
+		if (pwszMessage)
+		{
+			FormatPinThrottleMessage(dwSecondsLeft, pwszMessage, cchMessage);
+		}
+		return TRUE;
+	}
+	return FALSE;
 }
 
-// Counts a wrong PIN and, from the EID_PIN_FREE_ATTEMPTS-th on, starts the countdown that
-// has to run out before the next attempt. Called on LogonUI's thread (ReportResult).
-void CEIDCredential::RecordWrongPin()
+BOOL CEIDCredential::IsPinEntryBlocked() const
 {
+	EnterCriticalSection(&_csFields);
+	const BOOL fBlocked = GetPinEntryBlock(nullptr, 0);
+	LeaveCriticalSection(&_csFields);
+	return fBlocked;
+}
+
+// Counts a wrong PIN. When the card is down to its reserved PIN attempts, holds PIN entry until
+// the card is re-inserted; otherwise, from the PinDelayThreshold-th wrong PIN on, starts the
+// countdown that has to run out before the next attempt. Called on LogonUI's thread
+// (ReportResult). ntsSubstatus is the number of PIN attempts the card has left, or 0xFFFFFFFF
+// when the card did not say (the hold then cannot apply).
+void CEIDCredential::RecordWrongPin(NTSTATUS ntsSubstatus)
+{
+	const PIN_ENTRY_POLICY policy = ReadPinEntryPolicy();
+	const DWORD dwTriesLeft = static_cast<DWORD>(ntsSubstatus);
+	// None left means the card is blocked already: there is nothing left to hold back.
+	const BOOL fHold = (dwTriesLeft != 0xFFFFFFFF && dwTriesLeft != 0 && dwTriesLeft <= policy.dwAttemptsReserved);
 	BOOL fStarted = FALSE;
 	EnterCriticalSection(&_csFields);
 	if (_dwWrongPinCount < MAXDWORD)
 	{
 		_dwWrongPinCount++;
 	}
-	if (_dwWrongPinCount >= EID_PIN_FREE_ATTEMPTS)
+	if (fHold)
+	{
+		// No countdown on top: nothing is allowed until the card is re-inserted anyway.
+		_fPinHeld = TRUE;
+		_dwCardTriesLeft = dwTriesLeft;
+		_dwFieldStateGen++;
+		fStarted = TRUE;
+	}
+	else if (policy.dwDelaySeconds != 0 && _dwWrongPinCount >= policy.dwDelayThreshold)
 	{
 		if (_pPinThrottleTimer == nullptr)
 		{
@@ -455,18 +541,18 @@ void CEIDCredential::RecordWrongPin()
 		// its next tick) carries on with the new deadline.
 		if (_pPinThrottleTimer != nullptr)
 		{
-			_ullPinThrottleEnd = GetTickCount64() + EID_PIN_THROTTLE_SECONDS * 1000ULL;
+			_ullPinThrottleEnd = GetTickCount64() + policy.dwDelaySeconds * 1000ULL;
 			_dwFieldStateGen++;
 			fStarted = TRUE;
 		}
 	}
 	const DWORD dwCount = _dwWrongPinCount;
 	LeaveCriticalSection(&_csFields);
-	EIDCardLibraryTrace(WINEVENT_LEVEL_INFO,L"EVID: wrong PIN tile=%p count=%lu countdown=%d",(void*)this,dwCount,fStarted);
+	EIDCardLibraryTrace(WINEVENT_LEVEL_INFO,L"EVID: wrong PIN tile=%p count=%lu triesLeft=%lu hold=%d blocked=%d",(void*)this,dwCount,dwTriesLeft,fHold,fStarted);
 
 	if (fStarted)
 	{
-		// Hide the PIN box and submit button and show the countdown.
+		// Hide the PIN box and submit button and say why.
 		UpdateConnectionFields();
 	}
 }
@@ -481,6 +567,7 @@ VOID CALLBACK CEIDCredential::PinThrottleTimerCallback(PTP_CALLBACK_INSTANCE pIn
 // keeps the tile alive. Calls into LogonUI with no lock held, like the notifier thread does.
 void CEIDCredential::OnPinThrottleTick(PTP_TIMER pTimer)
 {
+	WCHAR szMessage[EID_PIN_MESSAGE_CCH];  // NOSONAR - LSASS-01: C-style buffer for LSASS safety
 	EnterCriticalSection(&_csFields);
 	const DWORD dwSecondsLeft = PinThrottleSecondsLeft();
 	const BOOL fDisconnected = _fDisconnected;
@@ -492,6 +579,8 @@ void CEIDCredential::OnPinThrottleTick(PTP_TIMER pTimer)
 		_pPinThrottleTimer = nullptr;
 		_dwFieldStateGen++;
 	}
+	// While the countdown runs this is its message (or a hold's, which outranks it).
+	GetPinEntryBlock(szMessage, ARRAYSIZE(szMessage));
 	const DWORD dwGen = _dwFieldStateGen;
 	LeaveCriticalSection(&_csFields);
 
@@ -499,8 +588,6 @@ void CEIDCredential::OnPinThrottleTick(PTP_TIMER pTimer)
 	{
 		if (ICredentialProviderCredentialEvents* pEvents = GetEventsAddRef())
 		{
-			WCHAR szMessage[128];  // NOSONAR - LSASS-01: C-style buffer for LSASS safety
-			FormatPinThrottleMessage(dwSecondsLeft, szMessage, ARRAYSIZE(szMessage));
 			pEvents->SetFieldString(this, SFI_MESSAGE, fDisconnected ? s_szReconnectCard : szMessage);
 			pEvents->Release();
 		}
@@ -667,8 +754,9 @@ HRESULT CEIDCredential::GetFieldState(
         {
             *pcpfs = CPFS_HIDDEN;
         }
-        // Likewise the PIN entry and submit button while the wrong-PIN countdown runs.
-        if ((dwFieldID == SFI_PIN || dwFieldID == SFI_SUBMIT_BUTTON) && IsPinThrottled())
+        // Likewise the PIN entry and submit button while PIN entry is blocked (wrong-PIN
+        // countdown, or the card's last attempts held back until it is re-inserted).
+        if ((dwFieldID == SFI_PIN || dwFieldID == SFI_SUBMIT_BUTTON) && IsPinEntryBlocked())
         {
             *pcpfs = CPFS_HIDDEN;
         }
@@ -704,17 +792,15 @@ HRESULT CEIDCredential::GetStringValue(
     {
         // Make a copy of the string and return that. The caller
         // is responsible for freeing it.
+        WCHAR szBlocked[EID_PIN_MESSAGE_CCH];  // NOSONAR - LSASS-01: C-style buffer for LSASS safety
         EnterCriticalSection(&_csFields);
-        const DWORD dwThrottleSeconds = (dwFieldID == SFI_MESSAGE) ? PinThrottleSecondsLeft() : 0;
         if (_fDisconnected && dwFieldID == SFI_MESSAGE)
         {
             hr = SHStrDupW(s_szReconnectCard, ppwsz);
         }
-        else if (dwThrottleSeconds != 0)
+        else if (dwFieldID == SFI_MESSAGE && GetPinEntryBlock(szBlocked, ARRAYSIZE(szBlocked)))
         {
-            WCHAR szThrottle[128];  // NOSONAR - LSASS-01: C-style buffer for LSASS safety
-            FormatPinThrottleMessage(dwThrottleSeconds, szThrottle, ARRAYSIZE(szThrottle));
-            hr = SHStrDupW(szThrottle, ppwsz);
+            hr = SHStrDupW(szBlocked, ppwsz);
         }
         else
         {
@@ -1054,25 +1140,24 @@ HRESULT CEIDCredential::GetSerialization(
 {
     HRESULT hr;  // NOSONAR - EXPLICIT-TYPE-03: HRESULT visible for security audit
 
-    // The PIN box is hidden while the wrong-PIN countdown runs; refuse a submission that gets
-    // here anyway rather than send the PIN to the card.
+    // The PIN box is hidden while PIN entry is blocked; refuse a submission that gets here
+    // anyway rather than send the PIN to the card.
+    WCHAR szBlocked[EID_PIN_MESSAGE_CCH];  // NOSONAR - LSASS-01: C-style buffer for LSASS safety
     EnterCriticalSection(&_csFields);
-    const DWORD dwThrottleSeconds = PinThrottleSecondsLeft();
+    const BOOL fBlocked = GetPinEntryBlock(szBlocked, ARRAYSIZE(szBlocked));
     LeaveCriticalSection(&_csFields);
-    if (dwThrottleSeconds != 0)
+    if (fBlocked)
     {
-        WCHAR szThrottle[128];  // NOSONAR - LSASS-01: C-style buffer for LSASS safety
-        FormatPinThrottleMessage(dwThrottleSeconds, szThrottle, ARRAYSIZE(szThrottle));
         if (ppwszOptionalStatusText)
         {
-            SHStrDupW(szThrottle, ppwszOptionalStatusText);
+            SHStrDupW(szBlocked, ppwszOptionalStatusText);
         }
         if (pcpsiOptionalStatusIcon)
         {
             *pcpsiOptionalStatusIcon = CPSI_WARNING;
         }
         *pcpgsr = CPGSR_NO_CREDENTIAL_NOT_FINISHED;
-        EIDCardLibraryTrace(WINEVENT_LEVEL_INFO,L"Submission refused: wrong-PIN countdown, %lu s left",dwThrottleSeconds);
+        EIDCardLibraryTrace(WINEVENT_LEVEL_INFO,L"Submission refused: PIN entry blocked");
         return S_OK;
     }
 
@@ -1299,16 +1384,17 @@ HRESULT CEIDCredential::ReportResult(
         }
     }
 
-    // Wrong-PIN countdown: count wrong PINs (starting the countdown from the
-    // EID_PIN_FREE_ATTEMPTS-th on); a successful logon starts the count afresh.
+    // Wrong-PIN protection: count wrong PINs (ntsSubstatus is the card's attempts left), which
+    // may block PIN entry; a successful logon starts the count afresh.
     if (ntsStatus == STATUS_SMARTCARD_WRONG_PIN)
     {
-        RecordWrongPin();
+        RecordWrongPin(ntsSubstatus);
     }
     else if (ntsStatus == STATUS_SUCCESS)
     {
         EnterCriticalSection(&_csFields);
         _dwWrongPinCount = 0;
+        _fPinHeld = FALSE;
         LeaveCriticalSection(&_csFields);
     }
 

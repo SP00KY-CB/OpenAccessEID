@@ -100,7 +100,7 @@ public:
 	//  - UpdateConnectionFields() then pushes the current state to LogonUI (the reconnect
 	//    message, the wrong-PIN countdown, or the PIN prompt); it is called with no lock held,
 	//    and pushes again if the state changed while it was pushing.
-	// MarkReconnected also resets the wrong-PIN countdown: re-inserting the card starts over.
+	// MarkReconnected also resets the wrong-PIN protection: re-inserting the card starts over.
 	BOOL IsSelected() const;
 	BOOL IsDisconnected() const;
 	BOOL MarkDisconnectedIfSelected();
@@ -118,16 +118,24 @@ public:
 	// Whether the "view certificate" command link may be shown in the current scenario.
 	BOOL IsCertificateLinkAllowed() const;
 
-	// Wrong-PIN countdown. After EID_PIN_FREE_ATTEMPTS wrong PINs, each further wrong PIN
-	// hides the PIN box and submit button for EID_PIN_THROTTLE_SECONDS while the message
-	// counts down; a thread-pool timer ticks it every second (one-shot, re-armed by each tick
-	// so ticks never overlap) and holds a reference to the tile until its last tick.
-	// Re-inserting the card resets it (MarkReconnected; a tile created for a newly inserted
-	// card starts at zero), and so does a successful logon.
-	void RecordWrongPin();
+	// Wrong-PIN protection, configured by policy (PinDelayThreshold, PinDelaySeconds,
+	// PinAttemptsReserved). While PIN entry is blocked, the PIN box and submit button are
+	// hidden and the message says why:
+	//  - countdown: after PinDelayThreshold wrong PINs, each further one blocks PIN entry for
+	//    PinDelaySeconds. A thread-pool timer ticks it every second (one-shot, re-armed by
+	//    each tick so ticks never overlap) and holds a reference to the tile until its last tick.
+	//  - hold: once the card reports PinAttemptsReserved or fewer PIN attempts left, PIN entry
+	//    is blocked until the card is re-inserted, so typing cannot use up the card's last
+	//    attempts and block it. Each re-insertion then allows one attempt.
+	// Re-inserting the card resets both (MarkReconnected; a tile created for a newly inserted
+	// card starts afresh), and so does a successful logon.
+	void RecordWrongPin(NTSTATUS ntsSubstatus);
 	// Caller must hold _csFields. 0 when no countdown is running.
 	DWORD PinThrottleSecondsLeft() const;
-	BOOL IsPinThrottled() const;
+	// Caller must hold _csFields. TRUE while PIN entry is blocked (hold or countdown); then also
+	// fills pwszMessage, when given, with the text shown in place of the PIN box.
+	BOOL GetPinEntryBlock(PWSTR pwszMessage, size_t cchMessage) const;
+	BOOL IsPinEntryBlocked() const;
 	static VOID CALLBACK PinThrottleTimerCallback(PTP_CALLBACK_INSTANCE pInstance, PVOID pvContext, PTP_TIMER pTimer);
 	void OnPinThrottleTick(PTP_TIMER pTimer);
 
@@ -156,7 +164,9 @@ public:
 	DWORD       _dwWrongPinCount = 0;      // Wrong PINs since the card was inserted (or the last success).
 	ULONGLONG   _ullPinThrottleEnd = 0;    // GetTickCount64() at which the countdown ends; 0 = none.
 	PTP_TIMER   _pPinThrottleTimer = nullptr;  // Ticks the countdown; non-null while it holds a reference.
-	DWORD       _dwFieldStateGen = 0;      // Bumped whenever the disconnected flag or the countdown starts/stops; see UpdateConnectionFields.
+	BOOL        _fPinHeld = FALSE;         // PIN entry held until the card is re-inserted (card nearly blocked).
+	DWORD       _dwCardTriesLeft = 0;      // PIN attempts the card reported left when the hold started.
+	DWORD       _dwFieldStateGen = 0;      // Bumped whenever the disconnected flag, the hold or the countdown changes; see UpdateConnectionFields.
 	// Guards _rgFieldStrings, _pCredProvCredentialEvents, _fSelected, _fDisconnected,
 	// _pProvider and the wrong-PIN countdown state against the smart-card notifier thread (the
 	// disconnect morph / revive) and the countdown timer racing LogonUI's UI thread. May be
