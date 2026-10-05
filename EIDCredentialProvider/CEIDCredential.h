@@ -97,8 +97,10 @@ public:
 	//    sets the flag only if the tile is still selected (atomically with SetDeselected) and
 	//    returns FALSE when it is not (the caller then erases it); MarkReconnected returns
 	//    TRUE if it cleared the flag.
-	//  - UpdateConnectionFields() then pushes the current state to LogonUI; it is called
-	//    with no lock held.
+	//  - UpdateConnectionFields() then pushes the current state to LogonUI (the reconnect
+	//    message, the wrong-PIN countdown, or the PIN prompt); it is called with no lock held,
+	//    and pushes again if the state changed while it was pushing.
+	// MarkReconnected also resets the wrong-PIN countdown: re-inserting the card starts over.
 	BOOL IsSelected() const;
 	BOOL IsDisconnected() const;
 	BOOL MarkDisconnectedIfSelected();
@@ -115,6 +117,19 @@ public:
 	ICredentialProviderCredentialEvents* GetEventsAddRef();
 	// Whether the "view certificate" command link may be shown in the current scenario.
 	BOOL IsCertificateLinkAllowed() const;
+
+	// Wrong-PIN countdown. After EID_PIN_FREE_ATTEMPTS wrong PINs, each further wrong PIN
+	// hides the PIN box and submit button for EID_PIN_THROTTLE_SECONDS while the message
+	// counts down; a thread-pool timer ticks it every second (one-shot, re-armed by each tick
+	// so ticks never overlap) and holds a reference to the tile until its last tick.
+	// Re-inserting the card resets it (MarkReconnected; a tile created for a newly inserted
+	// card starts at zero), and so does a successful logon.
+	void RecordWrongPin();
+	// Caller must hold _csFields. 0 when no countdown is running.
+	DWORD PinThrottleSecondsLeft() const;
+	BOOL IsPinThrottled() const;
+	static VOID CALLBACK PinThrottleTimerCallback(PTP_CALLBACK_INSTANCE pInstance, PVOID pvContext, PTP_TIMER pTimer);
+	void OnPinThrottleTick(PTP_TIMER pTimer);
 
     LONG                                  _cRef;
 
@@ -138,11 +153,15 @@ public:
 	BOOL        _fSelected;      // TRUE while LogonUI has this tile zoomed (between SetSelected/SetDeselected).
 	BOOL        _fDisconnected;  // TRUE while the card is absent and the tile shows the reconnect prompt.
 	CEIDProvider* _pProvider;   // Owning provider; used to drop this tile when deselected while disconnected.
-	// Guards _rgFieldStrings, _pCredProvCredentialEvents, _fSelected, _fDisconnected and
-	// _pProvider against the smart-card notifier thread (the disconnect morph / revive) racing
-	// LogonUI's UI thread. May be taken while the factory's list lock is held (that is the only
-	// nesting), never the other way round; never held across a call into LogonUI or into the
-	// provider/tile list.
+	DWORD       _dwWrongPinCount = 0;      // Wrong PINs since the card was inserted (or the last success).
+	ULONGLONG   _ullPinThrottleEnd = 0;    // GetTickCount64() at which the countdown ends; 0 = none.
+	PTP_TIMER   _pPinThrottleTimer = nullptr;  // Ticks the countdown; non-null while it holds a reference.
+	DWORD       _dwFieldStateGen = 0;      // Bumped whenever the disconnected flag or the countdown starts/stops; see UpdateConnectionFields.
+	// Guards _rgFieldStrings, _pCredProvCredentialEvents, _fSelected, _fDisconnected,
+	// _pProvider and the wrong-PIN countdown state against the smart-card notifier thread (the
+	// disconnect morph / revive) and the countdown timer racing LogonUI's UI thread. May be
+	// taken while the factory's list lock is held (that is the only nesting), never the other
+	// way round; never held across a call into LogonUI or into the provider/tile list.
 	mutable CRITICAL_SECTION _csFields;
 
 };

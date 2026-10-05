@@ -43,6 +43,31 @@ static wchar_t s_wszUnknownError[] = L"Unknow Error";  // NOSONAR - GLOBAL-01: N
 // Message shown in place of the PIN box once the card is removed while this tile is selected.
 static const wchar_t s_szReconnectCard[] = L"Please reconnect your smart card";
 
+// Wrong-PIN countdown: wrong PINs allowed without a wait, then the wait imposed after each
+// further one. The card's own retry counter still blocks it independently.
+constexpr DWORD EID_PIN_FREE_ATTEMPTS = 5;
+constexpr DWORD EID_PIN_THROTTLE_SECONDS = 10;
+constexpr DWORD EID_PIN_THROTTLE_TICK_MS = 1000;
+
+// Message shown in place of the PIN box while the countdown runs.
+static void FormatPinThrottleMessage(DWORD dwSecondsLeft, PWSTR pwszBuffer, size_t cchBuffer)
+{
+	StringCchPrintfW(pwszBuffer, cchBuffer, L"Too many incorrect PINs. Try again in %lu second%ls.",
+		dwSecondsLeft, dwSecondsLeft == 1 ? L"" : L"s");
+}
+
+// Arms the countdown timer for one tick from now. One-shot: each tick re-arms it, so a slow
+// tick can never overlap the next one.
+static void ArmPinThrottleTimer(PTP_TIMER pTimer)
+{
+	// Negative = relative, in 100 ns units.
+	const ULONGLONG ullDue = static_cast<ULONGLONG>(-static_cast<LONGLONG>(EID_PIN_THROTTLE_TICK_MS) * 10000);
+	FILETIME ftDue;
+	ftDue.dwLowDateTime = static_cast<DWORD>(ullDue & 0xFFFFFFFF);
+	ftDue.dwHighDateTime = static_cast<DWORD>(ullDue >> 32);
+	SetThreadpoolTimer(pTimer, &ftDue, 0, 0);
+}
+
 // CEIDCredential ////////////////////////////////////////////////////////
 
 CEIDCredential::CEIDCredential(CContainer* container):
@@ -275,6 +300,7 @@ BOOL CEIDCredential::MarkDisconnectedIfSelected()
 	if (fSelected && !_fDisconnected)
 	{
 		_fDisconnected = TRUE;
+		_dwFieldStateGen++;
 		// Never keep a typed PIN across a card removal.
 		SecureClearPin();
 	}
@@ -289,7 +315,12 @@ BOOL CEIDCredential::MarkReconnected()
 	if (fWasDisconnected)
 	{
 		_fDisconnected = FALSE;
+		_dwFieldStateGen++;
 		SecureClearPin();
+		// The card has been re-inserted: start the wrong-PIN count afresh. A countdown still
+		// running ends at its next tick (it sees no time left).
+		_dwWrongPinCount = 0;
+		_ullPinThrottleEnd = 0;
 	}
 	LeaveCriticalSection(&_csFields);
 	return fWasDisconnected;
@@ -297,51 +328,204 @@ BOOL CEIDCredential::MarkReconnected()
 
 void CEIDCredential::UpdateConnectionFields()
 {
-	EnterCriticalSection(&_csFields);
-	// Push whatever the state is now (it is only changed on this same notifier thread).
-	const BOOL fDisconnected = _fDisconnected;
-	ICredentialProviderCredentialEvents* pEvents = _pCredProvCredentialEvents;
-	PWSTR pwszMessage = nullptr;
-	if (pEvents != nullptr)
+	// Several threads push - the notifier thread on a card removal or re-insertion, LogonUI's
+	// thread when a wrong-PIN countdown starts, the countdown timer when it ends - each with no
+	// lock held, so two pushes can interleave and leave LogonUI showing a mix of both states.
+	// So each push checks afterwards whether the state changed while it was pushing, and if it
+	// did pushes again: whichever push finishes last leaves the current state on screen.
+	for (int iPass = 0; iPass < 3; iPass++)
 	{
-		pEvents->AddRef();
-		if (!fDisconnected && _rgFieldStrings[SFI_MESSAGE])
+		EnterCriticalSection(&_csFields);
+		const DWORD dwGen = _dwFieldStateGen;
+		const BOOL fDisconnected = _fDisconnected;
+		const DWORD dwThrottleSeconds = PinThrottleSecondsLeft();
+		ICredentialProviderCredentialEvents* pEvents = _pCredProvCredentialEvents;
+		PWSTR pwszMessage = nullptr;
+		if (pEvents != nullptr)
 		{
-			// Private copy so the string can be handed to LogonUI outside the lock.
-			SHStrDupW(_rgFieldStrings[SFI_MESSAGE], &pwszMessage);
+			pEvents->AddRef();
+			if (!fDisconnected && dwThrottleSeconds == 0 && _rgFieldStrings[SFI_MESSAGE])
+			{
+				// Private copy so the string can be handed to LogonUI outside the lock.
+				SHStrDupW(_rgFieldStrings[SFI_MESSAGE], &pwszMessage);
+			}
+		}
+		LeaveCriticalSection(&_csFields);
+		EIDCardLibraryTrace(WINEVENT_LEVEL_INFO,L"EVID: UpdateConnectionFields tile=%p fDisconnected=%d throttle=%lu advised=%d",(void*)this,fDisconnected,dwThrottleSeconds,pEvents!=nullptr);
+
+		if (!pEvents)
+		{
+			// Not currently advised by LogonUI; the state is enough for the next query.
+			EIDCardLibraryTrace(WINEVENT_LEVEL_INFO,L"EVID: UpdateConnectionFields tile=%p SKIPPED field updates (not advised)",(void*)this);
+			return;
+		}
+
+		if (fDisconnected)
+		{
+			pEvents->SetFieldState(this, SFI_PIN, CPFS_HIDDEN);
+			pEvents->SetFieldState(this, SFI_SUBMIT_BUTTON, CPFS_HIDDEN);
+			pEvents->SetFieldState(this, SFI_CERTIFICATE, CPFS_HIDDEN);
+			pEvents->SetFieldString(this, SFI_PIN, L"");
+			pEvents->SetFieldString(this, SFI_MESSAGE, s_szReconnectCard);
+		}
+		else if (dwThrottleSeconds != 0)
+		{
+			WCHAR szThrottle[128];  // NOSONAR - LSASS-01: C-style buffer for LSASS safety
+			FormatPinThrottleMessage(dwThrottleSeconds, szThrottle, ARRAYSIZE(szThrottle));
+			pEvents->SetFieldState(this, SFI_PIN, CPFS_HIDDEN);
+			pEvents->SetFieldState(this, SFI_SUBMIT_BUTTON, CPFS_HIDDEN);
+			pEvents->SetFieldString(this, SFI_PIN, L"");
+			pEvents->SetFieldString(this, SFI_MESSAGE, szThrottle);
+		}
+		else
+		{
+			pEvents->SetFieldState(this, SFI_PIN, _rgFieldStatePairs[SFI_PIN].cpfs);
+			pEvents->SetFieldState(this, SFI_SUBMIT_BUTTON, _rgFieldStatePairs[SFI_SUBMIT_BUTTON].cpfs);
+			pEvents->SetFieldState(this, SFI_CERTIFICATE,
+				IsCertificateLinkAllowed() ? _rgFieldStatePairs[SFI_CERTIFICATE].cpfs : CPFS_HIDDEN);
+			pEvents->SetFieldString(this, SFI_PIN, L"");
+			pEvents->SetFieldString(this, SFI_MESSAGE, pwszMessage ? pwszMessage : L"");
+			pEvents->SetFieldInteractiveState(this, SFI_PIN, CPFIS_FOCUSED);
+		}
+		CoTaskMemFree(pwszMessage);
+		pEvents->Release();
+
+		EnterCriticalSection(&_csFields);
+		const BOOL fChanged = (_dwFieldStateGen != dwGen);
+		LeaveCriticalSection(&_csFields);
+		if (!fChanged)
+		{
+			return;
 		}
 	}
-	LeaveCriticalSection(&_csFields);
-	EIDCardLibraryTrace(WINEVENT_LEVEL_INFO,L"EVID: UpdateConnectionFields tile=%p fDisconnected=%d advised=%d",(void*)this,fDisconnected,pEvents!=nullptr);
+}
 
-	if (!pEvents)
+DWORD CEIDCredential::PinThrottleSecondsLeft() const
+{
+	const ULONGLONG ullNow = GetTickCount64();
+	if (_ullPinThrottleEnd <= ullNow)
 	{
-		// Not currently advised by LogonUI; the state is enough for the next query.
-		EIDCardLibraryTrace(WINEVENT_LEVEL_INFO,L"EVID: UpdateConnectionFields tile=%p SKIPPED field updates (not advised)",(void*)this);
+		return 0;
+	}
+	return static_cast<DWORD>((_ullPinThrottleEnd - ullNow + 999) / 1000);
+}
+
+BOOL CEIDCredential::IsPinThrottled() const
+{
+	EnterCriticalSection(&_csFields);
+	const BOOL fThrottled = (PinThrottleSecondsLeft() != 0);
+	LeaveCriticalSection(&_csFields);
+	return fThrottled;
+}
+
+// Counts a wrong PIN and, from the EID_PIN_FREE_ATTEMPTS-th on, starts the countdown that
+// has to run out before the next attempt. Called on LogonUI's thread (ReportResult).
+void CEIDCredential::RecordWrongPin()
+{
+	BOOL fStarted = FALSE;
+	EnterCriticalSection(&_csFields);
+	if (_dwWrongPinCount < MAXDWORD)
+	{
+		_dwWrongPinCount++;
+	}
+	if (_dwWrongPinCount >= EID_PIN_FREE_ATTEMPTS)
+	{
+		if (_pPinThrottleTimer == nullptr)
+		{
+			TP_CALLBACK_ENVIRON env;
+			InitializeThreadpoolEnvironment(&env);
+			// The last tick releases the timer's reference to the tile, which may be the last
+			// one and with it this DLL's last reference: keep the DLL loaded until it returns.
+			SetThreadpoolCallbackLibrary(&env, HINST_THISDLL);
+			_pPinThrottleTimer = CreateThreadpoolTimer(PinThrottleTimerCallback, this, &env);
+			DestroyThreadpoolEnvironment(&env);
+			if (_pPinThrottleTimer != nullptr)
+			{
+				AddRef();  // held by the timer; released by its last tick
+				ArmPinThrottleTimer(_pPinThrottleTimer);
+			}
+			else
+			{
+				// No countdown without a timer to end it (the PIN box would stay hidden); the
+				// card's own retry counter still applies.
+				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"CreateThreadpoolTimer 0x%08x - wrong-PIN countdown not started",GetLastError());
+			}
+		}
+		// A timer that is still running (a countdown reset by a re-insertion, not yet past
+		// its next tick) carries on with the new deadline.
+		if (_pPinThrottleTimer != nullptr)
+		{
+			_ullPinThrottleEnd = GetTickCount64() + EID_PIN_THROTTLE_SECONDS * 1000ULL;
+			_dwFieldStateGen++;
+			fStarted = TRUE;
+		}
+	}
+	const DWORD dwCount = _dwWrongPinCount;
+	LeaveCriticalSection(&_csFields);
+	EIDCardLibraryTrace(WINEVENT_LEVEL_INFO,L"EVID: wrong PIN tile=%p count=%lu countdown=%d",(void*)this,dwCount,fStarted);
+
+	if (fStarted)
+	{
+		// Hide the PIN box and submit button and show the countdown.
+		UpdateConnectionFields();
+	}
+}
+
+VOID CALLBACK CEIDCredential::PinThrottleTimerCallback(PTP_CALLBACK_INSTANCE pInstance, PVOID pvContext, PTP_TIMER pTimer)
+{
+	UNREFERENCED_PARAMETER(pInstance);
+	static_cast<CEIDCredential*>(pvContext)->OnPinThrottleTick(pTimer);
+}
+
+// Runs on a thread-pool thread, once a second while the countdown runs; the timer's reference
+// keeps the tile alive. Calls into LogonUI with no lock held, like the notifier thread does.
+void CEIDCredential::OnPinThrottleTick(PTP_TIMER pTimer)
+{
+	EnterCriticalSection(&_csFields);
+	const DWORD dwSecondsLeft = PinThrottleSecondsLeft();
+	const BOOL fDisconnected = _fDisconnected;
+	if (dwSecondsLeft == 0)
+	{
+		// Over, or reset by a card re-insertion. From here on this tick owns the timer: a
+		// wrong PIN from now on starts a new one.
+		_ullPinThrottleEnd = 0;
+		_pPinThrottleTimer = nullptr;
+		_dwFieldStateGen++;
+	}
+	const DWORD dwGen = _dwFieldStateGen;
+	LeaveCriticalSection(&_csFields);
+
+	if (dwSecondsLeft != 0)
+	{
+		if (ICredentialProviderCredentialEvents* pEvents = GetEventsAddRef())
+		{
+			WCHAR szMessage[128];  // NOSONAR - LSASS-01: C-style buffer for LSASS safety
+			FormatPinThrottleMessage(dwSecondsLeft, szMessage, ARRAYSIZE(szMessage));
+			pEvents->SetFieldString(this, SFI_MESSAGE, fDisconnected ? s_szReconnectCard : szMessage);
+			pEvents->Release();
+		}
+		// A card removal or re-insertion pushed its own state meanwhile: this message may
+		// have overwritten it, so push the whole current state again.
+		EnterCriticalSection(&_csFields);
+		const BOOL fChanged = (_dwFieldStateGen != dwGen);
+		LeaveCriticalSection(&_csFields);
+		if (fChanged)
+		{
+			UpdateConnectionFields();
+		}
+		ArmPinThrottleTimer(pTimer);
 		return;
 	}
 
-	if (fDisconnected)
-	{
-		pEvents->SetFieldState(this, SFI_PIN, CPFS_HIDDEN);
-		pEvents->SetFieldState(this, SFI_SUBMIT_BUTTON, CPFS_HIDDEN);
-		pEvents->SetFieldState(this, SFI_CERTIFICATE, CPFS_HIDDEN);
-		pEvents->SetFieldString(this, SFI_PIN, L"");
-		pEvents->SetFieldString(this, SFI_MESSAGE, s_szReconnectCard);
-	}
-	else
-	{
-		pEvents->SetFieldState(this, SFI_PIN, _rgFieldStatePairs[SFI_PIN].cpfs);
-		pEvents->SetFieldState(this, SFI_SUBMIT_BUTTON, _rgFieldStatePairs[SFI_SUBMIT_BUTTON].cpfs);
-		pEvents->SetFieldState(this, SFI_CERTIFICATE,
-			IsCertificateLinkAllowed() ? _rgFieldStatePairs[SFI_CERTIFICATE].cpfs : CPFS_HIDDEN);
-		pEvents->SetFieldString(this, SFI_PIN, L"");
-		pEvents->SetFieldString(this, SFI_MESSAGE, pwszMessage ? pwszMessage : L"");
-		pEvents->SetFieldInteractiveState(this, SFI_PIN, CPFIS_FOCUSED);
-	}
-	CoTaskMemFree(pwszMessage);
-	pEvents->Release();
+	EIDCardLibraryTrace(WINEVENT_LEVEL_INFO,L"EVID: wrong-PIN countdown over tile=%p",(void*)this);
+	// Bring back the PIN prompt (or the reconnect message, if the card is out).
+	UpdateConnectionFields();
+	// Allowed from the timer's own callback: it is freed once this callback returns.
+	CloseThreadpoolTimer(pTimer);
+	// The timer's reference. May delete this tile: nothing may touch a member after it.
+	Release();
 }
+
 // LogonUI calls this in order to give us a callback in case we need to notify it of anything.
 HRESULT CEIDCredential::Advise(
     ICredentialProviderCredentialEvents* pcpce
@@ -483,6 +667,11 @@ HRESULT CEIDCredential::GetFieldState(
         {
             *pcpfs = CPFS_HIDDEN;
         }
+        // Likewise the PIN entry and submit button while the wrong-PIN countdown runs.
+        if ((dwFieldID == SFI_PIN || dwFieldID == SFI_SUBMIT_BUTTON) && IsPinThrottled())
+        {
+            *pcpfs = CPFS_HIDDEN;
+        }
         // The certificate viewer must not be reachable as SYSTEM on the secure desktop (logon /
         // unlock screens, UAC prompt in consent.exe); see IsCertificateLinkAllowed.
         if (dwFieldID == SFI_CERTIFICATE && !IsCertificateLinkAllowed())
@@ -516,9 +705,16 @@ HRESULT CEIDCredential::GetStringValue(
         // Make a copy of the string and return that. The caller
         // is responsible for freeing it.
         EnterCriticalSection(&_csFields);
+        const DWORD dwThrottleSeconds = (dwFieldID == SFI_MESSAGE) ? PinThrottleSecondsLeft() : 0;
         if (_fDisconnected && dwFieldID == SFI_MESSAGE)
         {
             hr = SHStrDupW(s_szReconnectCard, ppwsz);
+        }
+        else if (dwThrottleSeconds != 0)
+        {
+            WCHAR szThrottle[128];  // NOSONAR - LSASS-01: C-style buffer for LSASS safety
+            FormatPinThrottleMessage(dwThrottleSeconds, szThrottle, ARRAYSIZE(szThrottle));
+            hr = SHStrDupW(szThrottle, ppwsz);
         }
         else
         {
@@ -856,9 +1052,29 @@ HRESULT CEIDCredential::GetSerialization(
     CREDENTIAL_PROVIDER_STATUS_ICON* pcpsiOptionalStatusIcon
     )
 {
-    UNREFERENCED_PARAMETER(ppwszOptionalStatusText);
-    UNREFERENCED_PARAMETER(pcpsiOptionalStatusIcon);
     HRESULT hr;  // NOSONAR - EXPLICIT-TYPE-03: HRESULT visible for security audit
+
+    // The PIN box is hidden while the wrong-PIN countdown runs; refuse a submission that gets
+    // here anyway rather than send the PIN to the card.
+    EnterCriticalSection(&_csFields);
+    const DWORD dwThrottleSeconds = PinThrottleSecondsLeft();
+    LeaveCriticalSection(&_csFields);
+    if (dwThrottleSeconds != 0)
+    {
+        WCHAR szThrottle[128];  // NOSONAR - LSASS-01: C-style buffer for LSASS safety
+        FormatPinThrottleMessage(dwThrottleSeconds, szThrottle, ARRAYSIZE(szThrottle));
+        if (ppwszOptionalStatusText)
+        {
+            SHStrDupW(szThrottle, ppwszOptionalStatusText);
+        }
+        if (pcpsiOptionalStatusIcon)
+        {
+            *pcpsiOptionalStatusIcon = CPSI_WARNING;
+        }
+        *pcpgsr = CPGSR_NO_CREDENTIAL_NOT_FINISHED;
+        EIDCardLibraryTrace(WINEVENT_LEVEL_INFO,L"Submission refused: wrong-PIN countdown, %lu s left",dwThrottleSeconds);
+        return S_OK;
+    }
 
     WCHAR wsz[MAX_COMPUTERNAME_LENGTH+1];  // NOSONAR - LSASS-01: C-style buffer for LSASS safety
     DWORD cch = ARRAYSIZE(wsz);
@@ -1081,6 +1297,19 @@ HRESULT CEIDCredential::ReportResult(
             pEvents->SetFieldString(this, SFI_PIN, L"");
             pEvents->Release();
         }
+    }
+
+    // Wrong-PIN countdown: count wrong PINs (starting the countdown from the
+    // EID_PIN_FREE_ATTEMPTS-th on); a successful logon starts the count afresh.
+    if (ntsStatus == STATUS_SMARTCARD_WRONG_PIN)
+    {
+        RecordWrongPin();
+    }
+    else if (ntsStatus == STATUS_SUCCESS)
+    {
+        EnterCriticalSection(&_csFields);
+        _dwWrongPinCount = 0;
+        LeaveCriticalSection(&_csFields);
     }
 
     // Since NULL is a valid value for *ppwszOptionalStatusText and *pcpsiOptionalStatusIcon
