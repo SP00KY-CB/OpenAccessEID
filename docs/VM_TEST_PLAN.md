@@ -289,3 +289,25 @@ Policy key: same subkey, DWORD `RequireRevocationCheck` (default 0/off, fail-clo
    hive); `certutil -key | findstr /i <CA container>` -> gone.
 5. Reinstall, uninstall again with the box UNTICKED -> CA cert, user certs
    and key container all survive.
+
+## Uninstall leftovers and wrong-PIN countdown
+
+Uninstall (the trace consumer service used to outlive the uninstaller's delete,
+leaving `EIDTraceConsumer.exe` and the installation folder behind):
+
+| # | Step | Expected | ✓ | Notes |
+|---|------|----------|---|-------|
+| L1 | Install, reboot, confirm `sc query EIDTraceConsumer` is RUNNING (diagnostics off, the default). Uninstall interactively. | The uninstall log shows `Service stopped` and `Service uninstalled successfully`. `C:\Program Files\OpenAccess EID` is gone **before** rebooting; `sc query EIDTraceConsumer` reports the service does not exist. | ☐ | |
+| L2 | Repeat L1 with diagnostics capture enabled by policy. | Same result. | ☐ | |
+| L3 | Repeat L1 as a silent uninstall (`EIDUninstall.exe /S`). | Same result. | ☐ | |
+| L4 | Upgrade from **v2.1.00_TEST_REL** (whose uninstaller does not wait for the service). | Install completes with no "Error opening file for writing" prompt for `EIDTraceConsumer.exe`; after the reboot `sc query EIDTraceConsumer` is RUNNING from `C:\Program Files\OpenAccess EID\EIDTraceConsumer.exe`. | ☐ | |
+
+Wrong-PIN countdown at the logon / unlock tile:
+
+| # | Step | Expected | ✓ | Notes |
+|---|------|----------|---|-------|
+| P1 | Use a card whose PIN allows **more than 6** wrong attempts (or note the card's own limit first). Enter a wrong PIN five times. | Each is refused with the usual message; no wait between attempts. | ☐ | |
+| P2 | After the fifth, dismiss the error. | The PIN box and Submit button are hidden and the tile reads "Too many incorrect PINs. Try again in N seconds.", counting down from 10 once a second. The screen stays responsive. At 0 the PIN box comes back with focus. | ☐ | |
+| P3 | Enter a sixth wrong PIN. | Another 10-second countdown. | ☐ | |
+| P4 | During a countdown, remove the card, then re-insert it. | Removal shows "Please reconnect your smart card"; re-insertion brings the PIN box straight back with no countdown, and five more wrong PINs are allowed before the next one. | ☐ | |
+| P5 | After a countdown ends, enter the correct PIN. | Logon succeeds. A later wrong PIN starts the count from one again. | ☐ | |
