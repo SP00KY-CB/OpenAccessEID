@@ -1,6 +1,7 @@
 #include "StringConversion.h"
 #include <stdarg.h>
 #include <algorithm>
+#include <climits>
 #include <cstring>
 
 namespace EID {
@@ -49,19 +50,29 @@ namespace EID {
         va_list args;
         va_start(args, format);
 
-        // First pass: get required size
-        int size = _vscwprintf(format, args) + 1;
-        if (size <= 1) {
+        // First pass: get the required length. It consumes a va_list, so it
+        // works on a copy - reusing args itself for the second pass is
+        // undefined behaviour.
+        va_list argsCopy;
+        va_copy(argsCopy, args);
+        const int cch = _vscwprintf(format, argsCopy);
+        va_end(argsCopy);
+        // -1 is a formatting error; INT_MAX would overflow the +1 below.
+        if (cch <= 0 || cch >= INT_MAX) {
             va_end(args);
             return std::wstring();
         }
 
-        // Allocate and format
-        std::vector<wchar_t> buffer(size);
-        vswprintf_s(buffer.data(), buffer.size(), format, args);
+        // Allocate and format. _TRUNCATE: never the CRT invalid-parameter
+        // handler (which terminates the process) if the two passes disagree.
+        std::vector<wchar_t> buffer(static_cast<size_t>(cch) + 1);
+        const int written = _vsnwprintf_s(buffer.data(), buffer.size(), _TRUNCATE, format, args);
         va_end(args);
+        if (written < 0) {
+            return std::wstring();
+        }
 
-        return std::wstring(buffer.data());
+        return std::wstring(buffer.data(), static_cast<size_t>(written));
     }
 
     std::wstring BuildContainerNameFromReader(const std::wstring& readerName)

@@ -62,13 +62,21 @@ bool WouldOverflow(ULONG_PTR offset, ULONG length, ULONG limit)
 	return offset + length > limit;
 }
 
-// Mirror of the per-UNICODE_STRING rule RemapPointer applies. Both
-// MaximumLength and Length are checked, in that order.
+// Mirror of the per-UNICODE_STRING rule RemapPointer applies
+// (IsCountedStringHeaderValid, then the bounds check). Length may not exceed
+// MaximumLength, an absent (NULL) Buffer must carry no length, and both
+// MaximumLength and Length are bounds-checked, in that order.
 bool CountedStringFits(const UNICODE_STRING& us, ULONG cbBuffer)
 {
+	if (us.Length > us.MaximumLength)
+	{
+		return false;
+	}
 	if (us.Buffer == nullptr)
 	{
-		return true;   // absent field: nothing to rebase
+		// absent field: nothing to rebase, but a length with no buffer is
+		// rejected (it reached memcpy_s(..., NULL, Length) in the logon path)
+		return us.Length == 0 && us.MaximumLength == 0;
 	}
 	const ULONG_PTR offset = reinterpret_cast<ULONG_PTR>(us.Buffer);
 	if (WouldOverflow(offset, us.MaximumLength, cbBuffer)) return false;
@@ -109,6 +117,10 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
 		const ULONG_PTR offset = reinterpret_cast<ULONG_PTR>(pUnlock->Logon.CspData);
 		fCspOk = !WouldOverflow(offset, pUnlock->Logon.CspDataLength, cbBuffer);
 	}
+	else
+	{
+		fCspOk = (pUnlock->Logon.CspDataLength == 0);
+	}
 
 	if (fUserNameOk && fDomainOk && fPinOk && fCspOk)
 	{
@@ -123,8 +135,12 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
 		volatile WCHAR wchSink = 0;
 		for (size_t i = 0; i < ARRAYSIZE(rgStrings); i++)
 		{
+			EID_ORACLE_REQUIRE(rgStrings[i]->Length <= rgStrings[i]->MaximumLength,
+				"a validated UNICODE_STRING has Length > MaximumLength");
 			if (rgStrings[i]->Buffer == nullptr)
 			{
+				EID_ORACLE_REQUIRE(rgStrings[i]->Length == 0,
+					"a validated UNICODE_STRING has a NULL Buffer with a non-zero Length");
 				continue;
 			}
 			const ULONG_PTR off = reinterpret_cast<ULONG_PTR>(rgStrings[i]->Buffer);

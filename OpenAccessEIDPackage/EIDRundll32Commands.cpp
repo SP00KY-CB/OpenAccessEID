@@ -25,8 +25,6 @@
 #include "../EIDCardLibrary/Registration.h"
 #include "../EIDCardLibrary/Tracing.h"
 
-BOOL LsaEIDRemoveAllStoredCredential();
-
 extern "C"
 {
 	
@@ -125,11 +123,9 @@ extern "C"
 		int ret = ERROR_INSTALL_FAILURE;
 		__try
 		{
-			if (!LsaEIDRemoveAllStoredCredential())
-			{
-				dwError = GetLastError();
-				__leave;
-			}
+			// Unregistration only. Stored credentials are kept, as they are by DllUnRegister:
+			// removing every user's enrolment is the explicit, opt-in CleanupLsaCredentials
+			// action, never a side effect of uninstalling.
 			// this function is unimplemented and trigger the reboot,
 			// but call it anyway
 			if (!UnRegisterTheSecurityPackage())

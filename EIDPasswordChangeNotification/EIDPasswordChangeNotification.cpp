@@ -85,6 +85,12 @@ NTSTATUS WINAPI PasswordChangeNotify(
 	EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"Enter");
 	EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"Username %wZ RelativeId %d",UserName,RelativeId);
 	CStoredCredentialManager* manager = CStoredCredentialManager::Instance();
-	manager->UpdateCredential(RelativeId, NewPassword->Buffer, NewPassword->Length);
+	// A blank password arrives as Length 0 with a possibly NULL Buffer; there is
+	// nothing to re-seal (UpdateCredential refuses it) and passing it on used to
+	// crash LSASS in wcslen.
+	if (manager && NewPassword && NewPassword->Buffer && NewPassword->Length > 0)
+	{
+		manager->UpdateCredential(RelativeId, NewPassword->Buffer, NewPassword->Length);
+	}
 	return TRUE;
 }

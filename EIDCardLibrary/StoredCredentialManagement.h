@@ -72,6 +72,8 @@ public:
 	BOOL GetPasswordFromSignatureChallengeResponse(__in DWORD dwRid, __in PBYTE ppChallenge, __in DWORD dwChallengeSize, __in PBYTE pResponse, __in DWORD dwResponseSize, __out PWSTR *pszPassword);
 	BOOL GetPasswordFromDPAPIChallengeResponse(__in DWORD dwRid, __in PBYTE ppChallenge, __in DWORD dwChallengeSize, __in PBYTE pResponse, __in DWORD dwResponseSize, __out PWSTR *pszPassword);
 	BOOL GetCertContextFromRid(__in DWORD dwRid, __out PCCERT_CONTEXT* ppContext, __out PBOOL fEncryptPassword);
+	// TRUE when the check completed; *pfBoundElsewhere is set when another account already holds pContext.
+	BOOL IsCertificateBoundToOtherRid(__in DWORD dwRid, __in PCCERT_CONTEXT pContext, __out PBOOL pfBoundElsewhere);
 	// Internal buffer processing using std::span for bounds safety
 	void ProcessSecretBufferInternal(__in DWORD dwRid, std::span<const BYTE> secret) noexcept;
 	void ProcessSecretBufferDebugInternal(__in DWORD dwRid, std::span<const BYTE> secret) noexcept;

@@ -7,8 +7,10 @@
 #include <LM.h>
 #include <vector>
 
-// User information structure
-struct UserInfo
+// User information structure.
+// Not named UserInfo: EIDManageUsers links this file and has its own, different
+// UserInfo, and two definitions under one name break the one-definition rule.
+struct LocalUserInfo
 {
     std::wstring wsUsername;
     std::wstring wsFullName;
@@ -19,7 +21,7 @@ struct UserInfo
     BOOL fEnabled;
     BOOL fPasswordExpired;
 
-    UserInfo() :
+    LocalUserInfo() :
         dwRid(0),  // NOSONAR - INIT-01: member initialized via constructor initializer list
         dwAccountId(0),  // NOSONAR - INIT-01: member initialized via constructor initializer list
         fEnabled(TRUE),  // NOSONAR - INIT-01: member initialized via constructor initializer list
@@ -35,7 +37,7 @@ HRESULT UserExists(
 // Get user information
 HRESULT GetUserInfo(
     _In_ const std::wstring& wsUsername,
-    _Out_ UserInfo& info);
+    _Out_ LocalUserInfo& info);
 
 // Get user RID
 HRESULT GetUserRid(
@@ -73,7 +75,7 @@ HRESULT SetUserPasswordNeverExpires(
 
 // Enumerate local users
 HRESULT EnumerateLocalUsers(
-    _Out_ std::vector<UserInfo>& users);
+    _Out_ std::vector<LocalUserInfo>& users);
 
 // Display user information
-void DisplayUserInfo(_In_ const UserInfo& info);
+void DisplayUserInfo(_In_ const LocalUserInfo& info);

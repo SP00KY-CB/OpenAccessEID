@@ -486,6 +486,10 @@ VOID CreateReport(PTSTR szNamedPipeName) // NOSONAR - API-01: PTSTR parameter di
 		{
 			CloseHandle(hReport);
 		}
+		if (hPipe != INVALID_HANDLE_VALUE)
+		{
+			CloseHandle(hPipe);
+		}
 	}
 }
 

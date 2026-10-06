@@ -31,13 +31,13 @@
     STDMETHOD_(ULONG, AddRef)()                                             \
     {                                                                       \
         LONG cRef = InterlockedIncrement(&_cRef);                           \
-        EIDCardLibraryTrace(WINEVENT_LEVEL_INFO, L"AddRef %X (%d)", this, cRef); \
+        EIDCardLibraryTrace(WINEVENT_LEVEL_INFO, L"AddRef %p (%ld)", this, cRef);   \
         return cRef;                                                        \
     }                                                                       \
     STDMETHOD_(ULONG, Release)()                                            \
     {                                                                       \
         LONG cRef = InterlockedDecrement(&_cRef);                           \
-        EIDCardLibraryTrace(WINEVENT_LEVEL_INFO, L"Release %X (%d)", this, cRef); \
+        EIDCardLibraryTrace(WINEVENT_LEVEL_INFO, L"Release %p (%ld)", this, cRef);   \
         if (!cRef)                                                          \
         {                                                                   \
             delete this;                                                    \

@@ -259,11 +259,11 @@ BOOL ParseCommandLine(_In_ int argc, _In_ PWSTR argv[], _Out_ COMMAND_OPTIONS& o
             {
                 std::wstring wsGroup = wsGroupList.substr(0, pos);
                 if (!wsGroup.empty())  // NOSONAR - COMPLEXITY-01: nested control flow and local scope retained; logic verified
-                    options.SelectedGroups.push_back(wsGroup);
+                    options.SelectedGroups.push_back(std::move(wsGroup));
                 wsGroupList.erase(0, pos + 1);
             }
             if (!wsGroupList.empty())
-                options.SelectedGroups.push_back(wsGroupList);
+                options.SelectedGroups.push_back(std::move(wsGroupList));
         }
         else if (wsArg == L"-local")
         {

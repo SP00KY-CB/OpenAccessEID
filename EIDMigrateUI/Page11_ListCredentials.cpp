@@ -19,7 +19,7 @@ INT_PTR CALLBACK FilePasswordDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPA
 
 // Structure for file password dialog data
 struct FILE_PASSWORD_DATA {
-    std::wstring wsPassword;
+    SecureWString wsPassword;  // zeroed when released
     BOOL fConfirmed;
     FILE_PASSWORD_DATA() : fConfirmed(FALSE) {}  // NOSONAR - INIT-01: constructor initializer list retained for clarity
 };
@@ -108,7 +108,7 @@ INT_PTR CALLBACK FilePasswordDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPA
             }
 
             // Password length validation
-            if (wcslen(szPassword) < 16) // NOSONAR - szPassword is stack-allocated buffer, never NULL
+            if (wcsnlen(szPassword, ARRAYSIZE(szPassword)) < 16) // NOSONAR - szPassword is stack-allocated buffer, never NULL
             {
                 int nResult = MessageBoxW(hwndDlg,
                     L"The password is less than 16 characters. A strong password is recommended.\n\nDo you want to continue?",
@@ -122,7 +122,7 @@ INT_PTR CALLBACK FilePasswordDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPA
                 }
             }
 
-            pData->wsPassword = szPassword;
+            pData->wsPassword.assign(szPassword, wcsnlen(szPassword, ARRAYSIZE(szPassword))); // NOSONAR - szPassword is stack-allocated buffer, never NULL
             pData->fConfirmed = TRUE;
             SecureZeroMemory(szPassword, sizeof(szPassword));
             SecureZeroMemory(szConfirm, sizeof(szConfirm));
@@ -165,7 +165,7 @@ static SecureWString PromptForFilePassword(HWND hwndParent, BOOL bForEncryption 
 
     if (nResult == IDOK && data.fConfirmed)
     {
-        return SecureWString(data.wsPassword.c_str());
+        return data.wsPassword;
     }
 
     return SecureWString();
@@ -281,7 +281,7 @@ static HRESULT EnumerateFileCredentialsHelper(HWND hList, HWND hwndDlg)
             pWIZARD_DATA->credentials = data.credentials;
             pWIZARD_DATA->groups = data.groups;
             pWIZARD_DATA->wsInputFile = g_wsCurrentFile;
-            pWIZARD_DATA->wsPassword = std::wstring(wsPassword.c_str());
+            pWIZARD_DATA->wsPassword = wsPassword;
         }
 
         if (hList)
@@ -314,59 +314,56 @@ static HRESULT EnumerateFileCredentialsHelper(HWND hList, HWND hwndDlg)
 }
 
 // Helper function to show credential details
+// Built with std::wstring: subject/issuer come from an imported (untrusted)
+// file and can be arbitrarily long, so a fixed buffer filled by a chain of
+// swprintf_s calls could hit the CRT invalid-parameter handler (fast-fail).
 static void ShowCredentialDetails(HWND hwndParent, _In_ const CredentialInfo& cred)
 {
-    WCHAR szDetails[4096]; // NOSONAR - C-style array required for building formatted details string for MessageBox
-    DWORD dwPos = 0;
+    std::wstring wsDetails;
 
-    dwPos += swprintf_s(szDetails + dwPos, ARRAYSIZE(szDetails) - dwPos,
-        L"Credential Details for: %s\r\n\r\n", cred.wsUsername.c_str());
-
-    dwPos += swprintf_s(szDetails + dwPos, ARRAYSIZE(szDetails) - dwPos,
-        L"RID: %u\r\n", cred.dwRid);
+    wsDetails += L"Credential Details for: " + cred.wsUsername + L"\r\n\r\n";  // NOSONAR - FORMAT-01: plain appends keep untrusted lengths allocation-safe
+    wsDetails += L"RID: " + std::to_wstring(cred.dwRid) + L"\r\n";
 
     PCWSTR pwszEncFallback = (cred.EncryptionType == EID_PRIVATE_DATA_TYPE::eidpdtDPAPI) ? L"DPAPI" : L"None";
     PCWSTR pwszEnc = (cred.EncryptionType == EID_PRIVATE_DATA_TYPE::eidpdtCrypted) ? L"Certificate-based" : pwszEncFallback;
-    dwPos += swprintf_s(szDetails + dwPos, ARRAYSIZE(szDetails) - dwPos,
-        L"Encryption Type: %s\r\n", pwszEnc);
+    wsDetails += L"Encryption Type: ";
+    wsDetails += pwszEnc;
+    wsDetails += L"\r\n";
 
     if (!cred.wsSid.empty())
     {
-        dwPos += swprintf_s(szDetails + dwPos, ARRAYSIZE(szDetails) - dwPos,
-            L"SID: %s\r\n", cred.wsSid.c_str());
+        wsDetails += L"SID: " + cred.wsSid + L"\r\n";
     }
 
-    dwPos += swprintf_s(szDetails + dwPos, ARRAYSIZE(szDetails) - dwPos,
-        L"\r\n--- Certificate Information ---\r\n");
+    wsDetails += L"\r\n--- Certificate Information ---\r\n";
 
     if (!cred.Certificate.empty())
     {
-        dwPos += swprintf_s(szDetails + dwPos, ARRAYSIZE(szDetails) - dwPos,
-            L"Certificate Size: %zu bytes\r\n", cred.Certificate.size());
-        dwPos += swprintf_s(szDetails + dwPos, ARRAYSIZE(szDetails) - dwPos,
-            L"Certificate Present: Yes\r\n");
+        wsDetails += L"Certificate Size: " + std::to_wstring(cred.Certificate.size()) + L" bytes\r\n";
+        wsDetails += L"Certificate Present: Yes\r\n";
     }
     else
     {
-        dwPos += swprintf_s(szDetails + dwPos, ARRAYSIZE(szDetails) - dwPos,
-            L"Certificate Present: No\r\n");
+        wsDetails += L"Certificate Present: No\r\n";
     }
 
-    // Certificate hash
+    // Certificate hash. The hex digits are ASCII, so widening each char is exact.
     std::string sHash = BytesToHex(cred.CertificateHash, CERT_HASH_LENGTH);
-    dwPos += swprintf_s(szDetails + dwPos, ARRAYSIZE(szDetails) - dwPos,
-        L"Certificate Hash: %S\r\n", sHash.c_str());
+    wsDetails += L"Certificate Hash: ";
+    for (char ch : sHash)
+    {
+        wsDetails += static_cast<wchar_t>(ch);
+    }
+    wsDetails += L"\r\n";
 
     if (!cred.wsCertSubject.empty())
     {
-        dwPos += swprintf_s(szDetails + dwPos, ARRAYSIZE(szDetails) - dwPos,
-            L"Subject: %s\r\n", cred.wsCertSubject.c_str());
+        wsDetails += L"Subject: " + cred.wsCertSubject + L"\r\n";
     }
 
     if (!cred.wsCertIssuer.empty())
     {
-        dwPos += swprintf_s(szDetails + dwPos, ARRAYSIZE(szDetails) - dwPos,
-            L"Issuer: %s\r\n", cred.wsCertIssuer.c_str());
+        wsDetails += L"Issuer: " + cred.wsCertIssuer + L"\r\n";
     }
 
     // Convert FILETIME to readable expiry date
@@ -375,28 +372,28 @@ static void ShowCredentialDetails(HWND hwndParent, _In_ const CredentialInfo& cr
         SYSTEMTIME st = {0};
         if (FileTimeToSystemTime(&cred.ftCertValidTo, &st))
         {
-            dwPos += swprintf_s(szDetails + dwPos, ARRAYSIZE(szDetails) - dwPos,
-                L"Expires: %04u-%02u-%02u %02u:%02u:%02u\r\n",
+            WCHAR szDate[64]; // NOSONAR - C-style array; fixed-width numeric fields always fit
+            swprintf_s(szDate, ARRAYSIZE(szDate), L"%04u-%02u-%02u %02u:%02u:%02u",
                 st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+            wsDetails += L"Expires: ";
+            wsDetails += szDate;
+            wsDetails += L"\r\n";
         }
     }
 
-    dwPos += swprintf_s(szDetails + dwPos, ARRAYSIZE(szDetails) - dwPos,
-        L"\r\n--- Encryption Data ---\r\n");
+    wsDetails += L"\r\n--- Encryption Data ---\r\n";
 
     if (!cred.SymmetricKey.empty())
     {
-        dwPos += swprintf_s(szDetails + dwPos, ARRAYSIZE(szDetails) - dwPos,
-            L"Symmetric Key: %zu bytes\r\n", cred.SymmetricKey.size());
+        wsDetails += L"Symmetric Key: " + std::to_wstring(cred.SymmetricKey.size()) + L" bytes\r\n";
     }
 
     if (!cred.EncryptedPassword.empty())
     {
-        swprintf_s(szDetails + dwPos, ARRAYSIZE(szDetails) - dwPos,
-            L"Encrypted Password: %zu bytes\r\n", cred.EncryptedPassword.size());
+        wsDetails += L"Encrypted Password: " + std::to_wstring(cred.EncryptedPassword.size()) + L" bytes\r\n";
     }
 
-    MessageBoxW(hwndParent, szDetails, L"Credential Details", MB_OK | MB_ICONINFORMATION);
+    MessageBoxW(hwndParent, wsDetails.c_str(), L"Credential Details", MB_OK | MB_ICONINFORMATION);
 }
 
 INT_PTR CALLBACK WndProc_11_ListCredentials(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)  // NOSONAR - COMPLEXITY-01: refactor deferred; logic verified
@@ -661,7 +658,7 @@ INT_PTR CALLBACK WndProc_11_ListCredentials(HWND hwndDlg, UINT uMsg, WPARAM wPar
             ExportFileData data;
             data.credentials = selectedCredentials;
             data.formatVersion = "EIDMigrate-v1.0";
-            data.dwVersion = 1;
+            data.dwVersion = EIDMIGRATE_VERSION;  // match the binary header (FileFormat.h), as Export.cpp does
 
             // Get current UTC time for export date (ISO 8601 format)
             data.exportDate = WideToUtf8(FormatCurrentTimestamp());

@@ -103,13 +103,13 @@ INT_PTR CALLBACK WndProc_12_ValidateFile(HWND hwndDlg, UINT uMsg, WPARAM wParam,
             GetDlgItemText(hwndDlg, IDC_12_FILE_PATH, szFile, ARRAYSIZE(szFile));
             GetDlgItemText(hwndDlg, IDC_12_PASSWORD, szPassword, ARRAYSIZE(szPassword));
 
-            if (wcslen(szFile) == 0) { // NOSONAR - szFile is stack-allocated buffer, never NULL
+            if (wcsnlen(szFile, ARRAYSIZE(szFile)) == 0) { // NOSONAR - szFile is stack-allocated buffer, never NULL
                 MessageBoxW(hwndDlg, L"Please select a file to validate.",
                     L"Validate", MB_ICONEXCLAMATION);
                 return TRUE;
             }
 
-            if (wcslen(szPassword) == 0) { // NOSONAR - szPassword is stack-allocated buffer, never NULL
+            if (wcsnlen(szPassword, ARRAYSIZE(szPassword)) == 0) { // NOSONAR - szPassword is stack-allocated buffer, never NULL
                 MessageBoxW(hwndDlg, L"Please enter the passphrase.",
                     L"Validate", MB_ICONEXCLAMATION);
                 return TRUE;

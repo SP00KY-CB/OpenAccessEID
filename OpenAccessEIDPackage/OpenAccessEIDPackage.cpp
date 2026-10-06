@@ -157,17 +157,26 @@ extern "C"
 	// MatchUserOrIsAdmin - Check if the calling client matches the target RID or is an administrator
 	// Uses impersonation to lock the client's security context during authorization check
 	// This mitigates TOCTOU (Time-of-Check-Time-of-Use) vulnerabilities
+	//
+	// ORDER MATTERS: the impersonation-level and restricted-token checks run
+	// BEFORE the same-user match, and the same-user identity is the user SID
+	// of the impersonated thread token - not the SID of the logon session
+	// named by ClientInfo.LogonId. A caller impersonating an identification-
+	// level token of a victim (for example an S4U token) carries the victim's
+	// logon id but must not be able to act as the victim here.
 	BOOL MatchUserOrIsAdmin(__in DWORD dwRid)
 	{
 		BOOL fReturn = FALSE;
 		SECPKG_CLIENT_INFO ClientInfo;
 		NTSTATUS status;  // NOSONAR - EXPLICIT-TYPE-01: NTSTATUS visible for security audit
-		PSECURITY_LOGON_SESSION_DATA pLogonSessionData = NULL;
-		DWORD dwError = 0;
+		DWORD dwError = ERROR_ACCESS_DENIED;
 		PSID AdministratorsGroup = NULL;
-		HANDLE hProcess = NULL;  // NOSONAR - EXPLICIT-TYPE-02: HANDLE visible for security audit
-		HANDLE hToken = NULL;  // NOSONAR - EXPLICIT-TYPE-02: HANDLE visible for security audit
+		HANDLE hImpToken = NULL;  // NOSONAR - EXPLICIT-TYPE-02: HANDLE visible for security audit
 		BOOL bImpersonating = FALSE;
+		BOOL fIsAdmin = FALSE;
+		SECURITY_IMPERSONATION_LEVEL ImpersonationLevel = SecurityAnonymous;
+		DWORD dwReturnLength = 0;
+		PTOKEN_USER pTokenUser = NULL;
 		__try
 		{
 			if (STATUS_SUCCESS != MyLsaDispatchTable->GetClientInfo(&ClientInfo))
@@ -175,33 +184,102 @@ extern "C"
 				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"GetClientInfo");
 				__leave;
 			}
+			// Refuse restricted callers: the caller was deliberately sandboxed
+			// and must not manage or query stored credentials.
+			if (ClientInfo.Restricted)
+			{
+				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"Client token is restricted - denying rid 0x%x", dwRid);
+				__leave;
+			}
+			// If the client was itself impersonating when it called us, refuse an
+			// identification/anonymous-level token: a service coerced into making
+			// the call on behalf of another user must not inherit that user's
+			// identity or rights here.
+			if (ClientInfo.Impersonating && ClientInfo.ImpersonationLevel < SecurityImpersonation)
+			{
+				dwError = ERROR_BAD_IMPERSONATION_LEVEL;
+				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"Client impersonation level %d too low - denying", static_cast<int>(ClientInfo.ImpersonationLevel));
+				__leave;
+			}
 
 			// Impersonate the client to lock their security context
 			// This prevents TOCTOU attacks where privileges change between check and use
+			// FAIL CLOSED: without the client's thread token there is no
+			// trustworthy identity to compare against.
 			status = MyLsaDispatchTable->ImpersonateClient();
 			if (status != STATUS_SUCCESS)
 			{
-				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"ImpersonateClient 0x%08x", status);
-				// Continue without impersonation - still safe due to LSA context
+				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"ImpersonateClient 0x%08x - denying", status);
+				__leave;
 			}
-			else
+			bImpersonating = TRUE;
+
+			// OpenAsSelf = TRUE: open the token with LSASS's own rights, not the
+			// (impersonated) client's, which may not be allowed to query it.
+			if (!OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &hImpToken))
 			{
-				bImpersonating = TRUE;
+				dwError = GetLastError();
+				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"OpenThreadToken 0x%08x",dwError);
+				__leave;
+			}
+			if (!GetTokenInformation(hImpToken, TokenImpersonationLevel, &ImpersonationLevel, sizeof(ImpersonationLevel), &dwReturnLength))
+			{
+				dwError = GetLastError();
+				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"GetTokenInformation(TokenImpersonationLevel) 0x%08x",dwError);
+				__leave;
+			}
+			// A client that was itself impersonating must hand us a full
+			// impersonation token (checked above via ClientInfo as well). A
+			// direct caller's token is only read here (user SID and group
+			// membership), which works at identification level, so accept that
+			// rather than deny every caller should the LSA channel's QoS only
+			// grant SecurityIdentification.
+			if (ImpersonationLevel < (ClientInfo.Impersonating ? SecurityImpersonation : SecurityIdentification))
+			{
+				dwError = ERROR_BAD_IMPERSONATION_LEVEL;
+				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"Impersonation level %d too low - denying", static_cast<int>(ImpersonationLevel));
+				__leave;
+			}
+			if (IsTokenRestricted(hImpToken))
+			{
+				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"Impersonation token is restricted - denying rid 0x%x", dwRid);
+				__leave;
 			}
 
-			status = LsaGetLogonSessionData(&(ClientInfo.LogonId), &pLogonSessionData);
-			if (status != STATUS_SUCCESS)
+			// User SID of the impersonated client token.
+			dwReturnLength = 0;
+			if (!GetTokenInformation(hImpToken, TokenUser, NULL, 0, &dwReturnLength)
+				&& GetLastError() != ERROR_INSUFFICIENT_BUFFER)
 			{
-				dwError = LsaNtStatusToWinError(status);
-				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"LsaGetLogonSessionData 0x%08x",status);
+				dwError = GetLastError();
+				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"GetTokenInformation(TokenUser) size 0x%08x",dwError);
 				__leave;
 			}
-			// Validate SID before dereferencing to prevent NULL pointer crash
-			if (pLogonSessionData->Sid == NULL)
+			if (dwReturnLength < sizeof(TOKEN_USER))
 			{
-				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"pLogonSessionData->Sid is NULL");
+				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"GetTokenInformation(TokenUser) size %u too small", dwReturnLength);
 				__leave;
 			}
+			pTokenUser = static_cast<PTOKEN_USER>(EIDAlloc(dwReturnLength));
+			if (!pTokenUser)
+			{
+				dwError = ERROR_NOT_ENOUGH_MEMORY;
+				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"EIDAlloc TOKEN_USER");
+				__leave;
+			}
+			if (!GetTokenInformation(hImpToken, TokenUser, pTokenUser, dwReturnLength, &dwReturnLength))
+			{
+				dwError = GetLastError();
+				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"GetTokenInformation(TokenUser) 0x%08x",dwError);
+				__leave;
+			}
+			if (pTokenUser->User.Sid == NULL || !IsValidSid(pTokenUser->User.Sid))
+			{
+				dwError = ERROR_ACCESS_DENIED;
+				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"Token user SID invalid - denying");
+				__leave;
+			}
+
 			// Compare the WHOLE SID, not just the trailing RID.
 			//
 			// The previous check was
@@ -225,6 +303,7 @@ extern "C"
 				LSA_HANDLE hPolicy = nullptr;
 				if (STATUS_SUCCESS != LsaOpenPolicy(nullptr, &ObjectAttributes, POLICY_VIEW_LOCAL_INFORMATION, &hPolicy))
 				{
+					dwError = ERROR_ACCESS_DENIED;
 					EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"LsaOpenPolicy failed; denying");
 					__leave;
 				}
@@ -235,6 +314,7 @@ extern "C"
 				if (queryStatus != STATUS_SUCCESS || !pDomainInfo || !pDomainInfo->DomainSid)
 				{
 					if (pDomainInfo) LsaFreeMemory(pDomainInfo);
+					dwError = ERROR_ACCESS_DENIED;
 					EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"LsaQueryInformationPolicy failed; denying");
 					__leave;
 				}
@@ -256,7 +336,7 @@ extern "C"
 								*GetSidSubAuthority(pAccountSid, i) = *GetSidSubAuthority(pDomainInfo->DomainSid, i);
 							}
 							*GetSidSubAuthority(pAccountSid, ucDomainSubAuthorities) = dwRid;
-							fIsSameUser = EqualSid(pAccountSid, pLogonSessionData->Sid);
+							fIsSameUser = EqualSid(pAccountSid, pTokenUser->User.Sid);
 						}
 						EIDFree(pAccountSid);
 					}
@@ -266,40 +346,52 @@ extern "C"
 				if (fIsSameUser)
 				{
 					// is current user = TRUE
+					dwError = 0;
 					fReturn = TRUE;
 					__leave;
 				}
 			}
 			// is admin ?
+			//
+			// FAIL CLOSED: fReturn is still FALSE here and is set TRUE only on a
+			// positive membership result below. The previous code stored the
+			// AllocateAndInitializeSid result in fReturn, so any later failure
+			// (OpenTokenByLogonId, CheckTokenMembership) __leave'd with TRUE and
+			// granted access. It also checked membership on the logon session's
+			// token from OpenTokenByLogonId, which may be a primary token -
+			// CheckTokenMembership requires an impersonation token and so could
+			// fail on every call, i.e. every caller was an "administrator".
+			//
+			// Check the CLIENT's effective identity instead: the thread
+			// impersonation token obtained through ImpersonateClient above,
+			// whose level was verified to be >= SecurityImpersonation. A
+			// UAC-filtered administrator carries Administrators as deny-only in
+			// that token, which CheckTokenMembership reports as not a member.
+			dwError = ERROR_ACCESS_DENIED;
 			SID_IDENTIFIER_AUTHORITY NtAuthority = SECURITY_NT_AUTHORITY;
-
-			fReturn = AllocateAndInitializeSid(&NtAuthority,
+			if (!AllocateAndInitializeSid(&NtAuthority,
 						2,
 						SECURITY_BUILTIN_DOMAIN_RID,
 						DOMAIN_ALIAS_RID_ADMINS,
 						0, 0, 0, 0, 0, 0,
-						&AdministratorsGroup);
-			if(!fReturn)
+						&AdministratorsGroup))
 			{
 				dwError = GetLastError();
 				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"AllocateAndInitializeSid 0x%08x",dwError);
 				__leave;
 			}
-			status = MyLsaDispatchTable->OpenTokenByLogonId(&(ClientInfo.LogonId), &hToken);
-			if (status != STATUS_SUCCESS)
-			{
-				dwError = LsaNtStatusToWinError(status);
-				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"OpenTokenByLogonId 0x%08x",status);
-				__leave;
-			}
-			if (!CheckTokenMembership(hToken, AdministratorsGroup, &fReturn))
+			if (!CheckTokenMembership(hImpToken, AdministratorsGroup, &fIsAdmin))
 			{
 				dwError = GetLastError();
 				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"CheckTokenMembership 0x%08x",dwError);
 				__leave;
 			}
-			// fReturn is TRUE if the token contains admin
-			if (!fReturn)
+			if (fIsAdmin)
+			{
+				dwError = 0;
+				fReturn = TRUE;
+			}
+			else
 			{
 				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"Access denied for rid 0x%x", dwRid);
 			}
@@ -311,9 +403,8 @@ extern "C"
 			{
 				RevertToSelf();
 			}
-			if (hProcess) CloseHandle(hProcess);
-			if (hToken) CloseHandle(hToken);
-			if (pLogonSessionData) LsaFreeReturnBuffer(pLogonSessionData);
+			if (hImpToken) CloseHandle(hImpToken);
+			if (pTokenUser) EIDFree(pTokenUser);
 			if (AdministratorsGroup) FreeSid(AdministratorsGroup);
 		}
 		SetLastError(dwError);
@@ -457,6 +548,15 @@ extern "C"
 					break;
 				}
 				pBuffer->pbCertificate = pPointer;
+				// SECURITY: the stored-credential blob uses USHORT offsets/sizes; an oversized
+				// certificate used to wrap the secret size and overflow the LSASS heap.
+				if (static_cast<DWORD>(pBuffer->dwCertificateSize) > EID_MAX_CERTIFICATE_SIZE)
+				{
+					pBuffer->dwError = ERROR_INVALID_PARAMETER;
+					EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"pbCertificate too large (0x%x bytes) - rejecting", pBuffer->dwCertificateSize);
+					EIDSecurityAudit(SECURITY_AUDIT_WARNING, L"[IPC_REJECT] Rejected oversized certificate (0x%x bytes) in untrusted call-package (rid 0x%x)", pBuffer->dwCertificateSize, pBuffer->dwRid);
+					break;
+				}
 				pCertContext = CertCreateCertificateContext(X509_ASN_ENCODING, pBuffer->pbCertificate, pBuffer->dwCertificateSize);
 				if (!pCertContext)
 				{
@@ -594,6 +694,117 @@ extern "C"
 		}
 	}
 
+	// SECURITY: issued-challenge table for the GINA challenge/response pair.
+	//
+	// PerformGinaAuthenticationResponse used to verify the response against
+	// whatever challenge the caller submitted alongside it, so a captured
+	// (challenge, response) pair could be replayed indefinitely. The challenge
+	// handler now records each challenge it hands out, per RID, and the response
+	// handler accepts only a challenge that was issued here, at most
+	// EID_GINA_CHALLENGE_LIFETIME_MS ago, and only once.
+	constexpr DWORD EID_GINA_CHALLENGE_SLOTS = 16;
+	constexpr DWORD EID_GINA_MAX_CHALLENGE_SIZE = 1024;	// RSA-8192 wrapped key
+	constexpr ULONGLONG EID_GINA_CHALLENGE_LIFETIME_MS = 60 * 1000;
+
+	struct EID_GINA_ISSUED_CHALLENGE
+	{
+		BOOL fInUse;
+		DWORD dwRid;
+		DWORD dwChallengeType;
+		ULONGLONG ullIssuedTick;
+		DWORD dwChallengeSize;
+		BYTE rgbChallenge[EID_GINA_MAX_CHALLENGE_SIZE];  // NOSONAR - LSASS-01: fixed buffer, no allocation under the lock
+	};
+
+	static EID_GINA_ISSUED_CHALLENGE s_GinaChallenges[EID_GINA_CHALLENGE_SLOTS];  // NOSONAR - RUNTIME-01: guarded by s_GinaChallengeLock
+	static SRWLOCK s_GinaChallengeLock = SRWLOCK_INIT;  // NOSONAR - RUNTIME-01: lock for s_GinaChallenges
+
+	static void GinaWipeChallengeSlot(EID_GINA_ISSUED_CHALLENGE* pSlot)
+	{
+		SecureZeroMemory(pSlot, sizeof(EID_GINA_ISSUED_CHALLENGE));
+	}
+
+	// Record a challenge issued for dwRid, replacing any earlier one for the same
+	// RID. Returns FALSE (and records nothing) if the challenge cannot be stored.
+	static BOOL GinaRecordIssuedChallenge(DWORD dwRid, DWORD dwChallengeType, const BYTE* pbChallenge, DWORD dwChallengeSize)
+	{
+		if (!pbChallenge || dwChallengeSize == 0 || dwChallengeSize > EID_GINA_MAX_CHALLENGE_SIZE)
+		{
+			return FALSE;
+		}
+		const ULONGLONG ullNow = GetTickCount64();
+		AcquireSRWLockExclusive(&s_GinaChallengeLock);
+		EID_GINA_ISSUED_CHALLENGE* pTarget = nullptr;
+		EID_GINA_ISSUED_CHALLENGE* pOldest = &s_GinaChallenges[0];
+		for (DWORD i = 0; i < EID_GINA_CHALLENGE_SLOTS; i++)
+		{
+			EID_GINA_ISSUED_CHALLENGE* pSlot = &s_GinaChallenges[i];
+			if (pSlot->fInUse && ullNow - pSlot->ullIssuedTick > EID_GINA_CHALLENGE_LIFETIME_MS)
+			{
+				GinaWipeChallengeSlot(pSlot);	// expired
+			}
+			if (pSlot->fInUse && pSlot->dwRid == dwRid)
+			{
+				pTarget = pSlot;				// one outstanding challenge per RID
+				break;
+			}
+			if (!pSlot->fInUse && !pTarget)
+			{
+				pTarget = pSlot;
+			}
+			if (pSlot->fInUse && (!pOldest->fInUse || pSlot->ullIssuedTick < pOldest->ullIssuedTick))
+			{
+				pOldest = pSlot;
+			}
+		}
+		if (!pTarget)
+		{
+			pTarget = pOldest;					// table full: evict the oldest
+		}
+		GinaWipeChallengeSlot(pTarget);
+		pTarget->fInUse = TRUE;
+		pTarget->dwRid = dwRid;
+		pTarget->dwChallengeType = dwChallengeType;
+		pTarget->ullIssuedTick = ullNow;
+		pTarget->dwChallengeSize = dwChallengeSize;
+		memcpy(pTarget->rgbChallenge, pbChallenge, dwChallengeSize);
+		ReleaseSRWLockExclusive(&s_GinaChallengeLock);
+		return TRUE;
+	}
+
+	// Consume the challenge recorded for dwRid. Returns TRUE only if one was
+	// issued, has not expired, and equals the submitted type and bytes
+	// (constant-time compare). The record is removed whatever the outcome:
+	// single use.
+	static BOOL GinaConsumeIssuedChallenge(DWORD dwRid, DWORD dwChallengeType, const BYTE* pbChallenge, DWORD dwChallengeSize)
+	{
+		BOOL fMatch = FALSE;
+		const ULONGLONG ullNow = GetTickCount64();
+		AcquireSRWLockExclusive(&s_GinaChallengeLock);
+		for (DWORD i = 0; i < EID_GINA_CHALLENGE_SLOTS; i++)
+		{
+			EID_GINA_ISSUED_CHALLENGE* pSlot = &s_GinaChallenges[i];
+			if (!pSlot->fInUse || pSlot->dwRid != dwRid)
+			{
+				continue;
+			}
+			if (pbChallenge && ullNow - pSlot->ullIssuedTick <= EID_GINA_CHALLENGE_LIFETIME_MS &&
+				dwChallengeType == pSlot->dwChallengeType && dwChallengeSize == pSlot->dwChallengeSize)
+			{
+				BYTE bDiff = 0;
+				for (DWORD j = 0; j < dwChallengeSize; j++)
+				{
+					bDiff |= static_cast<BYTE>(pSlot->rgbChallenge[j] ^ pbChallenge[j]);
+				}
+				fMatch = (bDiff == 0);
+			}
+			GinaWipeChallengeSlot(pSlot);
+			break;
+		}
+		ReleaseSRWLockExclusive(&s_GinaChallengeLock);
+		return fMatch;
+	}
+
 	NTSTATUS NTAPI PerformGinaAuthenticationChallenge(
 	  __in   PLSA_CLIENT_REQUEST ClientRequest,
 	  __in   PVOID ProtocolSubmitBuffer,
@@ -638,6 +849,41 @@ extern "C"
 			{
 				response.dwError = GetLastError();
 				EIDCardLibraryTrace(WINEVENT_LEVEL_ERROR,L"GetChallenge 0x%08X", response.dwError);
+				__leave;
+			}
+			// SECURITY: GINA authentication is refused for crypted (card-bound)
+			// credentials. Their "challenge" is the static wrapped symmetric key,
+			// so a captured response (the unwrapped key) stays valid forever,
+			// and the GINA protocol (EID_MSGINA_AUTHENTICATION_RESPONSE_REQUEST)
+			// has a single response field - no room for the proof-of-possession
+			// signature over a fresh nonce that GetPassword performs for this
+			// type. Without that signature a card answering the decrypt with
+			// garbage or a replayed key cannot be told apart from the real one.
+			// Crypted credentials must be used through the credential provider
+			// path instead; clear-text and DPAPI types are unaffected (their
+			// GINA challenge is already a fresh signature nonce).
+			if (dwType == static_cast<DWORD>(EID_PRIVATE_DATA_TYPE::eidpdtCrypted))  // NOSONAR - ENUM-01: enum-to-underlying cast for Win32/ABI compatibility
+			{
+				response.dwError = ERROR_NOT_SUPPORTED;
+				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"GINA authentication not supported for crypted credential (rid 0x%x)", pGina->dwRid);
+				EIDSecurityAudit(SECURITY_AUDIT_WARNING, L"[POLICY_DENY] Refused GINA challenge for crypted credential (rid 0x%x): no proof-of-possession in GINA protocol", pGina->dwRid);
+				SecureZeroMemory(pbChallenge, dwChallengeSize);
+				EIDFree(pbChallenge);
+				pbChallenge = NULL;
+				dwChallengeSize = 0;
+				__leave;
+			}
+			// Remember what was issued so the response handler can refuse a
+			// replayed or caller-invented challenge. If it cannot be recorded,
+			// do not hand it out: the response would be refused anyway.
+			if (!GinaRecordIssuedChallenge(pGina->dwRid, dwType, pbChallenge, dwChallengeSize))
+			{
+				response.dwError = ERROR_INVALID_DATA;
+				EIDCardLibraryTrace(WINEVENT_LEVEL_ERROR,L"Unable to record challenge (size %u)", dwChallengeSize);
+				SecureZeroMemory(pbChallenge, dwChallengeSize);
+				EIDFree(pbChallenge);
+				pbChallenge = NULL;
+				dwChallengeSize = 0;
 				__leave;
 			}
 			// success
@@ -721,6 +967,23 @@ extern "C"
 			// put the result in SubStatus
 						
 			EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"RID = 0x%x", pGina->dwRid);
+			// Crypted credentials are never issued a GINA challenge (see
+			// PerformGinaAuthenticationChallenge); refuse explicitly as well.
+			if (pGina->dwChallengeType == static_cast<DWORD>(EID_PRIVATE_DATA_TYPE::eidpdtCrypted))  // NOSONAR - ENUM-01: enum-to-underlying cast for Win32/ABI compatibility
+			{
+				response.dwError = ERROR_NOT_SUPPORTED;
+				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"GINA authentication not supported for crypted credential (rid 0x%x)", pGina->dwRid);
+				__leave;
+			}
+			// Only accept a challenge that PerformGinaAuthenticationChallenge
+			// issued for this RID, recently, and not already used.
+			if (!GinaConsumeIssuedChallenge(pGina->dwRid, pGina->dwChallengeType, pGina->pbChallenge, pGina->dwChallengeSize))
+			{
+				response.dwError = ERROR_ACCESS_DENIED;
+				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"Challenge not issued, expired or already used for rid 0x%x", pGina->dwRid);
+				EIDSecurityAudit(SECURITY_AUDIT_WARNING, L"[AUTH_REPLAY] Rejected GINA response for rid 0x%x: challenge not issued, expired or already used", pGina->dwRid);
+				__leave;
+			}
 			// the real job is done here
 			if (!manager->GetPasswordFromChallengeResponse(pGina->dwRid,pGina->pbChallenge, pGina->dwChallengeSize, 
 										pGina->dwChallengeType,pGina->pbResponse, pGina->dwResponseSize,&szPassword))
@@ -1015,6 +1278,13 @@ extern "C"
 			{
 				*MachineName = LsaInitializeUnicodeStringFromWideString(ComputerName);
 				*AuthenticatingAuthority = LsaInitializeUnicodeStringFromWideString(ComputerName);
+				// Both are dereferenced later (CompletePrimaryCredential), so an
+				// allocation failure here has to stop the logon, not crash LSASS.
+				if (!*MachineName || !*AuthenticatingAuthority)
+				{
+					EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"No memory for MachineName/AuthenticatingAuthority");
+					return STATUS_INSUFFICIENT_RESOURCES;
+				}
 			}
 			else
 			{
@@ -1155,6 +1425,13 @@ extern "C"
 				return STATUS_LOGON_FAILURE;
 			}
 			*AccountName = LsaInitializeUnicodeStringFromWideString(szUserName);
+			if (!*AccountName)
+			{
+				// Dereferenced by UserNameToToken, the audit lines and
+				// CompletePrimaryCredential below.
+				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"No memory for AccountName");
+				return STATUS_INSUFFICIENT_RESOURCES;
+			}
 			// trusted ?
 			// check done after username to do accounting in case of failure
 			// AccountName is known !
@@ -1198,6 +1475,7 @@ extern "C"
 			);
 			
 			EIDFree(szUserName);
+			szUserName = NULL;
 
 
 			// create token
@@ -1251,6 +1529,7 @@ extern "C"
 			EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"RetrieveStoredCredential OK");
 
 			CertFreeCertificateContext(pCertContext);
+			pCertContext = NULL;
 
 			*TokenInformation = MyTokenInformation;
 			*TokenInformationType = LsaTokenInformationV2;
@@ -1329,6 +1608,20 @@ extern "C"
 		{
 			// Runs on all eighteen exits: normal completion, every `return`,
 			// and unwinding towards the __except below.
+			// The certificate context and user name used to be released only
+			// on the success path, so every failed logon (wrong PIN, blocked
+			// card, untrusted certificate, ...) leaked them in LSASS. The
+			// success path frees them early and sets them to NULL.
+			if (pCertContext)
+			{
+				CertFreeCertificateContext(pCertContext);
+				pCertContext = NULL;
+			}
+			if (szUserName)
+			{
+				EIDFree(szUserName);
+				szUserName = NULL;
+			}
 			SecureZeroMemory(pwzPin, sizeof(pwzPin));
 			SecureZeroMemory(pwzPinUncrypted, sizeof(pwzPinUncrypted));
 			if (szPassword)
@@ -1364,7 +1657,9 @@ extern "C"
 	}
 
 	// CleanupLsaCredentials - Removes EID credential mappings from LSA Private Data
-	// Called by uninstaller to clean up stored credentials for all local users
+	// Called by the uninstaller ONLY when the operator ticks "Remove EID certificate mappings
+	// from users". This is the sole uninstall path that deletes stored credentials:
+	// DllUnRegister deliberately keeps them so uninstall/upgrade preserves enrolments.
 	HRESULT WINAPI CleanupLsaCredentials()  // NOSONAR - COMPLEXITY-01: refactor deferred; logic verified
 	{
 		HRESULT hr = S_OK;  // NOSONAR - EXPLICIT-TYPE-03: HRESULT visible for security audit
@@ -1378,14 +1673,29 @@ extern "C"
 
 		__try
 		{
+			// Primary removal: ask the loaded package (still resident in LSASS until reboot)
+			// to delete every local user's stored credential, using the same key naming and
+			// RID enumeration that created them. The direct LSA sweep below stays as a
+			// fallback for when the package is not loaded.
+			if (LsaEIDRemoveAllStoredCredential())
+			{
+				EIDCardLibraryTrace(WINEVENT_LEVEL_INFO, L"CleanupLsaCredentials: package removed all stored credentials");
+			}
+			else
+			{
+				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING, L"CleanupLsaCredentials: package removal failed (0x%08x) - using direct LSA sweep", GetLastError());
+			}
+
 			// Initialize LSA object attributes
 			ObjectAttributes.Length = sizeof(LSA_OBJECT_ATTRIBUTES);
 
-			// Open LSA policy with necessary access
+			// Open LSA policy with necessary access. POLICY_GET_PRIVATE_INFORMATION is
+			// required by the LsaRetrievePrivateData existence check below; without it
+			// every retrieve is denied and nothing would be removed.
 			Status = LsaOpenPolicy(
 				NULL,
 				&ObjectAttributes,
-				POLICY_CREATE_SECRET | READ_CONTROL | WRITE_OWNER | WRITE_DAC,
+				POLICY_CREATE_SECRET | POLICY_GET_PRIVATE_INFORMATION | READ_CONTROL | WRITE_OWNER | WRITE_DAC,
 				&LsaPolicyHandle
 			);
 

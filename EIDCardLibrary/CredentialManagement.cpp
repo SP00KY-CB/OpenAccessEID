@@ -15,6 +15,7 @@
 #include "../EIDCardLibrary/Tracing.h"
 #include "../EIDCardLibrary/StoredCredentialManagement.h"
 #include "../EIDCardLibrary/CertificateUtilities.h"
+#include "../EIDCardLibrary/CertificateValidation.h"
 #include "../EIDCardLibrary/InputValidation.h"
 #include "CredentialManagement.h"
 
@@ -198,13 +199,22 @@ CSecurityContext::CSecurityContext(CCredential* pCredential)
 	szUserName = nullptr;  // NOSONAR - INIT-01: member initialized in body for clarity/ordering
 	_Role = EID_CONTEXT_ROLE::EIDCRUnbound;
 	_fChallengeIsOurs = FALSE;
-	if (pCredential && pCredential->_pCertInfo)
-	{
-		CRYPT_DATA_BLOB blob;
-		blob.pbData = pCredential->_pCertInfo->rgbHashOfCert;
-		blob.cbData = CERT_HASH_LENGTH;
-		pCertContext = FindCertificateFromHash(&blob);
-	}
+	_llExpiry = MAXLONGLONG;
+	// DELIBERATELY no certificate lookup here.
+	//
+	// This used to call FindCertificateFromHash with
+	// { _pCertInfo->rgbHashOfCert, CERT_HASH_LENGTH }: our CERT_HASH_LENGTH is
+	// 32 but the SDK's CERT_CREDENTIAL_INFO hash is 20 bytes, so it read 12
+	// bytes past the client-supplied structure and never matched anything.
+	// Correcting the length is NOT safe: FindCertificateFromHash runs in LSASS
+	// as SYSTEM, without impersonating the client, and searches the MY store
+	// and every reader - a local caller could then select a certificate (and,
+	// through BuildResponseMessage, a private key) that it has no access to.
+	// Until the lookup and the private-key use are done under client
+	// impersonation, pCertContext stays NULL on the initiating side and
+	// BuildResponseMessage refuses to sign (SEC_E_UNKNOWN_CREDENTIALS).
+	// The accepting side sets pCertContext in BuildChallengeMessage from the
+	// stored credential.
 }
 
 BOOL CSecurityContext::Delete(ULONG_PTR phContext)
@@ -388,6 +398,77 @@ static bool TokenBufferIsPresent(PSecBufferDesc Buffer)
 		&& Buffer->pBuffers[0].pvBuffer != nullptr;
 }
 
+// SECURITY: what the SSP card actually signs.
+//
+// The signer (GetResponseFromSignatureChallenge) signs the first 20 bytes of
+// the challenge as a raw 160-bit HP_HASHVAL, so the client used to sign whatever
+// 20 bytes the peer chose: a signing oracle for the card's key (e.g. over the
+// legacy 160-bit hash of a document or of another protocol's transcript). Both ends now
+// sign/verify a domain-separated value instead:
+//     SHA-256( L"OpenAccessEID-SSP-v1" || cbChallenge || challenge
+//              || cbUserName || UserName )   truncated to 20 bytes,
+// placed at the start of a zeroed buffer of the original challenge size (the
+// verifier insists on CREDENTIALKEYLENGTH bytes and reads the first 20).
+// SHA-256 rather than the legacy 160-bit hash: a chosen-prefix collision in that
+// hash would let a peer pick a challenge that collides with a message of its choosing; a
+// truncated SHA-256 output cannot be steered that way.
+// Both ends are this package; a peer running an older build will fail to
+// authenticate against this one (and vice versa).
+static const WCHAR EID_SSP_SIGNATURE_TAG[] = L"OpenAccessEID-SSP-v1";
+constexpr DWORD EID_SSP_SIGNED_DIGEST_LENGTH = 20;	// HP_HASHVAL length (160 bits) used by signer/verifier
+constexpr DWORD EID_SSP_SHA256_LENGTH = 32;
+
+static NTSTATUS DeriveSspSignedChallenge(const BYTE* pbChallenge, DWORD cbChallenge, PCWSTR szUserName,
+	DWORD cbDerived, PBYTE* ppbDerived)
+{
+	*ppbDerived = nullptr;
+	if (!pbChallenge || cbChallenge == 0 || !szUserName || cbDerived < EID_SSP_SIGNED_DIGEST_LENGTH)
+	{
+		EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"SEC_E_INVALID_TOKEN: cannot derive signed challenge (cbChallenge=%u)", cbChallenge);
+		return SEC_E_INVALID_TOKEN;
+	}
+	const size_t cchUserName = wcsnlen(szUserName, UNLEN + 1);
+	if (cchUserName > UNLEN || cbChallenge > 0x10000)
+	{
+		EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"SEC_E_INVALID_TOKEN: challenge or user name too long");
+		return SEC_E_INVALID_TOKEN;
+	}
+	const DWORD cbTag = static_cast<DWORD>(sizeof(EID_SSP_SIGNATURE_TAG) - sizeof(WCHAR));	// no terminator
+	const DWORD cbUserName = static_cast<DWORD>(cchUserName * sizeof(WCHAR));
+	const DWORD cbInput = cbTag + sizeof(DWORD) + cbChallenge + sizeof(DWORD) + cbUserName;
+	PBYTE pbInput = static_cast<PBYTE>(EIDAlloc(cbInput));
+	if (!pbInput)
+	{
+		return SEC_E_INSUFFICIENT_MEMORY;
+	}
+	PBYTE p = pbInput;
+	memcpy(p, EID_SSP_SIGNATURE_TAG, cbTag);			p += cbTag;
+	memcpy(p, &cbChallenge, sizeof(DWORD));			p += sizeof(DWORD);
+	memcpy(p, pbChallenge, cbChallenge);				p += cbChallenge;
+	memcpy(p, &cbUserName, sizeof(DWORD));				p += sizeof(DWORD);
+	memcpy(p, szUserName, cbUserName);
+	BYTE rgbDigest[EID_SSP_SHA256_LENGTH] = {0};		// NOSONAR - LSASS-01: fixed-size digest buffer
+	DWORD cbDigest = sizeof(rgbDigest);
+	const BOOL fHashed = CryptHashCertificate(NULL, CALG_SHA_256, 0, pbInput, cbInput, rgbDigest, &cbDigest);
+	const DWORD dwHashError = GetLastError();
+	SecureZeroMemory(pbInput, cbInput);
+	EIDFree(pbInput);
+	if (!fHashed || cbDigest != EID_SSP_SHA256_LENGTH)
+	{
+		EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"CryptHashCertificate(SHA-256) 0x%08x", dwHashError);
+		return SEC_E_INTERNAL_ERROR;
+	}
+	PBYTE pbDerived = static_cast<PBYTE>(EIDAlloc(cbDerived));
+	if (!pbDerived)
+	{
+		return SEC_E_INSUFFICIENT_MEMORY;
+	}
+	memset(pbDerived, 0, cbDerived);
+	memcpy(pbDerived, rgbDigest, EID_SSP_SIGNED_DIGEST_LENGTH);
+	*ppbDerived = pbDerived;
+	return STATUS_SUCCESS;
+}
+
 NTSTATUS CSecurityContext::BuildNegociateMessage(PSecBufferDesc Buffer)
 {
 	if (!TokenBufferIsPresent(Buffer))
@@ -474,6 +555,11 @@ NTSTATUS CSecurityContext::BuildChallengeMessage(PSecBufferDesc Buffer)
 		message->MessageType = static_cast<DWORD>(EID_MESSAGE_TYPE::EIDMTChallenge);  // NOSONAR - ENUM-01: enum kept for Win32/ABI compatibility
 		message->Version = EID_MESSAGE_VERSION;
 		CStoredCredentialManager* manager = CStoredCredentialManager::Instance();
+		if (pCertContext)
+		{
+			CertFreeCertificateContext(pCertContext);
+			pCertContext = nullptr;
+		}
 		if (!manager->GetCertContextFromHash(Hash, &pCertContext, &dwRid))
 		{
 			Status = SEC_E_UNKNOWN_CREDENTIALS;
@@ -481,10 +567,13 @@ NTSTATUS CSecurityContext::BuildChallengeMessage(PSecBufferDesc Buffer)
 			__leave;
 		}
 		// get username
-		Status = NetUserEnum(nullptr, 3, 0, (PBYTE*)&pInfo, MAX_PREFERRED_LENGTH, &dwEntriesRead,&dwTotalEntries, nullptr);
-		if (Status != NERR_Success)
+		// NetUserEnum returns a NET_API_STATUS (NERR_* / Win32 code), not an
+		// NTSTATUS: keep it out of Status and map any failure to an SSPI code.
+		const NET_API_STATUS netStatus = NetUserEnum(nullptr, 3, 0, (PBYTE*)&pInfo, MAX_PREFERRED_LENGTH, &dwEntriesRead,&dwTotalEntries, nullptr);
+		if (netStatus != NERR_Success)
 		{
-			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"NetUserEnum = 0x%08X",Status);
+			Status = SEC_E_INTERNAL_ERROR;
+			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"NetUserEnum = 0x%08X",netStatus);
 			__leave;
 		}
 		for (dwI = 0; dwI < dwEntriesRead; dwI++)
@@ -638,8 +727,25 @@ NTSTATUS CSecurityContext::BuildResponseMessage(PSecBufferDesc Buffer)
 	memcpy_s(message->Signature.data(), message->Signature.size(), EID_MESSAGE_SIGNATURE, sizeof(EID_MESSAGE_SIGNATURE));
 	message->MessageType = static_cast<DWORD>(EID_MESSAGE_TYPE::EIDMTResponse);  // NOSONAR - ENUM-01: enum kept for Win32/ABI compatibility
 	message->Version = EID_MESSAGE_VERSION;
+	// No certificate (see the constructor) or no PIN: nothing to sign with.
+	// Passing a NULL context on used to fault inside LSASS.
+	if (!pCertContext || !_pCredential || !_pCredential->_szPin)
+	{
+		EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"SEC_E_UNKNOWN_CREDENTIALS: no certificate or PIN for this context");
+		return SEC_E_UNKNOWN_CREDENTIALS;
+	}
+	// Never sign the peer's raw challenge - sign the domain-separated digest.
+	PBYTE pbToSign = nullptr;
+	NTSTATUS DeriveStatus = DeriveSspSignedChallenge(pbChallenge, dwChallengeSize, szUserName, dwChallengeSize, &pbToSign);  // NOSONAR (EXPLICIT-TYPE-04) - Explicit type preferred for code clarity
+	if (DeriveStatus != STATUS_SUCCESS)
+	{
+		return DeriveStatus;
+	}
 	CStoredCredentialManager* manager = CStoredCredentialManager::Instance();
-	if (!manager->GetResponseFromSignatureChallenge(pbChallenge, dwChallengeSize, pCertContext,_pCredential->_szPin, &pbResponse, &dwResponseSize))  // NOSONAR - SCOPE-01: local scoped to block; init-statement refactor deferred
+	const BOOL fSigned = manager->GetResponseFromSignatureChallenge(pbToSign, dwChallengeSize, pCertContext,_pCredential->_szPin, &pbResponse, &dwResponseSize);
+	SecureZeroMemory(pbToSign, dwChallengeSize);
+	EIDFree(pbToSign);
+	if (!fSigned)
 	{
 		EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"SEC_E_LOGON_DENIED");
 		return SEC_E_LOGON_DENIED;
@@ -716,10 +822,40 @@ NTSTATUS CSecurityContext::BuildCompleteMessage(PSecBufferDesc Buffer)  // NOSON
 		EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"SEC_E_INVALID_TOKEN: challenge was not generated by this context");
 		return SEC_E_INVALID_TOKEN;
 	}
+	// Verify against the same domain-separated digest the client signs.
+	PBYTE pbSigned = nullptr;
+	NTSTATUS DeriveStatus = DeriveSspSignedChallenge(pbChallenge, dwChallengeSize, szUserName, dwChallengeSize, &pbSigned);  // NOSONAR (EXPLICIT-TYPE-04) - Explicit type preferred for code clarity
+	if (DeriveStatus != STATUS_SUCCESS)
+	{
+		EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"SEC_E_LOGON_DENIED: derive 0x%08X", DeriveStatus);
+		return SEC_E_LOGON_DENIED;
+	}
 	CStoredCredentialManager* manager = CStoredCredentialManager::Instance();
-	if (!manager->VerifySignatureChallengeResponse(dwRid, pbChallenge, dwChallengeSize, pbResponse, dwResponseSize))  // NOSONAR - SCOPE-01: local scoped to block; init-statement refactor deferred
+	const BOOL fVerified = manager->VerifySignatureChallengeResponse(dwRid, pbSigned, dwChallengeSize, pbResponse, dwResponseSize);
+	SecureZeroMemory(pbSigned, dwChallengeSize);
+	EIDFree(pbSigned);
+	if (!fVerified)
 	{
 		EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"SEC_E_LOGON_DENIED");
+		return SEC_E_LOGON_DENIED;
+	}
+	// A valid signature only proves possession of the key in the STORED
+	// certificate. Like the interactive logon path, also require that the
+	// certificate still chains to a trusted root, carries the smart-card logon
+	// EKU, is within validity and is not revoked - otherwise an expired or
+	// revoked card keeps producing network logon tokens indefinitely.
+	// pCertContext is the stored certificate for dwRid (GetCertContextFromHash
+	// in BuildChallengeMessage returns both from the same stored record).
+	if (!pCertContext)
+	{
+		EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"SEC_E_LOGON_DENIED: no stored certificate for rid 0x%x", dwRid);
+		return SEC_E_LOGON_DENIED;
+	}
+	if (!IsTrustedCertificate(pCertContext))
+	{
+		const DWORD dwTrustError = GetLastError();
+		EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"SEC_E_LOGON_DENIED: untrusted certificate for rid 0x%x (0x%08x)", dwRid, dwTrustError);
+		EIDSecurityAudit(SECURITY_AUDIT_FAILURE, L"[AUTH_CERT_ERROR] SSP network logon refused for rid 0x%x: untrusted, expired or revoked certificate (0x%08x)", dwRid, dwTrustError);
 		return SEC_E_LOGON_DENIED;
 	}
 	return STATUS_SUCCESS;
@@ -766,7 +902,7 @@ CSecurityContext::~CSecurityContext()
 CUsermodeContext::CUsermodeContext(PEID_SSP_CALLBACK_MESSAGE pMessage)
 {
 	Handle = pMessage->hToken;  // NOSONAR - INIT-01: member initialized in body for clarity/ordering
-	EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"Token = 0x%08X", Handle);
+	EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"Token = %p", Handle);
 }
 
 NTSTATUS CUsermodeContext::AddContextInfo(ULONG_PTR pHandle, PEID_SSP_CALLBACK_MESSAGE pMessage)
@@ -775,7 +911,7 @@ NTSTATUS CUsermodeContext::AddContextInfo(ULONG_PTR pHandle, PEID_SSP_CALLBACK_M
 	CUsermodeContext* pContext = GetContextFromHandle(pHandle);
 	if (!pContext)  // NOSONAR - SCOPE-01: local scoped to block; init-statement refactor deferred
 	{
-		EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"Inserting context 0x%08X", pHandle);
+		EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"Inserting context %p", reinterpret_cast<PVOID>(pHandle));
 		pContext = new CUsermodeContext(pMessage);  // NOSONAR - COM-01: User mode context requires heap allocation
 		UserModeContexts.insert(std::pair<ULONG_PTR,CUsermodeContext*> (pHandle, pContext));
 	}
@@ -787,13 +923,13 @@ NTSTATUS CUsermodeContext::DeleteContextInfo(ULONG_PTR pHandle)
 	// C++17 init-statement: it is only used within this if/else block
 	if (auto it = UserModeContexts.find(pHandle); it != UserModeContexts.end())
 	{
-		EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"Context 0X%08X deleted", pHandle);
+		EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"Context %p deleted", reinterpret_cast<PVOID>(pHandle));
 		UserModeContexts.erase(it);
 		return STATUS_SUCCESS;
 	}
 	else
 	{
-		EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"SEC_E_INVALID_HANDLE 0X%08X", pHandle);
+		EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"SEC_E_INVALID_HANDLE %p", reinterpret_cast<PVOID>(pHandle));
 		return SEC_E_INVALID_HANDLE;
 	}
 }
@@ -804,7 +940,7 @@ NTSTATUS CUsermodeContext::GetImpersonationHandle(ULONG_PTR pHandle,PHANDLE Impe
 	CUsermodeContext* pContext = GetContextFromHandle(pHandle);
 	if (!pContext)
 	{
-		EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"SEC_E_INVALID_HANDLE 0X%08X", pHandle);
+		EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"SEC_E_INVALID_HANDLE %p", reinterpret_cast<PVOID>(pHandle));
 		return SEC_E_INVALID_HANDLE;
 	}
 	*ImpersonationToken = pContext->Handle;
@@ -820,7 +956,7 @@ CUsermodeContext* CUsermodeContext::GetContextFromHandle(ULONG_PTR pHandle)
 	}
 	else
 	{
-		EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"Context not found = 0x%08X", pHandle);
+		EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"Context not found = %p", reinterpret_cast<PVOID>(pHandle));
 		return nullptr;
 	}
 }

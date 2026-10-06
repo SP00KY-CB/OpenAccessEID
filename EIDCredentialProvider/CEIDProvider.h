@@ -87,19 +87,23 @@ public:
     __override ~CEIDProvider();
     HRESULT Initialize();
 private:
+    // Ask LogonUI to re-enumerate. Takes a referenced copy of _pcpe under _csCallback and
+    // calls CredentialsChanged outside the lock (safe against a concurrent UnAdvise on the
+    // UI thread). Returns TRUE if a notification was actually sent.
+    BOOL NotifyCredentialsChanged();
 
 
 
     LONG                        _cRef;                  // Reference counter.
 	CMessageCredential          *_pMessageCredential;   // Our "disconnected" credential.
     ICredentialProviderEvents   *_pcpe;                    // Used to tell our owner to re-enumerate credentials.
-    UINT_PTR                    _upAdviseContext;       // Used to tell our owner who we are when asking to
+    UINT_PTR                    _upAdviseContext = 0;   // Used to tell our owner who we are when asking to
                                                         // re-enumerate credentials.
-    CREDENTIAL_PROVIDER_USAGE_SCENARIO      _cpus;
-	DWORD									_dwFlags;
+    CREDENTIAL_PROVIDER_USAGE_SCENARIO      _cpus = CPUS_INVALID;
+	DWORD									_dwFlags = 0;
 	BOOL									_fDontShowAnything;
 	CContainerHolderFactory<CEIDCredential>	_CredentialList;
 	CSmartCardConnectionNotifier*			_pSmartCardConnectionNotifier;
-	CRITICAL_SECTION						_csCallback;  // Protects callback from destruction race (CWE-416 fix for #8)
+	CRITICAL_SECTION						_csCallback;  // Protects callback from destruction race (CWE-416 fix for #8); also guards _pcpe/_upAdviseContext
 	BOOL									_fShuttingDown;  // Flag to prevent callback during shutdown
 };

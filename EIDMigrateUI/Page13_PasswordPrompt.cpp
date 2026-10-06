@@ -113,7 +113,7 @@ INT_PTR CALLBACK PasswordPromptDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, L
             }
 
             // Password length validation (optional - Windows allows empty)
-            if (wcslen(szPassword) < 1) // NOSONAR - szPassword is stack-allocated buffer, never NULL
+            if (wcsnlen(szPassword, ARRAYSIZE(szPassword)) < 1) // NOSONAR - szPassword is stack-allocated buffer, never NULL
             {
                 MessageBoxW(hwndDlg, L"Password cannot be empty. Click Skip to continue without setting a password.",
                     L"Invalid Password", MB_ICONERROR | MB_OK);

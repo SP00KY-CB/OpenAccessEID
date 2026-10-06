@@ -64,8 +64,57 @@ if (-not $isAdmin) {
 
 $LsaKey        = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'
 $AuditKey      = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\LSASS.exe'
-$BackupDir     = Join-Path $env:ProgramData 'OpenAccessEID\LsaProtectionBackup'
+$DataDir       = Join-Path $env:ProgramData 'OpenAccessEID'
+$BackupDir     = Join-Path $DataDir 'LsaProtectionBackup'
 $BackupFile    = Join-Path $BackupDir 'RunAsPPL.backup.txt'
+
+# The backup decides what -Restore writes into the LSA key, so it is only
+# written or read where a standard user cannot have planted or changed it:
+# C:\ProgramData\OpenAccessEID, LsaProtectionBackup and the backup file must
+# each be a real folder or file (not a junction, symbolic link or other
+# reparse point), owned by SYSTEM or Administrators, and give nobody else a
+# right to write, delete, change permissions or take ownership. Checked
+# outermost first: once a folder passes, nobody else can swap what is in it.
+# Returns $null when the item passes, else the reason it does not.
+function Get-UntrustedReason {
+    param([string] $LiteralPath)
+    $item = Get-Item -LiteralPath $LiteralPath -Force
+    if ((([int] $item.Attributes) -band 0x400) -ne 0) {
+        return "$LiteralPath is a junction, symbolic link or other reparse point"
+    }
+    $acl = Get-Acl -LiteralPath $LiteralPath
+    $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    if (@('S-1-5-18', 'S-1-5-32-544') -notcontains $owner) {
+        return "$LiteralPath is owned by $owner, not by SYSTEM or Administrators"
+    }
+    # WriteData/CreateFiles, AppendData/CreateDirectories, WriteExtendedAttributes,
+    # DeleteSubdirectoriesAndFiles, WriteAttributes, Delete, ChangePermissions,
+    # TakeOwnership, GENERIC_ALL, GENERIC_WRITE (as Test-EIDDirectoryTree.ps1).
+    $writeMask = 0x500D0156
+    foreach ($ace in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+        if ($ace.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
+        $sid = $ace.IdentityReference.Value
+        if (@('S-1-5-18', 'S-1-5-32-544', 'S-1-3-0') -contains $sid) { continue }
+        if (([int] $ace.FileSystemRights -band $writeMask) -ne 0) {
+            return "$LiteralPath lets $sid modify it"
+        }
+    }
+    return $null
+}
+
+# Throws unless $DataDir, $BackupDir and (with -IncludeFile) $BackupFile pass
+# Get-UntrustedReason.
+function Assert-TrustedBackupLocation {
+    param([switch] $IncludeFile)
+    $paths = @($DataDir, $BackupDir)
+    if ($IncludeFile) { $paths += $BackupFile }
+    foreach ($p in $paths) {
+        $reason = Get-UntrustedReason -LiteralPath $p
+        if ($reason) {
+            throw "Refusing to use the LSA Protection backup: $reason. Nothing was changed. Check $DataDir by hand (a standard user may have planted it), remove what does not belong there, then run this script again."
+        }
+    }
+}
 
 function Write-Banner {
     param([string] $Text, [ConsoleColor] $Color = 'Yellow')
@@ -185,9 +234,27 @@ function Confirm-Proceed {
 
 function Save-CurrentState {
     param($State)
-    if (-not (Test-Path $BackupDir)) {
-        New-Item -Path $BackupDir -ItemType Directory -Force | Out-Null
+    # Never overwrite an existing backup: it records the state from before LSA
+    # Protection was first turned off, which is what -Restore must put back. A
+    # second run (say with -EnableAuditMode) would otherwise record "0".
+    # The installer creates $DataDir with permissions only SYSTEM and
+    # Administrators can change; LsaProtectionBackup inherits them.
+    if (-not (Test-Path -LiteralPath $DataDir)) {
+        throw "$DataDir does not exist. Install (or reinstall) OpenAccess EID, which creates it with the right permissions, then run this script again. Nothing was changed."
     }
+    if (Test-Path -LiteralPath $BackupFile) {
+        Assert-TrustedBackupLocation -IncludeFile
+        Write-Host "  Keeping the existing backup of the original state: $BackupFile" -ForegroundColor Green
+        return
+    }
+    if (-not (Test-Path -LiteralPath $BackupDir)) {
+        $reason = Get-UntrustedReason -LiteralPath $DataDir
+        if ($reason) {
+            throw "Refusing to write the LSA Protection backup: $reason. Nothing was changed."
+        }
+        New-Item -Path $BackupDir -ItemType Directory | Out-Null
+    }
+    Assert-TrustedBackupLocation
     $lines = @(
         "# OpenAccess EID - LSA Protection state backup",
         "# Created: $(Get-Date -Format 'yyyy-MM-ddTHH:mm:ssZ') UTC",
@@ -198,7 +265,7 @@ function Save-CurrentState {
         "SecureBoot       = $($State.SecureBoot)",
         "OSVersion        = $($State.OSVersion)"
     )
-    Set-Content -Path $BackupFile -Value $lines -Encoding UTF8
+    Set-Content -LiteralPath $BackupFile -Value $lines -Encoding UTF8
     Write-Host "  Backed up prior state to: $BackupFile" -ForegroundColor Green
 }
 
@@ -207,14 +274,60 @@ function Set-LsaRunAsPPL {
     Set-ItemProperty -Path $LsaKey -Name 'RunAsPPL' -Value $Value -Type DWord
     Write-Host "  RunAsPPL set to $Value" -ForegroundColor Green
 
-    try {
-        $probe = Get-ItemProperty -Path $LsaKey -Name 'RunAsPPLBoot' -ErrorAction Stop
-        if ($null -ne $probe.RunAsPPLBoot) {
-            Set-ItemProperty -Path $LsaKey -Name 'RunAsPPLBoot' -Value $Value -Type DWord
-            Write-Host "  RunAsPPLBoot set to $Value" -ForegroundColor Green
+    # RunAsPPLBoot exists only on Windows 11 24H2 and later; it is changed only
+    # where it is already present. A failure to write it is not swallowed.
+    $probe = Get-ItemProperty -Path $LsaKey -Name 'RunAsPPLBoot' -ErrorAction SilentlyContinue
+    if ($null -ne $probe -and $null -ne $probe.RunAsPPLBoot) {
+        Set-ItemProperty -Path $LsaKey -Name 'RunAsPPLBoot' -Value $Value -Type DWord
+        Write-Host "  RunAsPPLBoot set to $Value" -ForegroundColor Green
+    } else {
+        Write-Host '  RunAsPPLBoot is not present on this OS build; left unchanged.' -ForegroundColor Gray
+    }
+}
+
+function Read-StateBackup {
+    # Returns the RunAsPPL / RunAsPPLBoot values recorded by Save-CurrentState.
+    # $null means the value did not exist before this script changed anything.
+    $values = @{ RunAsPPL = $null; RunAsPPLBoot = $null }
+    $found = @{}
+    foreach ($line in Get-Content -LiteralPath $BackupFile) {
+        if ($line -match '^\s*(RunAsPPL|RunAsPPLBoot)\s*=\s*(\S+)\s*$') {
+            $name = $Matches[1]
+            $raw = $Matches[2]
+            if ($raw -eq '<unset>') {
+                $values[$name] = $null
+            } elseif ($raw -match '^\d+$') {
+                $values[$name] = [int] $raw
+            } else {
+                throw "Unrecognised value '$raw' for $name in $BackupFile"
+            }
+            $found[$name] = $true
         }
-    } catch {
-        # RunAsPPLBoot not present on this OS build; best-effort, ignore
+    }
+    if (-not $found['RunAsPPL']) {
+        throw "$BackupFile does not record RunAsPPL"
+    }
+    return $values
+}
+
+function Format-BackupValue {
+    param($Value)
+    if ($null -eq $Value) { return '(not set)' }
+    return "$Value"
+}
+
+function Restore-LsaValue {
+    param([string] $Name, $Value, [switch] $LeaveIfUnset)
+    if ($null -ne $Value) {
+        Set-ItemProperty -Path $LsaKey -Name $Name -Value $Value -Type DWord
+        Write-Host "  $Name restored to $Value" -ForegroundColor Green
+    } elseif ($LeaveIfUnset) {
+        Write-Host "  $Name was not set before; left unchanged" -ForegroundColor Gray
+    } else {
+        if ($null -ne (Get-ItemProperty -Path $LsaKey -Name $Name -ErrorAction SilentlyContinue)) {
+            Remove-ItemProperty -Path $LsaKey -Name $Name
+        }
+        Write-Host "  $Name removed (it was not set before)" -ForegroundColor Green
     }
 }
 
@@ -233,7 +346,16 @@ function Enable-LsaAuditMode {
 
 function Invoke-Restore {
     Write-Banner 'Restore mode: re-enable LSA Protection' 'Cyan'
-    if (-not (Test-Path $BackupFile)) {
+    $backup = $null
+    if (Test-Path -LiteralPath $BackupFile) {
+        # A planted "backup" could keep LSA Protection off; refuse it.
+        Assert-TrustedBackupLocation -IncludeFile
+        $backup = Read-StateBackup
+        Write-Host "Backup found at $BackupFile" -ForegroundColor Cyan
+        Write-Host "Will restore the values recorded there:" -ForegroundColor Cyan
+        Write-Host "  RunAsPPL     -> $(Format-BackupValue $backup.RunAsPPL)" -ForegroundColor Gray
+        Write-Host "  RunAsPPLBoot -> $(Format-BackupValue $backup.RunAsPPLBoot)" -ForegroundColor Gray
+    } else {
         Write-Host "No backup found at $BackupFile" -ForegroundColor Yellow
         Write-Host "Will set RunAsPPL = 1 (LSA Protection, with UEFI variable on Secure Boot hosts)." -ForegroundColor Yellow
     }
@@ -241,7 +363,19 @@ function Invoke-Restore {
         Write-Host 'Cancelled.' -ForegroundColor Red
         return
     }
-    Set-LsaRunAsPPL -Value 1
+    if ($null -eq $backup) {
+        Set-LsaRunAsPPL -Value 1
+    } else {
+        Restore-LsaValue -Name 'RunAsPPL' -Value $backup.RunAsPPL
+        # Set-LsaRunAsPPL only ever changes RunAsPPLBoot where it already
+        # existed, so "not set" in the backup means it was never touched.
+        Restore-LsaValue -Name 'RunAsPPLBoot' -Value $backup.RunAsPPLBoot -LeaveIfUnset
+        # Retire the backup: its presence is how the uninstaller (and the next
+        # run of this script) tell that LSA Protection is still turned off.
+        $retired = Join-Path $BackupDir ('RunAsPPL.restored-{0}.txt' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+        Move-Item -LiteralPath $BackupFile -Destination $retired
+        Write-Host "  Backup applied and kept as $retired" -ForegroundColor Green
+    }
     Write-Host ''
     Write-Host 'Reboot required to take effect.' -ForegroundColor Cyan
 }

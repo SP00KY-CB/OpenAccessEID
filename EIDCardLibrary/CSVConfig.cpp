@@ -137,9 +137,28 @@ HRESULT EID_CSV_JsonToConfig(const std::string& json, EID_CSV_CONFIG& config)
     // Initialize with defaults
     config = EID_CSV_CONFIG();
 
+    // Typed member lookup: logging.json is untrusted input, and asBool() /
+    // asNumber() / asString() on a value of another JSON type read a member
+    // that type never set. A member of the wrong type is ignored (the default
+    // is kept), exactly as if it were absent.
+    auto member = [&root](const char* key, JsonType expected) -> const JsonValue*
+    {
+        if (!root.has(key))
+            return nullptr;
+        const std::shared_ptr<JsonValue>& pValue = root[key];
+        if (!pValue || pValue->type() != expected)
+        {
+            EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,
+                L"[CONFIG_REJECT] logging.json member '%S' has the wrong type; ignored", key);
+            return nullptr;
+        }
+        return pValue.get();
+    };
+    const JsonValue* pMember = nullptr;
+
     // Read enabled flag
-    if (root.has("enabled"))
-        config.fEnabled = root["enabled"]->asBool() ? TRUE : FALSE;
+    if ((pMember = member("enabled", JsonType::Boolean)) != nullptr)
+        config.fEnabled = pMember->asBool() ? TRUE : FALSE;
 
     // Read log path.
     //
@@ -149,9 +168,9 @@ HRESULT EID_CSV_JsonToConfig(const std::string& json, EID_CSV_CONFIG& config)
     // hands its directory to EnsureLogDirSecured, which calls
     // SetNamedSecurityInfoW with a PROTECTED DACL **as SYSTEM**, follows
     // junctions, and severs inheritance. A length check is not enough.
-    if (root.has("logPath"))
+    if ((pMember = member("logPath", JsonType::String)) != nullptr)
     {
-        std::string utf8Path = root["logPath"]->asString();
+        std::string utf8Path = pMember->asString();
         std::wstring wpath = Utf8ToWide(utf8Path);
         if (!EID_CSV_IsAcceptableLogPath(wpath))
         {
@@ -172,36 +191,36 @@ HRESULT EID_CSV_JsonToConfig(const std::string& json, EID_CSV_CONFIG& config)
     // {"fileCount": -1} drive ~4.29 billion GetFileAttributesW calls inside
     // CSVLogger::RotateLogFile while holding s_csLogger, in LSASS, on the logon
     // path. Same bounds as the other three loaders.
-    if (root.has("maxFileSizeMB"))
+    if ((pMember = member("maxFileSizeMB", JsonType::Number)) != nullptr)
     {
-        const long long llValue = root["maxFileSizeMB"]->asNumber();
+        const long long llValue = pMember->asNumber();
         config.dwMaxFileSizeMB = (llValue < 1) ? 1 : (llValue > 100 ? 100 : static_cast<DWORD>(llValue));
     }
 
     // Read file count
-    if (root.has("fileCount"))
+    if ((pMember = member("fileCount", JsonType::Number)) != nullptr)
     {
-        const long long llValue = root["fileCount"]->asNumber();
+        const long long llValue = pMember->asNumber();
         config.dwFileCount = (llValue < 1) ? 1 : (llValue > 100 ? 100 : static_cast<DWORD>(llValue));
     }
 
     // Read columns bitmask
-    if (root.has("columns"))
-        config.dwColumns = static_cast<EID_CSV_COLUMN>(static_cast<DWORD>(root["columns"]->asNumber()));
+    if ((pMember = member("columns", JsonType::Number)) != nullptr)
+        config.dwColumns = static_cast<EID_CSV_COLUMN>(static_cast<DWORD>(pMember->asNumber()));
 
     // Read category filter bitmask
-    if (root.has("categoryFilter"))
-        config.dwCategoryFilter = static_cast<DWORD>(root["categoryFilter"]->asNumber());
+    if ((pMember = member("categoryFilter", JsonType::Number)) != nullptr)
+        config.dwCategoryFilter = static_cast<DWORD>(pMember->asNumber());
 
     // Read verbose events flag
-    if (root.has("verboseEvents"))
-        config.fVerboseEvents = root["verboseEvents"]->asBool() ? TRUE : FALSE;
+    if ((pMember = member("verboseEvents", JsonType::Boolean)) != nullptr)
+        config.fVerboseEvents = pMember->asBool() ? TRUE : FALSE;
 
     // Read diagnostics flags
-    if (root.has("diagnosticsEnabled"))
-        config.fDiagnosticsEnabled = root["diagnosticsEnabled"]->asBool() ? TRUE : FALSE;
-    if (root.has("diagnosticsLevel"))
-        config.dwDiagnosticsLevel = static_cast<DWORD>(root["diagnosticsLevel"]->asNumber());
+    if ((pMember = member("diagnosticsEnabled", JsonType::Boolean)) != nullptr)
+        config.fDiagnosticsEnabled = pMember->asBool() ? TRUE : FALSE;
+    if ((pMember = member("diagnosticsLevel", JsonType::Number)) != nullptr)
+        config.dwDiagnosticsLevel = static_cast<DWORD>(pMember->asNumber());
 
     return S_OK;
 }
@@ -285,8 +304,10 @@ HRESULT EID_CSV_SaveConfigToFile(PCWSTR pwszPath, const EID_CSV_CONFIG& config)
     {
         std::wstring dir = wpath.substr(0, lastSlash);
         // M5: create the config directory with a restrictive DACL (Full to SYSTEM/Admins,
-        // Read&Execute to Users), re-applying it if the directory already exists.
-        EnsureLogDirSecured(dir.c_str());
+        // Read&Execute to Users), re-applying it if the directory already exists. Refuse
+        // to write into a directory that is a reparse point or not admin/SYSTEM-owned.
+        if (!EnsureLogDirSecured(dir.c_str()))
+            return HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED);
     }
 
     // Convert to JSON
@@ -308,6 +329,17 @@ HRESULT EID_CSV_SaveConfigToFile(PCWSTR pwszPath, const EID_CSV_CONFIG& config)
         return E_FAIL;
     }
     file.close();
+
+    // The loader only honours a logging.json owned by SYSTEM or Administrators. An
+    // elevated writer's default owner may be its own user SID, so hand the file to
+    // Administrators explicitly (best effort; the loader rejects it otherwise).
+    BYTE adminSid[SECURITY_MAX_SID_SIZE];  // NOSONAR - LSASS-01: C-style buffer for LSASS safety
+    DWORD cbAdminSid = sizeof(adminSid);
+    if (CreateWellKnownSid(WinBuiltinAdministratorsSid, nullptr, adminSid, &cbAdminSid))
+    {
+        SetNamedSecurityInfoW(const_cast<PWSTR>(pwszPath), SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION, adminSid, nullptr, nullptr, nullptr);
+    }
 
     return S_OK;
 }
@@ -599,7 +631,27 @@ void EID_CSV_ApplyPolicyOverrides(EID_CSV_CONFIG& config)  // NOSONAR - COMPLEXI
 HRESULT EID_CSV_LoadConfig(EID_CSV_CONFIG& config)
 {
     // Try JSON file first, then registry, then defaults.
-    HRESULT hr = EID_CSV_LoadConfigFromFile(EID_CSV_CONFIG_PATH, config);
+    //
+    // logging.json is only honoured when both the file and its directory are owned by
+    // SYSTEM or Administrators and neither is a reparse point. C:\ProgramData lets any
+    // user create C:\ProgramData\OpenAccessEID before the installer does; trusting a
+    // file there would let them steer this SYSTEM logger. ETW-only rejection: see the
+    // re-entrancy note at the top of this file.
+    HRESULT hr = HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+    if (GetFileAttributesW(EID_CSV_CONFIG_PATH) != INVALID_FILE_ATTRIBUTES)
+    {
+        if (EID_IsAdminOwnedNonReparse(EID_CSV_CONFIG_DIR) &&
+            EID_IsAdminOwnedNonReparse(EID_CSV_CONFIG_PATH))
+        {
+            hr = EID_CSV_LoadConfigFromFile(EID_CSV_CONFIG_PATH, config);
+        }
+        else
+        {
+            EIDCardLibraryTrace(WINEVENT_LEVEL_ERROR,
+                L"[CONFIG_REJECT] logging.json or its directory is a reparse point or not owned by SYSTEM/Administrators; ignored, falling back to registry/default configuration");
+            hr = HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED);
+        }
+    }
     if (FAILED(hr))
         hr = EID_CSV_LoadConfigFromRegistry(config);
     if (FAILED(hr))

@@ -21,61 +21,59 @@ static std::string BytesToHex(_In_reads_bytes_(cbBytes) const BYTE* pbBytes, _In
 static const UserInfo* g_pUser = nullptr;  // NOSONAR - GLOBAL-01: pointer assigned at runtime
 
 // Format user details
+//
+// Built as a std::wstring rather than swprintf_s into a fixed buffer: the group
+// list is unbounded, and once a 4096-character buffer filled, swprintf_s's
+// invalid-parameter handler terminated the tool.
 std::wstring FormatUserDetails(_In_ const UserInfo& user)
 {
-    WCHAR szDetails[4096];  // NOSONAR - LSASS-01: C-style buffer required by Win32 API
-    DWORD dwPos = 0;
+    std::wstring wsDetails;
 
-    dwPos += swprintf_s(szDetails + dwPos, ARRAYSIZE(szDetails) - dwPos,
-        L"User Details for: %s\r\n\r\n", user.wsUsername.c_str());
-
-    dwPos += swprintf_s(szDetails + dwPos, ARRAYSIZE(szDetails) - dwPos,
-        L"RID: %u\r\n", user.dwRid);
-
-    dwPos += swprintf_s(szDetails + dwPos, ARRAYSIZE(szDetails) - dwPos,
-        L"SID: %s\r\n", user.wsSid.c_str());
-
-    dwPos += swprintf_s(szDetails + dwPos, ARRAYSIZE(szDetails) - dwPos,
-        L"Has EID Credential: %s\r\n",
-        user.fHasEIDCredential ? L"Yes" : L"No");
+    wsDetails += L"User Details for: " + user.wsUsername + L"\r\n\r\n";  // NOSONAR - FORMAT-01: plain appends keep the unbounded group list allocation-safe
+    wsDetails += L"RID: " + std::to_wstring(user.dwRid) + L"\r\n";
+    wsDetails += L"SID: " + user.wsSid + L"\r\n";
+    wsDetails += L"Has EID Credential: ";
+    wsDetails += user.fHasEIDCredential ? L"Yes" : L"No";
+    wsDetails += L"\r\n";
 
     PCWSTR pwszEncFallback = (user.EncryptionType == EID_PRIVATE_DATA_TYPE::eidpdtDPAPI) ? L"DPAPI" : L"None";
     PCWSTR pwszEnc = (user.EncryptionType == EID_PRIVATE_DATA_TYPE::eidpdtCrypted) ? L"Certificate-based" : pwszEncFallback;
-    dwPos += swprintf_s(szDetails + dwPos, ARRAYSIZE(szDetails) - dwPos,
-        L"Encryption Type: %s\r\n", pwszEnc);
+    wsDetails += L"Encryption Type: ";
+    wsDetails += pwszEnc;
+    wsDetails += L"\r\n";
 
-    dwPos += swprintf_s(szDetails + dwPos, ARRAYSIZE(szDetails) - dwPos,
-        L"Last Login: %s\r\n\r\n", user.wsLastLogin.c_str());
+    wsDetails += L"Last Login: " + user.wsLastLogin + L"\r\n\r\n";
 
     // Certificate hash
     if (user.fHasEIDCredential)
     {
-        dwPos += swprintf_s(szDetails + dwPos, ARRAYSIZE(szDetails) - dwPos,
-            L"--- Certificate Information ---\r\n");
+        wsDetails += L"--- Certificate Information ---\r\n";
 
+        // The hex digits are ASCII, so widening each char is exact.
         std::string sHash = BytesToHex(user.CertificateHash, CERT_HASH_LENGTH);
-        dwPos += swprintf_s(szDetails + dwPos, ARRAYSIZE(szDetails) - dwPos,
-            L"Certificate Hash: %S\r\n\r\n", sHash.c_str());
+        wsDetails += L"Certificate Hash: ";
+        for (char ch : sHash)
+        {
+            wsDetails += static_cast<wchar_t>(ch);
+        }
+        wsDetails += L"\r\n\r\n";
     }
 
     // Groups
-    dwPos += swprintf_s(szDetails + dwPos, ARRAYSIZE(szDetails) - dwPos,
-        L"--- Group Membership ---\r\n");
+    wsDetails += L"--- Group Membership ---\r\n";
     if (user.wsGroups.empty())
     {
-        swprintf_s(szDetails + dwPos, ARRAYSIZE(szDetails) - dwPos,
-            L"No group memberships found.\r\n");
+        wsDetails += L"No group memberships found.\r\n";
     }
     else
     {
         for (const auto& group : user.wsGroups)
         {
-            dwPos += swprintf_s(szDetails + dwPos, ARRAYSIZE(szDetails) - dwPos,
-                L"• %s\r\n", group.c_str());
+            wsDetails += L"\u2022 " + group + L"\r\n";  // NOSONAR - ESCAPE-01: C++23 delimited escapes not used in this codebase
         }
     }
 
-    return std::wstring(szDetails);
+    return wsDetails;
 }
 
 // Initialize details dialog

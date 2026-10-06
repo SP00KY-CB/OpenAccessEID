@@ -191,7 +191,7 @@ HRESULT EnumerateLocalGroups(_Out_ std::vector<LocalGroupInfo>& groups)
         // Get members for this group
         GetGroupMembers(info.wsName, info.wsMembers);
 
-        groups.push_back(info);
+        groups.push_back(std::move(info));
     }
 
     NetApiBufferFree(pBuf);

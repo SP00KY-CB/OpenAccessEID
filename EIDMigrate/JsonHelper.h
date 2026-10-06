@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <memory>
 #include <sstream>
 #include <Windows.h>
 
@@ -63,9 +64,11 @@ public:
 class JsonValue
 {
 private:
-    JsonType m_type;
-    bool m_boolValue;
-    long long m_numberValue;
+    // Default member initialisers: every constructor leaves all scalars defined.
+    // (This header is also used inside LSASS by EIDCardLibrary/CSVConfig.cpp.)
+    JsonType m_type = JsonType::Null;
+    bool m_boolValue = false;
+    long long m_numberValue = 0;
     std::string m_stringValue;
     JsonArray m_arrayValue;
     JsonObject m_objectValue;
@@ -91,8 +94,9 @@ public:
     bool isObject() const { return m_type == JsonType::Object; }
     bool isNull() const { return m_type == JsonType::Null; }
 
-    bool asBool() const { return m_boolValue; }
-    long long asNumber() const { return m_numberValue; }
+    // Type-checked scalar accessors: a value of another type reads as false / 0.
+    bool asBool() const { return m_type == JsonType::Boolean && m_boolValue; }
+    long long asNumber() const { return m_type == JsonType::Number ? m_numberValue : 0; }
     const std::string& asString() const { return m_stringValue; }
     const JsonArray& asArray() const { return m_arrayValue; }
     const JsonObject& asObject() const { return m_objectValue; }

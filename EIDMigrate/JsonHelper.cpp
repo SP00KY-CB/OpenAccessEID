@@ -297,7 +297,7 @@ JsonObject JsonParser::parseObject(int depth)
 
         // Parse value
         std::shared_ptr<JsonValue> value = parseValue(depth + 1);
-        obj[key] = value;
+        obj[key] = std::move(value);
 
         skipWhitespace();
         c = current();

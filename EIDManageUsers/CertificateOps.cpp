@@ -75,20 +75,9 @@ HRESULT EnumerateUserCertificates(_In_ const std::wstring& wsUsername,
         // Note: This may fail if user has password
         // For admin tool, we might need to use different approach
 
-        // Alternative: Open store directly with user SID
-        LPWSTR pwszSid = nullptr;
-        if (!ConvertSidToStringSidW(pSid, &pwszSid))
-        {
-            LocalFree(pSid);
-            return HRESULT_FROM_WIN32(GetLastError());
-        }
-
-        // Build store path for user
-        WCHAR szStorePath[MAX_PATH];  // NOSONAR - LSASS-01: C-style buffer required by Win32 API
-        swprintf_s(szStorePath, ARRAYSIZE(szStorePath),
-            L"\\\\.%\\%s\\%s", pwszSid, L"MY");  // NOSONAR - STRING-01: literal retained; raw-string conversion not behavior-safe for this format path
-
-        LocalFree(pwszSid);
+        // (A per-SID store path used to be formatted here with an invalid
+        // format string - "%\\" - that triggered the CRT invalid-parameter
+        // handler, and the result was never used. Removed.)
         LocalFree(pSid);
 
         // Open the store

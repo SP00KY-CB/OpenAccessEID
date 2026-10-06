@@ -50,6 +50,7 @@ automatically - no per-admin-workstation install is required.
 | Policy | Registry value | Default |
 |--------|---------------|---------|
 | Enforce CSP whitelist | `EnforceCSPWhitelist` (DWORD) | `0` (Disabled) |
+| Hold back the card's last PIN attempts until it is re-inserted | `PinAttemptsReserved` (DWORD, 0-10; 0 = off) | `1` |
 
 `EnforceCSPWhitelist` is the security-critical addition - when enabled it
 blocks smart-card certificates that use a CSP / KSP provider outside the

@@ -30,6 +30,7 @@
 #include "../EIDMigrate/LsaClient.h"
 #include "../EIDMigrate/FileCrypto.h"
 #include "../EIDMigrate/Utils.h"
+#include "../EIDMigrate/SecureMemory.h"
 
 // Version information
 #define EIDMIGRATEUI_APP_VERSION       L"1.0.0.1" // NOSONAR - MACRO-01: Windows-style macro constant retained for API/preprocessor use
@@ -80,7 +81,7 @@ struct WIZARD_DATA { // NOSONAR - COMPLEXITY-01: field count required for wizard
     DWORD dwFailedCount;
     std::wstring wsOutputFile;
     std::wstring wsInputFile;
-    std::wstring wsPassword;
+    SecureWString wsPassword;  // file passphrase; zeroed when released
     std::vector<CredentialInfo> credentials;
     std::vector<GroupInfo> groups;
     std::vector<std::wstring> SelectedGroups;  // Specific groups selected for export/import
@@ -134,7 +135,7 @@ struct WIZARD_DATA { // NOSONAR - COMPLEXITY-01: field count required for wizard
         dwFailedCount = 0;
         wsOutputFile.clear();
         wsInputFile.clear();
-        wsPassword.clear();
+        SecureClear(wsPassword);
         credentials.clear();
         groups.clear();
         SelectedGroups.clear();

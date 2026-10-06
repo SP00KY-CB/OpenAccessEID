@@ -246,7 +246,8 @@ foreach ($file in $allFiles) {
         }
     }
     catch {
-        # Silently skip files that can't be fetched
+        # Keep going with the remaining files, but say which one was skipped and why.
+        Write-Warning "Skipped duplications for ${fileKey}: $($_.Exception.Message)"
     }
 }
 

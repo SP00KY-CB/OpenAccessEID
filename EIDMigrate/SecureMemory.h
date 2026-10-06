@@ -59,11 +59,28 @@ public:
     }
 };
 
+// Stateless allocator: all instances are interchangeable (required by the
+// Allocator requirements; containers may compare allocators on assignment).
+template<typename T, typename U>
+inline bool operator==(const SecureAllocator<T>&, const SecureAllocator<U>&) noexcept { return true; }
+template<typename T, typename U>
+inline bool operator!=(const SecureAllocator<T>&, const SecureAllocator<U>&) noexcept { return false; }
+
 // Secure wide string type that zeros on destruction
 using SecureWString = std::basic_string<WCHAR, std::char_traits<WCHAR>, SecureAllocator<WCHAR>>;
 
 // Secure ANSI string type that zeros on destruction
 using SecureString = std::basic_string<CHAR, std::char_traits<CHAR>, SecureAllocator<CHAR>>;
+
+// clear() keeps the buffer (and, for short strings, the inline small-string
+// buffer that never reaches the allocator) with its old contents. Zero the
+// characters first, then clear.
+inline void SecureClear(_Inout_ SecureWString& s) noexcept
+{
+    if (!s.empty())
+        SecureZeroMemory(&s[0], s.size() * sizeof(WCHAR));
+    s.clear();
+}
 
 // Secure buffer for binary data
 class SecureBuffer

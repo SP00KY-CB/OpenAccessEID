@@ -13,7 +13,7 @@ INT_PTR CALLBACK WndProc_06_ImportSelect(HWND hwndDlg, UINT uMsg, WPARAM wParam,
         // Clear file state
         g_wizardData.fFileDecrypted = FALSE;
         g_wizardData.wsInputFile.clear();
-        g_wizardData.wsPassword.clear();
+        SecureClear(g_wizardData.wsPassword);
         return TRUE;
     }
 
@@ -94,22 +94,25 @@ INT_PTR CALLBACK WndProc_06_ImportSelect(HWND hwndDlg, UINT uMsg, WPARAM wParam,
             GetDlgItemText(hwndDlg, IDC_06_INPUT_FILE, szFile, ARRAYSIZE(szFile));
             GetDlgItemText(hwndDlg, IDC_06_PASSWORD, szPassword, ARRAYSIZE(szPassword));
 
-            if (wcslen(szFile) == 0 || wcslen(szPassword) == 0) { // NOSONAR - both are stack-allocated buffers, never NULL
+            if (wcsnlen(szFile, ARRAYSIZE(szFile)) == 0 || wcsnlen(szPassword, ARRAYSIZE(szPassword)) == 0) { // NOSONAR - both are stack-allocated buffers, never NULL
+                SecureZeroMemory(szPassword, sizeof(szPassword));
                 MessageBoxW(hwndDlg, L"Please select a file and enter a password.",
                     L"Import", MB_ICONEXCLAMATION);
                 return TRUE;
             }
 
             // Validate password length
-            if (wcslen(szPassword) < 16) { // NOSONAR - szPassword is stack-allocated buffer, never NULL
+            if (wcsnlen(szPassword, ARRAYSIZE(szPassword)) < 16) { // NOSONAR - szPassword is stack-allocated buffer, never NULL
+                SecureZeroMemory(szPassword, sizeof(szPassword));
                 MessageBoxW(hwndDlg, L"Password must be at least 16 characters.",
                     L"Import", MB_ICONEXCLAMATION);
                 return TRUE;
             }
 
-            // Store password
+            // Store password (SecureWString: zeroed when released)
             g_wizardData.wsInputFile = szFile;
-            g_wizardData.wsPassword = szPassword;
+            g_wizardData.wsPassword.assign(szPassword, wcsnlen(szPassword, ARRAYSIZE(szPassword))); // NOSONAR - szPassword is stack-allocated buffer, never NULL
+            SecureZeroMemory(szPassword, sizeof(szPassword));
 
             // Try to read and parse the file
             std::vector<CredentialInfo> credentials;
@@ -117,16 +120,14 @@ INT_PTR CALLBACK WndProc_06_ImportSelect(HWND hwndDlg, UINT uMsg, WPARAM wParam,
             std::wstring wsSourceMachine;
             std::wstring wsExportDate;
 
-            SecureWString secPassword;
-            secPassword.assign(szPassword, wcslen(szPassword)); // NOSONAR - szPassword is stack-allocated buffer, never NULL
-
-            HRESULT hr = ReadImportFileWithMetadata(szFile, secPassword, credentials, groups,
+            HRESULT hr = ReadImportFileWithMetadata(szFile, g_wizardData.wsPassword, credentials, groups,
                 &wsSourceMachine, &wsExportDate, nullptr);
             if (SUCCEEDED(hr)) {
                 g_wizardData.fFileDecrypted = TRUE;
-                g_wizardData.credentials = credentials;
-                g_wizardData.groups = groups;
-                g_wizardData.dwFileCredentialCount = static_cast<DWORD>(credentials.size());
+                const DWORD dwCredentialCount = static_cast<DWORD>(credentials.size());
+                g_wizardData.credentials = std::move(credentials);
+                g_wizardData.groups = std::move(groups);
+                g_wizardData.dwFileCredentialCount = dwCredentialCount;
                 g_wizardData.wsSourceMachine = wsSourceMachine;
                 g_wizardData.wsExportDate = wsExportDate;
 
@@ -136,12 +137,13 @@ INT_PTR CALLBACK WndProc_06_ImportSelect(HWND hwndDlg, UINT uMsg, WPARAM wParam,
                 SetDlgItemText(hwndDlg, IDC_06_EXPORT_DATE,
                     wsExportDate.empty() ? L"Unknown" : wsExportDate.c_str());
                 WCHAR szCount[32]; // NOSONAR - C-style array required for Windows API swprintf_s/SetDlgItemText
-                swprintf_s(szCount, ARRAYSIZE(szCount), L"%u", static_cast<DWORD>(credentials.size()));
+                swprintf_s(szCount, ARRAYSIZE(szCount), L"%u", dwCredentialCount);
                 SetDlgItemText(hwndDlg, IDC_06_CREDENTIAL_COUNT, szCount);
                 SetDlgItemText(hwndDlg, IDC_06_VERSION, L"1.0");
 
                 MessageBoxW(hwndDlg, L"File decrypted successfully!", L"Import", MB_ICONINFORMATION);
             } else {
+                SecureClear(g_wizardData.wsPassword);
                 MessageBoxW(hwndDlg, L"Failed to decrypt file. Check the password.",
                     L"Import", MB_ICONERROR);
             }

@@ -37,7 +37,8 @@ LARGE_INTEGER SecondsSince1970ToTime( const DWORD Seconds )
 {
 	LARGE_INTEGER Time = {0};
     Time.QuadPart = 116444736000000000I64; // january 1st 1970
-	Time.QuadPart = Seconds * 10000000 + Time.QuadPart;
+	// 64-bit multiply: Seconds * 10000000 in 32 bits wraps for any date after 1970-01-01 07:09:27
+	Time.QuadPart = static_cast<LONGLONG>(Seconds) * 10000000LL + Time.QuadPart;
 	return Time;
 }
 
@@ -63,6 +64,14 @@ NTSTATUS UserNameToProfile(__in PLSA_UNICODE_STRING AccountName,  // NOSONAR - A
 	PBYTE Offset;
 	DWORD dwSize;
 
+	// UserName is UNLEN+1 WCHARs; a longer name would make wcsncpy_s abort LSASS
+	// and the terminator write below land past the end of the buffer.
+	if (!AccountName || !AccountName->Buffer || AccountName->Length / sizeof(WCHAR) > UNLEN)
+	{
+		EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"Account name missing or longer than UNLEN");
+		if (ProfileBufferLength) *ProfileBufferLength=0;
+		return STATUS_INVALID_PARAMETER;
+	}
 	wcsncpy_s(UserName,ARRAYSIZE(UserName),AccountName->Buffer,AccountName->Length/2);
 	UserName[AccountName->Length/2]=0;
 	dwSize = ARRAYSIZE(DomainName);
@@ -93,7 +102,7 @@ NTSTATUS UserNameToProfile(__in PLSA_UNICODE_STRING AccountName,  // NOSONAR - A
 		MyProfileBuffer.LogoffTime = SecondsSince1970ToTime(pUserInfo->usri4_acct_expires);
 		MyProfileBuffer.KickOffTime = SecondsSince1970ToTime(pUserInfo->usri4_acct_expires);
 	}
-	MyProfileBuffer.PasswordLastSet.QuadPart = pUserInfo->usri4_password_age * 10000000;
+	MyProfileBuffer.PasswordLastSet.QuadPart = static_cast<LONGLONG>(pUserInfo->usri4_password_age) * 10000000LL;
 	// can change now
 	MyProfileBuffer.PasswordCanChange.QuadPart = MyProfileBuffer.PasswordLastSet.QuadPart;
 	// never must change

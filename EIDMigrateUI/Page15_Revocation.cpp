@@ -163,7 +163,7 @@ INT_PTR CALLBACK WndProc_15_Revocation(HWND hwndDlg, UINT uMsg, WPARAM wParam, L
             WCHAR szFile[MAX_PATH];  // NOSONAR - LSASS-01: C-style buffer required by Win32 API
             GetDlgItemText(hwndDlg, IDC_15_CRL_PATH, szFile, ARRAYSIZE(szFile));
 
-            if (wcslen(szFile) == 0) { // NOSONAR - szFile is stack-allocated buffer, never NULL
+            if (wcsnlen(szFile, ARRAYSIZE(szFile)) == 0) { // NOSONAR - szFile is stack-allocated buffer, never NULL
                 MessageBoxW(hwndDlg, L"Please select a CRL file (.crl) to install.",
                     L"Revocation", MB_ICONEXCLAMATION);
                 return TRUE;

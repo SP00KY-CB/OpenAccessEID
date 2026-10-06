@@ -44,6 +44,10 @@ public:
 	NTSTATUS ReceiveResponseMessage(PSecBufferDesc Buffer);
 	NTSTATUS BuildCompleteMessage(PSecBufferDesc Buffer);
 	DWORD GetRid();
+	// Expiry (UTC FILETIME units) the accepting side clamped this context to;
+	// MAXLONGLONG means no limit. Reported by SECPKG_ATTR_LIFESPAN.
+	void SetExpiry(LONGLONG llExpiry) { _llExpiry = llExpiry; }
+	LONGLONG GetExpiry() const { return _llExpiry; }
 	~CSecurityContext();
 	PWSTR GetUserName();
 private:
@@ -69,6 +73,7 @@ private:
 	PBYTE pbResponse;
 	DWORD dwResponseSize;
 	PWSTR szUserName;
+	LONGLONG _llExpiry;
 };
 
 class CCredential  // NOSONAR - OWNERSHIP-01: manual Win32/crypto lifetime management; rule-of-five deferred

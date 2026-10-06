@@ -22,6 +22,7 @@
 #include <Windows.h>
 #include <Unknwn.h>
 #include <credentialprovider.h>
+#include <new>
 
 #include "Dll.h"
 #include "../EIDCardLibrary/guid.h"
@@ -130,7 +131,7 @@ HRESULT CClassFactory_CreateInstance(REFCLSID rclsid, REFIID riid, void** ppv)  
     HRESULT hr;  // NOSONAR - EXPLICIT-TYPE-03: HRESULT visible for security audit
     if (CLSID_CEIDProvider == rclsid )
     {
-        auto pcf = new CClassFactory;  // NOSONAR - COM-01: COM class factory requires heap allocation
+        auto pcf = new (std::nothrow) CClassFactory;  // NOSONAR - COM-01: COM class factory requires heap allocation
         if (pcf)
         {
             hr = pcf->QueryInterface(riid, ppv);

@@ -59,6 +59,10 @@ BOOL LsaEIDCreateStoredCredential(__in PWSTR szUsername, __in PWSTR szPassword, 
 
 BOOL LsaEIDRemoveStoredCredential(__in_opt PWSTR szUsername);
 
+// Removes the stored credential of every local user (admin only). Destructive: call it only
+// from an explicit operator action (CleanupLsaCredentials), never from (un)registration.
+BOOL LsaEIDRemoveAllStoredCredential();
+
 BOOL LsaEIDHasStoredCredential(__in_opt PWSTR szUsername);
 
 DWORD LsaEIDGetRIDFromStoredCredential(__in PCCERT_CONTEXT pContext);

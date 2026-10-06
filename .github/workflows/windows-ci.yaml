@@ -41,8 +41,12 @@ jobs:
           path: Installer/drivers
           key: drivers-${{ hashFiles('Installer/Stage-Minidrivers.ps1') }}
 
+      # Pinned so a new NSIS release cannot change the installer without a
+      # reviewed commit. 3.13.0 is the current approved Chocolatey package
+      # (published 2026-09-27), i.e. what unpinned runs have been getting; the
+      # package itself verifies the checksum of the NSIS setup it downloads.
       - name: Install NSIS
-        run: choco install nsis -y --no-progress
+        run: choco install nsis --version 3.13.0 -y --no-progress
 
       - name: Stage LICENSE for NSIS
         shell: pwsh
@@ -50,9 +54,10 @@ jobs:
 
       # build.ps1 generates an SPDX SBOM under Installer\sbom when this tool
       # is on PATH, and silently skips it otherwise.
+      # Pinned to the current stable release; bump deliberately.
       - name: Install sbom-tool
         shell: pwsh
-        run: dotnet tool install --global Microsoft.Sbom.DotNetTool
+        run: dotnet tool install --global Microsoft.Sbom.DotNetTool --version 4.1.13
 
       - name: Build (Release x64)
         shell: pwsh
@@ -61,16 +66,28 @@ jobs:
       # BinSkim verifies the compiled binaries opted into the exploit
       # mitigations (/GS, ASLR, DEP, CFG, SafeSEH, Spectre...). It ships as a
       # plain NuGet package, not a dotnet tool, so fetch and unzip the nupkg.
+      # The nupkg is checked against a pinned SHA-256 before it is unpacked
+      # (cross-checked against the SHA-512 nuget.org publishes for 4.4.9.11);
+      # bump both together.
       # The step fails only if no SARIF was produced (tool breakage); rule
       # findings surface as code scanning alerts, not CI failures. The NSIS
       # installer stub is excluded: its PE is produced by NSIS, so findings
       # there would not be actionable in this repo.
       - name: BinSkim binary scan
         shell: pwsh
+        env:
+          BINSKIM_VERSION: '4.4.9.11'
+          BINSKIM_SHA256: 69678989cbc273b5b50fcf98fb0fd978e1e35a3f844acb24254b31f0ce90c447
         run: |
-          $ver = '4.4.9.11'
+          $ver = $env:BINSKIM_VERSION
+          $sha256 = $env:BINSKIM_SHA256
           $nupkg = Join-Path $env:RUNNER_TEMP 'binskim.zip'
           Invoke-WebRequest "https://api.nuget.org/v3-flatcontainer/microsoft.codeanalysis.binskim/$ver/microsoft.codeanalysis.binskim.$ver.nupkg" -OutFile $nupkg
+          $actual = (Get-FileHash -LiteralPath $nupkg -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $sha256) {
+            Write-Error "BinSkim $ver nupkg SHA-256 mismatch: expected $sha256, got $actual"
+            exit 1
+          }
           Expand-Archive $nupkg (Join-Path $env:RUNNER_TEMP 'binskim') -Force
           $exe = Get-ChildItem (Join-Path $env:RUNNER_TEMP 'binskim') -Recurse -Filter binskim.exe |
             Where-Object FullName -match 'win-x64' | Select-Object -First 1

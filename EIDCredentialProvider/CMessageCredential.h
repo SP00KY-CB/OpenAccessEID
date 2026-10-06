@@ -145,7 +145,7 @@ public:
 	DWORD									_dwSmartCardCount;
 	CMessageCredentialStatus				_dwStatus;
 	CMessageCredentialStatus				_dwOldStatus;
-	CREDENTIAL_PROVIDER_USAGE_SCENARIO    _cpus; // The usage scenario for which we were enumerated.
-	DWORD								  _dwFlags;
+	CREDENTIAL_PROVIDER_USAGE_SCENARIO    _cpus = CPUS_INVALID; // The usage scenario for which we were enumerated.
+	DWORD								  _dwFlags = 0;
 };
 

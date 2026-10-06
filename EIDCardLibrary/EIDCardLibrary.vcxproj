@@ -205,6 +205,7 @@
     <ClInclude Include="Tracing.h" />
     <ClInclude Include="TraceExport.h" />
     <ClInclude Include="CSVConfig.h" />
+    <ClInclude Include="LogDirSecurity.h" />
     <ClInclude Include="CSVLogger.h" />
     <ClInclude Include="EventDefinitions.h" />
   </ItemGroup>

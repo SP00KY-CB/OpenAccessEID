@@ -206,36 +206,46 @@ HRESULT InstallCertificateToUserStore(
     // If username is specified, we need to open their store
     if (!wsUsername.empty())
     {
-        // For local user accounts, we can open the store directly with their SID
+        // Open the TARGET user's store through HKEY_USERS\<SID>. Never fall back
+        // to the current (administrator) user's store: that would report success
+        // while installing the certificate for the wrong account.
         std::wstring wsSid;
         hr = GetUserSid(wsUsername, wsSid);
-        if (SUCCEEDED(hr))
+        if (FAILED(hr) || wsSid.empty())
         {
-            // Build store path: \\.\<SID>\My
-            std::wstring wsStorePath = L"\\\\.\\" + wsSid + L"\\My";  // NOSONAR - STRING-01: escaped path literal retained to preserve exact store path
+            if (SUCCEEDED(hr))
+                hr = E_FAIL;  // GetUserSid can report success with no SID if the last error was cleared
+            EIDM_TRACE_ERROR(L"Could not resolve the SID of user '%ls': 0x%08X", wsUsername.c_str(), hr);
+            goto cleanup;
+        }
 
-            hCertStore = CertOpenStore(
-                CERT_STORE_PROV_SYSTEM,
-                0,
-                NULL,  // NOSONAR - Was: nullptr - changed to NULL for HCRYPTPROV_LEGACY; Windows API requires NULL
-                CERT_SYSTEM_STORE_CURRENT_USER,
-                wsStorePath.c_str());
+        // CERT_SYSTEM_STORE_USERS needs the user's registry hive to be loaded
+        // (the user is logged on, or the profile was loaded). Check explicitly
+        // so an unloaded profile yields a clear error instead of a generic one.
+        HKEY hUserHive = NULL; // NOSONAR - NULL required for Windows API compatibility
+        LSTATUS lHive = RegOpenKeyExW(HKEY_USERS, wsSid.c_str(), 0, KEY_READ, &hUserHive);
+        if (lHive != ERROR_SUCCESS)
+        {
+            EIDM_TRACE_ERROR(L"Registry hive of user '%ls' (%ls) is not loaded (error %ld); cannot open the user's certificate store",
+                wsUsername.c_str(), wsSid.c_str(), static_cast<long>(lHive));
+            hr = HRESULT_FROM_WIN32(ERROR_NOT_LOGGED_ON);
+            goto cleanup;
+        }
+        RegCloseKey(hUserHive);
 
-            if (hCertStore)
-            {
-                EIDM_TRACE_VERBOSE(L"Opened certificate store for user '%ls'", wsUsername.c_str());
-            }
-            else
-            {
-                // Fallback: try opening as current user (running as admin)
-                EIDM_TRACE_WARN(L"Could not open user store, trying current user store");
-                hCertStore = CertOpenStore(
-                    CERT_STORE_PROV_SYSTEM,
-                    0,
-                    NULL,  // NOSONAR - Was: nullptr - changed to NULL for HCRYPTPROV_LEGACY; Windows API requires NULL
-                    CERT_SYSTEM_STORE_CURRENT_USER,
-                    L"My");
-            }
+        // Store path for CERT_SYSTEM_STORE_USERS: <SID>\My
+        std::wstring wsStorePath = wsSid + L"\\My";
+
+        hCertStore = CertOpenStore(
+            CERT_STORE_PROV_SYSTEM,
+            0,
+            NULL,  // NOSONAR - Was: nullptr - changed to NULL for HCRYPTPROV_LEGACY; Windows API requires NULL
+            CERT_SYSTEM_STORE_USERS,
+            wsStorePath.c_str());
+
+        if (hCertStore)
+        {
+            EIDM_TRACE_VERBOSE(L"Opened certificate store for user '%ls'", wsUsername.c_str());
         }
     }
     else
@@ -293,8 +303,6 @@ cleanup:
         CertCloseStore(hCertStore, 0);
     if (pCertContext)
         CertFreeCertificateContext(pCertContext);
-    if (pExistingCert)
-        CertFreeCertificateContext(pExistingCert);
 
     return hr;
 }

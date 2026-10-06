@@ -78,7 +78,17 @@ BOOL PopulateListViewCheckData(HWND hWndListViewList, HWND hWndListViewCheck)
 
 	LVGROUP grp;
 	
+	if (!pCredentialList)
+	{
+		return FALSE;
+	}
 	CContainerHolderTest* pContainerHolder = pCredentialList->GetContainerHolderAt(dwCurrentCredential);
+	// dwCurrentCredential is 0xFFFFFFFF when nothing is selected, and the list
+	// can shrink when a card is removed.
+	if (!pContainerHolder)
+	{
+		return FALSE;
+	}
 
 	//GRP
 	for (int index = pContainerHolder->GetCheckCount() -1; index >= 0; index--)
@@ -119,6 +129,11 @@ BOOL PopulateListViewCheckData(HWND hWndListViewList, HWND hWndListViewCheck)
 		lvI.puColumns = ColumnsToDisplay;
 		lvI.iGroupId = index;
 		ListView_InsertItem(hWndListViewCheck, &lvI);
+		// The list view keeps its own copy of the text.
+		if (lvI.pszText)
+		{
+			EIDFree(lvI.pszText);
+		}
 	}
 
 
@@ -132,18 +147,30 @@ BOOL PopulateListViewListData(HWND hWndListView)
 	// Some code to create the list-view control.
 	
 	ListView_DeleteAllItems(hWndListView);
+	// pCredentialList is reset to nullptr when later pages tear the list down.
+	if (!pCredentialList)
+	{
+		return FALSE;
+	}
 	// Initialize LVITEM members that are common to all items.
 	lvI.mask = LVIF_TEXT | LVIF_IMAGE |  LVIF_STATE | LVIF_COLUMNS; 
 	
 	// Initialize LVITEM members that are different for each item. 
 	for (DWORD index = 0; index < pCredentialList->ContainerHolderCount(); index++)
 	{
+		// Each accessor call takes the lock separately, so the list can shrink
+		// between the count and the lookup.
+		CContainerHolderTest* pHolder = pCredentialList->GetContainerHolderAt(index);  // NOSONAR - API-01: pointer type dictated by non-const accessor API
+		if (!pHolder || !pHolder->GetContainer())
+		{
+			continue;
+		}
 		lvI.stateMask = LVIS_OVERLAYMASK;
-		lvI.state = INDEXTOOVERLAYMASK(pCredentialList->GetContainerHolderAt(index)->GetIconIndex() +1);
+		lvI.state = INDEXTOOVERLAYMASK(pHolder->GetIconIndex() +1);
 		lvI.iItem = index;
 		lvI.iImage = 0;
 		lvI.iSubItem = 0;
-		lvI.pszText = pCredentialList->GetContainerHolderAt(index)->GetContainer()->GetUserName();
+		lvI.pszText = pHolder->GetContainer()->GetUserName();
 		lvI.cColumns = ARRAYSIZE(ColumnsToDisplay);
 		lvI.puColumns = ColumnsToDisplay;
 		ListView_InsertItem(hWndListView, &lvI);
@@ -166,10 +193,12 @@ HWND hWndTemp;  // NOSONAR - RUNTIME-01: Temporary window handle for UI operatio
 
 HICON MiniIcon(HICON SourceIcon)
 {
-	ICONINFO SourceIconInfo;
-	ICONINFO TargetIconInfo;
+	// Zero-initialised so that the single cleanup in __finally is correct
+	// whichever step fails.
+	ICONINFO SourceIconInfo = {};
+	ICONINFO TargetIconInfo = {};
 	HICON TargetIcon = nullptr;
-	BITMAP SourceBitmapInfo;
+	BITMAP SourceBitmapInfo = {};
 	HDC SourceDC = nullptr;
 	HDC TargetDC = nullptr;
 	HDC ScreenDC = nullptr;
@@ -177,17 +206,18 @@ HICON MiniIcon(HICON SourceIcon)
 	HBITMAP OldTargetBitmap = nullptr;
 	__try
 	{
-		/* Get information about the source icon and shortcut overlay */
+		/* Get information about the source icon. GetIconInfo hands us copies
+		   of the mask and colour bitmaps, which we own and must delete. */
 		if (! GetIconInfo(SourceIcon, &SourceIconInfo)
+			|| nullptr == SourceIconInfo.hbmColor
 			|| 0 == GetObjectW(SourceIconInfo.hbmColor, sizeof(BITMAP), &SourceBitmapInfo))
 		{
 		  __leave;
 		}
 
-		/* search for the shortcut icon only once */
-		
-
-		TargetIconInfo = SourceIconInfo;
+		TargetIconInfo.fIcon = SourceIconInfo.fIcon;
+		TargetIconInfo.xHotspot = SourceIconInfo.xHotspot;
+		TargetIconInfo.yHotspot = SourceIconInfo.yHotspot;
 		TargetIconInfo.hbmMask = nullptr;
 		TargetIconInfo.hbmColor = nullptr;
 
@@ -198,18 +228,17 @@ HICON MiniIcon(HICON SourceIcon)
 		if (nullptr == OldSourceBitmap) __leave;
 
 		TargetDC = CreateCompatibleDC(nullptr);
-			if (nullptr == TargetDC) __leave;
+		if (nullptr == TargetDC) __leave;
 		TargetIconInfo.hbmMask = CreateCompatibleBitmap(TargetDC, GetSystemMetrics(SM_CXICON),
 														GetSystemMetrics(SM_CYICON));
 		if (nullptr == TargetIconInfo.hbmMask) __leave;
-	ScreenDC = GetDC(nullptr);
-	if (nullptr == ScreenDC) __leave;
-	TargetIconInfo.hbmColor = CreateCompatibleBitmap(ScreenDC, GetSystemMetrics(SM_CXICON),
+		ScreenDC = GetDC(nullptr);
+		if (nullptr == ScreenDC) __leave;
+		TargetIconInfo.hbmColor = CreateCompatibleBitmap(ScreenDC, GetSystemMetrics(SM_CXICON),
 														 GetSystemMetrics(SM_CYICON));
-	ReleaseDC(nullptr, ScreenDC);
-	if (nullptr == TargetIconInfo.hbmColor) __leave;
-	OldTargetBitmap = (HBITMAP) SelectObject(TargetDC, TargetIconInfo.hbmMask);
-	if (nullptr == OldTargetBitmap) __leave;
+		if (nullptr == TargetIconInfo.hbmColor) __leave;
+		OldTargetBitmap = (HBITMAP) SelectObject(TargetDC, TargetIconInfo.hbmMask);
+		if (nullptr == OldTargetBitmap) __leave;
 
 		/* Create the target mask by ANDing the source and shortcut masks */
 		if (! BitBlt(TargetDC, 0, 0, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON),
@@ -227,39 +256,42 @@ HICON MiniIcon(HICON SourceIcon)
 		{
 		  __leave;
 		}
-		
 
 		if (! BitBlt(TargetDC, 0, GetSystemMetrics(SM_CYICON) - SourceBitmapInfo.bmHeight, SourceBitmapInfo.bmWidth, SourceBitmapInfo.bmHeight,
 					 SourceDC, 0, 0, SRCCOPY))
 		{
 			__leave;
 		}
-		/* Create the icon using the bitmaps prepared earlier */
-		TargetIcon = CreateIconIndirect(&TargetIconInfo);
-		/* Clean up, we're not goto'ing to 'fail' after this so we can be lazy and not set
-		   handles to NULL */
-		SelectObject(TargetDC, OldTargetBitmap);
-		DeleteObject(TargetDC);
 
-		/* CreateIconIndirect copies the bitmaps, so we can release our bitmaps now */
-		DeleteObject(TargetIconInfo.hbmColor);
-		DeleteObject(TargetIconInfo.hbmMask);
+		/* Deselect the target bitmap before handing it to CreateIconIndirect */
+		SelectObject(TargetDC, OldTargetBitmap);
+		OldTargetBitmap = nullptr;
+
+		/* Create the icon using the bitmaps prepared earlier. CreateIconIndirect
+		   copies the bitmaps, so ours are released in __finally either way. */
+		TargetIcon = CreateIconIndirect(&TargetIconInfo);
 	}
 	__finally
 	{
-		/* Clean up scratch resources we created */
-		if (OldTargetBitmap) 
+		/* Single cleanup path: deselect, then delete bitmaps, then delete DCs */
+		if (ScreenDC)
+			ReleaseDC(nullptr, ScreenDC);
+		if (OldTargetBitmap)
 			SelectObject(TargetDC, OldTargetBitmap);
-		if (TargetIconInfo.hbmColor) 
-			DeleteObject(TargetIconInfo.hbmColor);
-		if (TargetIconInfo.hbmMask) 
-			DeleteObject(TargetIconInfo.hbmMask);
-		if (TargetDC) 
-			DeleteObject(TargetDC);
-		if (OldSourceBitmap) 
+		if (OldSourceBitmap)
 			SelectObject(SourceDC, OldSourceBitmap);
-		if (SourceDC) 
-			DeleteObject(SourceDC);
+		if (TargetIconInfo.hbmColor)
+			DeleteObject(TargetIconInfo.hbmColor);
+		if (TargetIconInfo.hbmMask)
+			DeleteObject(TargetIconInfo.hbmMask);
+		if (SourceIconInfo.hbmColor)
+			DeleteObject(SourceIconInfo.hbmColor);
+		if (SourceIconInfo.hbmMask)
+			DeleteObject(SourceIconInfo.hbmMask);
+		if (TargetDC)
+			DeleteDC(TargetDC);
+		if (SourceDC)
+			DeleteDC(SourceDC);
 	}
 	return TargetIcon;
 }
@@ -419,12 +451,30 @@ BOOL InitListViewView(HWND hWndListView)
 	return TRUE;
 }
 
+// TRUE when the selected credential exists and passed its checks. The list can be
+// torn down by later pages or shrink when a card is removed, so never dereference
+// GetContainerHolderAt() unchecked.
+static BOOL CurrentCredentialIsUsable()
+{
+	if (!pCredentialList)
+	{
+		return FALSE;
+	}
+	CContainerHolderTest* pHolder = pCredentialList->GetContainerHolderAt(dwCurrentCredential);  // NOSONAR - API-01: pointer type dictated by non-const accessor API
+	return (pHolder && pHolder->GetIconIndex()) ? TRUE : FALSE;
+}
+
 void SelectBestCredential()
 {
 	dwCurrentCredential = 0;
+	if (!pCredentialList)
+	{
+		return;
+	}
 	for (DWORD index = 0; index < pCredentialList->ContainerHolderCount(); index++)
 	{
-		if (pCredentialList->GetContainerHolderAt(index)->GetIconIndex())
+		CContainerHolderTest* pHolder = pCredentialList->GetContainerHolderAt(index);  // NOSONAR - API-01: pointer type dictated by non-const accessor API
+		if (pHolder && pHolder->GetIconIndex())
 		{
 			dwCurrentCredential = index;
 			break;
@@ -481,7 +531,7 @@ static void HandleCredentialSelectionChange(HWND hWnd, LPNMITEMACTIVATE pnmItem)
             dwCurrentCredential = (DWORD)pnmItem->iItem;
             PopulateListViewCheckData(GetDlgItem(hWnd, IDC_04LIST), GetDlgItem(hWnd, IDC_04CHECKS));
 
-            if (pCredentialList->GetContainerHolderAt(dwCurrentCredential)->GetIconIndex())
+            if (CurrentCredentialIsUsable())
             {
                 PropSheet_SetWizButtons(hWnd, PSWIZB_NEXT | PSWIZB_BACK);
             }
@@ -546,7 +596,7 @@ INT_PTR CALLBACK	WndProc_04CHECKS(HWND hWnd, UINT message, WPARAM wParam, LPARAM
 						//has certificate
 						SelectBestCredential();
 						PopulateListViewListData(GetDlgItem(hWnd, IDC_04LIST));	
-						if (pCredentialList->GetContainerHolderAt(dwCurrentCredential)->GetIconIndex())  // NOSONAR - COMPLEXITY-01: refactor deferred; logic verified
+						if (CurrentCredentialIsUsable())
 						{
 							PropSheet_SetWizButtons(hWnd, PSWIZB_NEXT |	PSWIZB_BACK);
 						}
@@ -611,14 +661,26 @@ INT_PTR CALLBACK	WndProc_04CHECKS(HWND hWnd, UINT message, WPARAM wParam, LPARAM
 				if (pnmh->idFrom == IDC_04LIST && pCredentialList &&
 					((LPNMITEMACTIVATE)lParam)->iItem >= 0 && (DWORD)((LPNMITEMACTIVATE)lParam)->iItem < pCredentialList->ContainerHolderCount())
 				{
-					pCredentialList->GetContainerHolderAt(((LPNMITEMACTIVATE)lParam)->iItem)->GetContainer()->ViewCertificate(hWnd);
+					CContainerHolderTest* pHolder = pCredentialList->GetContainerHolderAt(((LPNMITEMACTIVATE)lParam)->iItem);  // NOSONAR - API-01: pointer type dictated by non-const accessor API
+					if (pHolder && pHolder->GetContainer())
+					{
+						pHolder->GetContainer()->ViewCertificate(hWnd);
+					}
 				}
 				break;
 			case LVN_LINKCLICK:
 				if (pnmh->idFrom == IDC_04CHECKS && pCredentialList)	
 				{
-					BOOL fReturn;
-					fReturn = pCredentialList->GetContainerHolderAt(dwCurrentCredential)->Solve(((NMLVLINK*)lParam)->iSubItem);
+					BOOL fReturn = FALSE;
+					CContainerHolderTest* pHolder = pCredentialList->GetContainerHolderAt(dwCurrentCredential);  // NOSONAR - API-01: pointer type dictated by non-const accessor API
+					if (pHolder)
+					{
+						fReturn = pHolder->Solve(((NMLVLINK*)lParam)->iSubItem);
+					}
+					else
+					{
+						SetLastError(ERROR_NOT_FOUND);
+					}
 					if (!fReturn)  // NOSONAR - COMPLEXITY-01: refactor deferred; logic verified
 					{
 						MessageBoxWin32Ex(GetLastError(),hWnd);

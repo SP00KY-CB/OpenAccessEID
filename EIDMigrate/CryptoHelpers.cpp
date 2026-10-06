@@ -189,7 +189,12 @@ static void XORBlock(_Out_writes_all_(cbSize) BYTE* pbDest, _In_ const BYTE* pbS
         pbDest[i] = pbSrc[i] ^ bPad; // NOSONAR - BYTE-01: BYTE buffer interops with Win32 API
 }
 
-// PBKDF2-HMAC-SHA256 implementation (RFC 2898)
+// PBKDF2-HMAC-SHA256 implementation (RFC 8018 / RFC 2898)
+//
+// fLegacy selects the derivation used by format version 1 files, which
+// chained U_{i+1} = PRF(P, T_i) (the running XOR) instead of the standard
+// U_{i+1} = PRF(P, U_i). It is kept ONLY so that existing exports remain
+// decryptable; new exports always use the standard construction.
 static CRYPTO_STATUS PBKDF2HMACSHA256(
     _In_reads_bytes_(cbPassword) const BYTE* pbPassword,
     _In_ DWORD cbPassword,
@@ -197,7 +202,8 @@ static CRYPTO_STATUS PBKDF2HMACSHA256(
     _In_ DWORD cbSalt,
     _In_ DWORD cIterations,
     _In_ DWORD cbDerivedKey,
-    _Out_writes_all_(cbDerivedKey) BYTE* pbDerivedKey)
+    _Out_writes_all_(cbDerivedKey) BYTE* pbDerivedKey,
+    _In_ BOOL fLegacy)
 {
     // HMAC-SHA256 produces 32 bytes
     constexpr DWORD HASH_LEN = 32;
@@ -234,30 +240,79 @@ static CRYPTO_STATUS PBKDF2HMACSHA256(
             return cryptoStatus;
         }
 
-        // U_{i+1} = PRF(password, U_i) // NOSONAR - DOC-01: RFC 2898 algorithm notation, not commented-out code
+        // T_i = U_1 ^ U_2 ^ ... ^ U_c, with U_{j+1} = PRF(password, U_j) // NOSONAR - DOC-01: RFC 8018 algorithm notation, not commented-out code
         memcpy(blockHash, u1, HASH_LEN);
+        BYTE uPrev[HASH_LEN]; // NOSONAR - LSASS-01: C-style buffer required by Win32 API
+        memcpy(uPrev, u1, HASH_LEN);
 
         for (DWORD iter = 1; iter < cIterations; iter++)
         {
             BYTE uNext[HASH_LEN]; // NOSONAR - LSASS-01: C-style buffer required by Win32 API
-            cryptoStatus = ComputeHMACSha256(pbPassword, cbPassword, blockHash, HASH_LEN, uNext);
+            // Standard: chain on the previous U. Legacy (format v1): chain on the running XOR.
+            cryptoStatus = ComputeHMACSha256(pbPassword, cbPassword, fLegacy ? blockHash : uPrev, HASH_LEN, uNext);
             if (cryptoStatus != CRYPTO_STATUS::CRYPTO_SUCCESS)
             {
                 EIDM_TRACE_ERROR(L"PBKDF2: U_%u computation failed for block %u", iter + 1, blockIndex);
+                SecureZeroMemory(uPrev, sizeof(uPrev));
+                SecureZeroMemory(blockHash, sizeof(blockHash));
                 return cryptoStatus;
             }
 
             // blockHash = blockHash XOR uNext
             for (DWORD i = 0; i < HASH_LEN; i++)
                 blockHash[i] ^= uNext[i]; // NOSONAR - BYTE-01: BYTE buffer interops with Win32 API
+            memcpy(uPrev, uNext, HASH_LEN);
+            SecureZeroMemory(uNext, sizeof(uNext));
         }
 
         // Copy to output (possibly partial block)
         DWORD cbBlockCopy = min(HASH_LEN, cbDerivedKey - (blockIndex - 1) * HASH_LEN);
         memcpy(pbDerivedKey + (blockIndex - 1) * HASH_LEN, blockHash, cbBlockCopy);
+        SecureZeroMemory(uPrev, sizeof(uPrev));
+        SecureZeroMemory(u1, sizeof(u1));
+        SecureZeroMemory(blockHash, sizeof(blockHash));
     }
 
     return CRYPTO_STATUS::CRYPTO_SUCCESS;
+}
+
+// Known-answer test for the standard PBKDF2-HMAC-SHA256 construction.
+// Vectors: P = "password", S = "salt", dkLen = 32 - the widely published
+// PBKDF2-HMAC-SHA256 counterparts of the RFC 6070 test set (also checked
+// against Python's hashlib.pbkdf2_hmac). c = 2 and c = 4096 both differ
+// between the standard and the legacy (v1) chaining, so this also catches a
+// regression to the old construction. It runs once per process before the
+// first new-format derivation; a mismatch fails that derivation.
+static bool Pbkdf2SelfTestPassed()
+{
+    static volatile LONG s_lState = 0;  // 0 = not run, 1 = passed, 2 = failed
+    LONG lState = s_lState;
+    if (lState != 0)
+        return lState == 1;
+
+    static const BYTE rgbPassword[] = { 'p', 'a', 's', 's', 'w', 'o', 'r', 'd' }; // NOSONAR - LSASS-01: fixed test vector
+    static const BYTE rgbSalt[] = { 's', 'a', 'l', 't' }; // NOSONAR - LSASS-01: fixed test vector
+    static const BYTE rgbExpected2[32] = { // NOSONAR - LSASS-01: fixed test vector
+        0xae, 0x4d, 0x0c, 0x95, 0xaf, 0x6b, 0x46, 0xd3, 0x2d, 0x0a, 0xdf, 0xf9, 0x28, 0xf0, 0x6d, 0xd0,
+        0x2a, 0x30, 0x3f, 0x8e, 0xf3, 0xc2, 0x51, 0xdf, 0xd6, 0xe2, 0xd8, 0x5a, 0x95, 0x47, 0x4c, 0x43 };
+    static const BYTE rgbExpected4096[32] = { // NOSONAR - LSASS-01: fixed test vector
+        0xc5, 0xe4, 0x78, 0xd5, 0x92, 0x88, 0xc8, 0x41, 0xaa, 0x53, 0x0d, 0xb6, 0x84, 0x5c, 0x4c, 0x8d,
+        0x96, 0x28, 0x93, 0xa0, 0x01, 0xce, 0x4e, 0x11, 0xa4, 0x96, 0x38, 0x73, 0xaa, 0x98, 0x13, 0x4a };
+
+    BYTE rgbOut[32]; // NOSONAR - LSASS-01: C-style buffer required by Win32 API
+    bool fPassed =
+        PBKDF2HMACSHA256(rgbPassword, sizeof(rgbPassword), rgbSalt, sizeof(rgbSalt), 2,
+            sizeof(rgbOut), rgbOut, FALSE) == CRYPTO_STATUS::CRYPTO_SUCCESS &&
+        memcmp(rgbOut, rgbExpected2, sizeof(rgbOut)) == 0 &&
+        PBKDF2HMACSHA256(rgbPassword, sizeof(rgbPassword), rgbSalt, sizeof(rgbSalt), 4096,
+            sizeof(rgbOut), rgbOut, FALSE) == CRYPTO_STATUS::CRYPTO_SUCCESS &&
+        memcmp(rgbOut, rgbExpected4096, sizeof(rgbOut)) == 0;
+
+    if (!fPassed)
+        EIDM_TRACE_ERROR(L"PBKDF2-HMAC-SHA256 known-answer self-test FAILED");
+
+    InterlockedExchange(&s_lState, fPassed ? 1 : 2);
+    return fPassed;
 }
 
 CRYPTO_STATUS DeriveKeyFromPassphrase(
@@ -269,6 +324,11 @@ CRYPTO_STATUS DeriveKeyFromPassphrase(
     {
         return CRYPTO_STATUS::CRYPTO_ERROR_INVALID_PARAMETER;
     }
+
+    // New exports use the standard construction: refuse to write a file if it
+    // does not reproduce the published known-answer vectors.
+    if (!Pbkdf2SelfTestPassed())
+        return CRYPTO_STATUS::CRYPTO_ERROR_KDF_FAILED;
 
     NTSTATUS status = STATUS_UNSUCCESSFUL; // NOSONAR (EXPLICIT-TYPE-03) - Explicit NTSTATUS type preferred for clarity
     BCRYPT_ALG_HANDLE hRng = NULL; // NOSONAR - Windows API requires NULL
@@ -308,7 +368,8 @@ CRYPTO_STATUS DeriveKeyFromPassphrase(
             pDerivedKey->rgbSalt, PBKDF2_SALT_SIZE,
             PBKDF2_ITERATIONS,
             PBKDF2_KEY_SIZE,
-            pDerivedKey->rgbKey);
+            pDerivedKey->rgbKey,
+            FALSE);  // standard RFC 8018 derivation for new exports
 
         if (cryptoStatus != CRYPTO_STATUS::CRYPTO_SUCCESS)
         {
@@ -327,7 +388,8 @@ CRYPTO_STATUS DeriveKeyFromPassphrase(
             rgbAuthSalt, PBKDF2_SALT_SIZE,
             PBKDF2_ITERATIONS,
             PBKDF2_KEY_SIZE,
-            pDerivedKey->rgbAuthKey);
+            pDerivedKey->rgbAuthKey,
+            FALSE);
 
         if (cryptoStatus != CRYPTO_STATUS::CRYPTO_SUCCESS)
         {
@@ -357,7 +419,8 @@ CRYPTO_STATUS DeriveKeyFromPassphraseWithSalt(
     _In_ SIZE_T cchPassphrase,
     _In_reads_(PBKDF2_SALT_SIZE) const BYTE* pbSalt,
     _Out_ DERIVED_KEY* pDerivedKey,
-    _In_ DWORD dwIterations)
+    _In_ DWORD dwIterations,
+    _In_ BOOL fLegacyPbkdf2)
 {
     if (!pwszPassphrase || cchPassphrase == 0 || !pbSalt || !pDerivedKey)
     {
@@ -375,6 +438,9 @@ CRYPTO_STATUS DeriveKeyFromPassphraseWithSalt(
             dwIterations, PBKDF2_MIN_ITERATIONS, PBKDF2_MAX_ITERATIONS);
         return CRYPTO_STATUS::CRYPTO_ERROR_INVALID_PARAMETER;
     }
+
+    if (!fLegacyPbkdf2 && !Pbkdf2SelfTestPassed())
+        return CRYPTO_STATUS::CRYPTO_ERROR_KDF_FAILED;
 
     CRYPTO_STATUS cryptoStatus = CRYPTO_STATUS::CRYPTO_SUCCESS;
 
@@ -394,7 +460,8 @@ CRYPTO_STATUS DeriveKeyFromPassphraseWithSalt(
         pDerivedKey->rgbSalt, PBKDF2_SALT_SIZE,
         dwIterations,
         PBKDF2_KEY_SIZE,
-        pDerivedKey->rgbKey);
+        pDerivedKey->rgbKey,
+        fLegacyPbkdf2);
 
     if (cryptoStatus != CRYPTO_STATUS::CRYPTO_SUCCESS)
     {
@@ -414,7 +481,8 @@ CRYPTO_STATUS DeriveKeyFromPassphraseWithSalt(
         rgbAuthSalt, PBKDF2_SALT_SIZE,
         dwIterations,
         PBKDF2_KEY_SIZE,
-        pDerivedKey->rgbAuthKey);
+        pDerivedKey->rgbAuthKey,
+        fLegacyPbkdf2);
 
     if (cryptoStatus != CRYPTO_STATUS::CRYPTO_SUCCESS)
     {

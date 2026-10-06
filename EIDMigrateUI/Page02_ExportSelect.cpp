@@ -36,7 +36,9 @@ INT_PTR CALLBACK WndProc_02_ExportSelect(HWND hwndDlg, UINT uMsg, WPARAM wParam,
             GetDlgItemText(hwndDlg, IDC_02_CONFIRM_PASSWORD, szConfirm, ARRAYSIZE(szConfirm));
 
             // Validate file path
-            if (wcslen(szFile) == 0) { // NOSONAR - szFile is stack-allocated buffer, never NULL
+            if (wcsnlen(szFile, ARRAYSIZE(szFile)) == 0) { // NOSONAR - szFile is stack-allocated buffer, never NULL
+                SecureZeroMemory(szPassword, sizeof(szPassword));
+                SecureZeroMemory(szConfirm, sizeof(szConfirm));
                 MessageBoxW(hwndDlg, L"Please specify an output file.",
                     L"Export", MB_ICONEXCLAMATION);
                 SetWindowLongPtr(hwndDlg, DWLP_MSGRESULT, -1);
@@ -44,7 +46,9 @@ INT_PTR CALLBACK WndProc_02_ExportSelect(HWND hwndDlg, UINT uMsg, WPARAM wParam,
             }
 
             // Validate password
-            if (wcslen(szPassword) < 16) { // NOSONAR - szPassword is stack-allocated buffer, never NULL
+            if (wcsnlen(szPassword, ARRAYSIZE(szPassword)) < 16) { // NOSONAR - szPassword is stack-allocated buffer, never NULL
+                SecureZeroMemory(szPassword, sizeof(szPassword));
+                SecureZeroMemory(szConfirm, sizeof(szConfirm));
                 MessageBoxW(hwndDlg, L"Password must be at least 16 characters.",
                     L"Export", MB_ICONEXCLAMATION);
                 SetWindowLongPtr(hwndDlg, DWLP_MSGRESULT, -1);
@@ -53,6 +57,8 @@ INT_PTR CALLBACK WndProc_02_ExportSelect(HWND hwndDlg, UINT uMsg, WPARAM wParam,
 
             // Confirm password
             if (wcscmp(szPassword, szConfirm) != 0) {
+                SecureZeroMemory(szPassword, sizeof(szPassword));
+                SecureZeroMemory(szConfirm, sizeof(szConfirm));
                 MessageBoxW(hwndDlg, L"Passwords do not match.",
                     L"Export", MB_ICONEXCLAMATION);
                 SetWindowLongPtr(hwndDlg, DWLP_MSGRESULT, -1);
@@ -61,7 +67,9 @@ INT_PTR CALLBACK WndProc_02_ExportSelect(HWND hwndDlg, UINT uMsg, WPARAM wParam,
 
             // Store options
             g_wizardData.wsOutputFile = szFile;
-            g_wizardData.wsPassword = szPassword;
+            g_wizardData.wsPassword.assign(szPassword, wcsnlen(szPassword, ARRAYSIZE(szPassword))); // NOSONAR - szPassword is stack-allocated buffer, never NULL
+            SecureZeroMemory(szPassword, sizeof(szPassword));
+            SecureZeroMemory(szConfirm, sizeof(szConfirm));
 
             HWND hValidate = GetDlgItem(hwndDlg, IDC_02_VALIDATE_CERTS);
             HWND hGroups = GetDlgItem(hwndDlg, IDC_02_INCLUDE_GROUPS);

@@ -6,9 +6,10 @@
 #include "EIDMigrate.h"
 #include "../EIDCardLibrary/EIDCardLibrary.h"
 #include <vector>
+#include <utility>
 
-// Credential summary information
-struct CredentialInfo
+// Credential summary information (data members; see CredentialInfo below)
+struct CredentialInfoData
 {
     DWORD dwRid;
     std::wstring wsUsername;
@@ -27,7 +28,7 @@ struct CredentialInfo
     FILETIME ftCertValidTo;
     DWORD dwPasswordLength;
 
-    CredentialInfo() :
+    CredentialInfoData() :
         dwRid(0),  // NOSONAR - INIT-01: member initialized in body for clarity/ordering
         EncryptionType(EID_PRIVATE_DATA_TYPE::eidpdtClearText),  // NOSONAR - INIT-01: member initialized in body for clarity/ordering
         wsAlgorithm(L"AES-256-CBC"),  // NOSONAR - INIT-01: member initialized in body for clarity/ordering
@@ -38,6 +39,54 @@ struct CredentialInfo
         ftCertValidFrom.dwLowDateTime = 0;
         ftCertValidTo.dwHighDateTime = 0;
         ftCertValidTo.dwLowDateTime = 0;
+    }
+};
+
+// CredentialInfo carries the encrypted password and the symmetric key of an
+// EID credential. Wipe them when the object dies or is overwritten, so the
+// buffers are not returned to the heap with secret contents. Copy and move
+// keep their member-wise semantics (the data lives in CredentialInfoData, so
+// adding a member there needs no change here); a moved-from object's vectors
+// are empty and need no wiping.
+struct CredentialInfo : CredentialInfoData
+{
+    CredentialInfo() = default;
+    CredentialInfo(const CredentialInfo&) = default;
+    CredentialInfo(CredentialInfo&&) noexcept = default;
+
+    CredentialInfo& operator=(const CredentialInfo& other)
+    {
+        if (this != &other)
+        {
+            WipeSecrets();
+            CredentialInfoData::operator=(other);
+        }
+        return *this;
+    }
+
+    CredentialInfo& operator=(CredentialInfo&& other) noexcept
+    {
+        if (this != &other)
+        {
+            WipeSecrets();
+            CredentialInfoData::operator=(std::move(other));
+        }
+        return *this;
+    }
+
+    ~CredentialInfo()
+    {
+        WipeSecrets();
+    }
+
+    void WipeSecrets() noexcept
+    {
+        if (!EncryptedPassword.empty())
+            SecureZeroMemory(EncryptedPassword.data(), EncryptedPassword.size());
+        if (!SymmetricKey.empty())
+            SecureZeroMemory(SymmetricKey.data(), SymmetricKey.size());
+        EncryptedPassword.clear();
+        SymmetricKey.clear();
     }
 };
 
@@ -56,7 +105,8 @@ struct GroupInfo
 
 // Enumerate all EID credentials from LSA
 HRESULT EnumerateLsaCredentials(
-    _Out_ std::vector<CredentialInfo>& credentials);
+    _Out_ std::vector<CredentialInfo>& credentials,
+    _Out_opt_ DWORD* pdwUnreadable = nullptr);
 
 // Export a single credential from LSA by RID
 HRESULT ExportLsaCredential(

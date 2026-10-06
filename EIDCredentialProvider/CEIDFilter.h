@@ -21,6 +21,7 @@
 
 #include <Windows.h>
 #include <credentialprovider.h>
+#include <new>
 #include "helpers.h"
 
 /**
@@ -68,7 +69,7 @@ HRESULT CEIDFilter_CreateInstance(REFIID riid, void** ppv)  // NOSONAR - CAST-01
     HRESULT hr;
 	if (riid != IID_ICredentialProviderFilter) return E_NOINTERFACE;
     // C++17 init-statement: pFilter is only used within this if block
-    if (CEIDFilter* pFilter = new CEIDFilter())  // NOSONAR (EXPLICIT-TYPE-04) - Explicit type preferred for code clarity
+    if (CEIDFilter* pFilter = new (std::nothrow) CEIDFilter())  // NOSONAR (EXPLICIT-TYPE-04) - Explicit type preferred for code clarity
     {
         hr = pFilter->QueryInterface(riid, ppv);
         pFilter->Release();

@@ -190,6 +190,12 @@ struct EID_CALLPACKAGE_BUFFER
 };
 using PEID_CALLPACKAGE_BUFFER = EID_CALLPACKAGE_BUFFER*;
 
+// Upper bound on an enrolment certificate accepted by the package. A smart card
+// logon certificate is a few KB; the stored-credential blob (EID_PRIVATE_DATA)
+// uses USHORT offsets/sizes, so an oversized certificate must be refused before
+// any size arithmetic is done on it.
+constexpr DWORD EID_MAX_CERTIFICATE_SIZE = 16384;
+
 struct EID_MSGINA_AUTHENTICATION_CHALLENGE_REQUEST
 {
 	EID_CALLPACKAGE_MESSAGE MessageType;

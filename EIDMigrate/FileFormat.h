@@ -12,8 +12,12 @@ constexpr char EIDMIGRATE_MAGIC[16] = {  // NOSONAR - LSASS-01: C-style buffer f
     '\0', '\0', '\0', '\0', '\0', '\0'
 };
 
-// File format version
-constexpr uint32_t EIDMIGRATE_VERSION = 1;
+// File format version written by this build.
+//   1 - PBKDF2 used a non-standard chaining (U_{i+1} = PRF(P, T_i)).
+//       Still accepted on import, with the legacy derivation.
+//   2 - Standard PBKDF2-HMAC-SHA256 (RFC 8018). Header layout unchanged.
+constexpr uint32_t EIDMIGRATE_VERSION = 2;
+constexpr uint32_t EIDMIGRATE_VERSION_LEGACY_PBKDF2 = 1;
 
 // File header offsets and sizes
 constexpr size_t HEADER_MAGIC_OFFSET = 0x00;
@@ -66,7 +70,7 @@ struct DERIVED_KEY
 struct EIDMIGRATE_FILE_HEADER
 {
     UCHAR Magic[16];                         // "EIDMIGRATE\x00\x00\x00\x00\x00\x00" // NOSONAR - LSASS-01: C-style buffer for fixed binary file-format layout
-    uint32_t FormatVersion;                  // Little-endian = 1
+    uint32_t FormatVersion;                  // Little-endian, EIDMIGRATE_VERSION (2) or legacy 1
     UCHAR PBKDF2Salt[16];                    // PBKDF2 salt // NOSONAR - LSASS-01: C-style buffer for fixed binary file-format layout
     UCHAR GCMNonce[12];                      // GCM nonce/IV // NOSONAR - LSASS-01: C-style buffer for fixed binary file-format layout
     UCHAR Reserved[16];                      // Future use (zero) // NOSONAR - LSASS-01: C-style buffer for fixed binary file-format layout

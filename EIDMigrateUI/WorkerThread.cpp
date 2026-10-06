@@ -54,7 +54,7 @@ DWORD WINAPI ExportWorker(LPVOID lpParam) { // NOSONAR - Windows API requires LP
     UINT uErrorMsg = pContext->uErrorMsg;
 
     const std::wstring& wsOutputFile = *pContext->pwszOutputFile;
-    const std::wstring& wsPassword = *pContext->pwszPassword;
+    const SecureWString& wsPassword = *pContext->pwszPassword;
     BOOL fValidateCerts = pContext->pfValidateCerts ? *pContext->pfValidateCerts : FALSE;
     BOOL fIncludeGroups = pContext->pfIncludeGroups ? *pContext->pfIncludeGroups : TRUE;
 
@@ -89,13 +89,9 @@ DWORD WINAPI ExportWorker(LPVOID lpParam) { // NOSONAR - Windows API requires LP
 
     SendProgress(hwnd, uProgressMsg, 40, 100, L"Encrypting and writing export file...");
 
-    // Create secure password wrapper
-    SecureWString secPassword;
-    secPassword.assign(wsPassword.c_str(), wsPassword.length());
-
     // Perform export
     EXPORT_STATS stats;
-    hr = ExportCredentials(wsOutputFile, secPassword, options, stats);
+    hr = ExportCredentials(wsOutputFile, wsPassword, options, stats);
     if (FAILED(hr)) {
         SendError(hwnd, uErrorMsg, hr, GetLastError(), L"Failed to export credentials");
         return hr;
@@ -123,7 +119,7 @@ DWORD WINAPI ImportWorker(LPVOID lpParam) { // NOSONAR - Windows API requires LP
     UINT uErrorMsg = pContext->uErrorMsg;
 
     const std::wstring& wsInputFile = *pContext->pwszInputFile;
-    const std::wstring& wsPassword = *pContext->pwszPassword;
+    const SecureWString& wsPassword = *pContext->pwszPassword;
     BOOL fDryRun = pContext->pfDryRun ? *pContext->pfDryRun : TRUE;
     BOOL fCreateUsers = pContext->pfCreateUsers ? *pContext->pfCreateUsers : FALSE;
     BOOL fContinueOnError = pContext->pfContinueOnError ? *pContext->pfContinueOnError : FALSE;
@@ -147,13 +143,9 @@ DWORD WINAPI ImportWorker(LPVOID lpParam) { // NOSONAR - Windows API requires LP
         options.userPasswords = *pContext->pUserPasswords;
     }
 
-    // Create secure password wrapper
-    SecureWString secPassword;
-    secPassword.assign(wsPassword.c_str(), wsPassword.length());
-
     // Perform import
     IMPORT_STATS stats;
-    HRESULT hr = ImportCredentials(wsInputFile, secPassword, options, stats);
+    HRESULT hr = ImportCredentials(wsInputFile, wsPassword, options, stats);
     if (FAILED(hr)) {
         SendError(hwnd, uErrorMsg, hr, GetLastError(), L"Failed to import credentials");
         return hr;
@@ -212,15 +204,12 @@ DWORD WINAPI ValidateFileWorker(LPVOID lpParam) { // NOSONAR - Windows API requi
         return ERROR_INVALID_PARAMETER;
     }
 
-    HWND hwnd = pContext->hwndParent;
-    UINT uProgressMsg = pContext->uProgressMsg;
-    UINT uCompleteMsg = pContext->uCompleteMsg;
-    UINT uErrorMsg = pContext->uErrorMsg;
-
     const std::wstring& wsInputFile = *pContext->pwszInputFile;
-    std::wstring wsPassword = pContext->pwszPassword ? *pContext->pwszPassword : L"";
+    SecureWString swPassword;
+    if (pContext->pwszPassword)
+        swPassword = *pContext->pwszPassword;
 
-    SendProgress(hwnd, uProgressMsg, 0, 100, L"Validating file format...");
+    SendProgress(pContext->hwndParent, pContext->uProgressMsg, 0, 100, L"Validating file format...");
 
     VALIDATE_OPTIONS options;
     options.wsInputPath = wsInputFile;
@@ -228,18 +217,16 @@ DWORD WINAPI ValidateFileWorker(LPVOID lpParam) { // NOSONAR - Windows API requi
     options.fVerbose = FALSE;
 
     VALIDATION_RESULT result;
-    // Create SecureWString from password string
-    SecureWString swPassword(wsPassword.c_str());
     HRESULT hr = ValidateImportFile(wsInputFile, swPassword, options, result);
     if (FAILED(hr) || !result.IsValid()) {  // NOSONAR - SCOPE-01: declaration kept at function scope for clarity
-        SendError(hwnd, uErrorMsg, hr, GetLastError(), L"File validation failed");
+        SendError(pContext->hwndParent, pContext->uErrorMsg, hr, GetLastError(), L"File validation failed");
         return hr;
     }
 
-    SendProgress(hwnd, uProgressMsg, 100, 100, L"Validation complete");
+    SendProgress(pContext->hwndParent, pContext->uProgressMsg, 100, 100, L"Validation complete");
 
     std::wstring wsMessage = L"File is valid. Contains " + std::to_wstring(result.dwCredentialCount) + L" credentials";  // NOSONAR - STRING-01: manual concatenation retained
-    SendComplete(hwnd, uCompleteMsg, S_OK, result.dwCredentialCount, wsMessage);
+    SendComplete(pContext->hwndParent, pContext->uCompleteMsg, S_OK, result.dwCredentialCount, wsMessage);
 
     return 0;
 }

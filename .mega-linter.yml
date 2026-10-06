@@ -68,6 +68,15 @@ DISABLE_ERRORS_LINTERS:
 # Fuzz corpora are binary test inputs; include/ is a vendored Microsoft header.
 FILTER_REGEX_EXCLUDE: '(^fuzz/corpus|^include/)'
 
+# Cppcheck: the repository is C++ only (no .c files), but Cppcheck parses .h
+# files as C by default, so every template in a header was reported as
+# "invalid C code". The C pass is limited to .c files (i.e. it has nothing to
+# do) and the C++ pass is told to parse headers as C++.
+C_CPPCHECK_FILE_EXTENSIONS:
+  - ".c"
+CPP_CPPCHECK_ARGUMENTS:
+  - "--language=c++"
+
 SARIF_REPORTER: true
 TEXT_REPORTER: true
 GITHUB_COMMENT_REPORTER: false

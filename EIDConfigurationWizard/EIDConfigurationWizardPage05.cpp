@@ -34,7 +34,13 @@ BOOL WizardFinishButton(PTSTR wszUserPassword)
 	DWORD dwError = 0;
 
 	CContainerHolderTest* MyTest = pCredentialList->GetContainerHolderAt(dwCurrentCredential);  // NOSONAR - API-01: pointer type dictated by non-const accessor API
-	CContainer* container = MyTest->GetContainer();  // NOSONAR - API-01: pointer type dictated by non-const accessor API
+	// No selection (0xFFFFFFFF) or the card was removed since it was selected.
+	CContainer* container = MyTest ? MyTest->GetContainer() : nullptr;  // NOSONAR - API-01: pointer type dictated by non-const accessor API
+	if (!container)
+	{
+		SetLastError(ERROR_NOT_FOUND);
+		return FALSE;
+	}
 	PCCERT_CONTEXT pCertContext = container->GetCertificate();
 	fReturn = LsaEIDCreateStoredCredential(szUserName, wszUserPassword, pCertContext, container->GetKeySpec() == AT_KEYEXCHANGE);
 	if (!fReturn)

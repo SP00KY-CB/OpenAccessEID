@@ -51,71 +51,9 @@ static DWORD ClampMaxFileSizeMB(DWORD dwValue)
     return dwValue;
 }
 
-// ================================================================
-// M5: Restrictive DACL for the log directory.
-// Full control to SYSTEM (SY) and Administrators (BA); Read&Execute only
-// (0x1200a9, no create/write) to Users (BU). PAI = protected, no inheritance
-// from the (Users-writable) ProgramData parent. Prevents a low-privileged
-// user from planting files/symlinks that this SYSTEM service would follow.
-// ================================================================
-#define EID_LOG_DIR_SDDL L"D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)"  // NOSONAR - MACRO-01: Windows-style macro constant retained for API/preprocessor use
-
-// Build a SECURITY_ATTRIBUTES carrying the restrictive log-dir DACL above.
-// On success returns TRUE and hands back the SD in *ppSD; the caller MUST
-// LocalFree(*ppSD) once CreateDirectoryW has returned. On failure returns
-// FALSE and the caller should fall back to a NULL security descriptor.
-static BOOL BuildLogDirSecurityAttributes(SECURITY_ATTRIBUTES* psa, PSECURITY_DESCRIPTOR* ppSD)
-{
-    if (ppSD)
-        *ppSD = nullptr;
-    if (!psa || !ppSD)
-        return FALSE;
-
-    PSECURITY_DESCRIPTOR pSD = nullptr;
-    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            EID_LOG_DIR_SDDL, SDDL_REVISION_1, &pSD, nullptr))
-        return FALSE;
-
-    psa->nLength = sizeof(SECURITY_ATTRIBUTES);
-    psa->lpSecurityDescriptor = pSD;
-    psa->bInheritHandle = FALSE;
-    *ppSD = pSD;
-    return TRUE;
-}
-
-// Create the log directory with the DACL above, re-applying it when the directory
-// already exists. CreateDirectoryW ignores its security attributes for an existing
-// directory, so without this every machine upgraded from an earlier build would keep
-// the inherited (Users-writable) ProgramData ACL and M5 would never take effect.
-static void EnsureLogDirSecured(PCWSTR pwszDir)
-{
-    if (!pwszDir || pwszDir[0] == L'\0')
-        return;
-
-    SECURITY_ATTRIBUTES sa;
-    PSECURITY_DESCRIPTOR pSD = nullptr;
-    if (!BuildLogDirSecurityAttributes(&sa, &pSD))
-    {
-        CreateDirectoryW(pwszDir, nullptr);
-        return;
-    }
-
-    if (!CreateDirectoryW(pwszDir, &sa) && GetLastError() == ERROR_ALREADY_EXISTS)
-    {
-        PACL pDacl = nullptr;
-        BOOL fDaclPresent = FALSE;
-        BOOL fDaclDefaulted = FALSE;
-        if (GetSecurityDescriptorDacl(pSD, &fDaclPresent, &pDacl, &fDaclDefaulted) && fDaclPresent)
-        {
-            // PROTECTED_DACL_SECURITY_INFORMATION matches the SDDL's "PAI" - it severs
-            // inheritance from ProgramData rather than merging with it.
-            SetNamedSecurityInfoW(const_cast<PWSTR>(pwszDir), SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                nullptr, nullptr, pDacl, nullptr);
-        }
-    }
-    LocalFree(pSD);
-}
+// Directory-trust helpers (EnsureLogDirSecured, EID_IsLogDirSafeForRotation, ...) are
+// shared with the LSASS-side logger rather than duplicated here.
+#include "../EIDCardLibrary/LogDirSecurity.h"
 
 // Service name and display name
 #define SERVICE_NAME             L"EIDTraceConsumer"  // NOSONAR - MACRO-01: Windows-style macro constant retained for API/preprocessor use
@@ -181,7 +119,7 @@ void StopRealtimeSession();
 // Configuration and diagnostics file management
 BOOL LoadCsvConfiguration();
 BOOL EnsureDiagFileOpen();
-void WriteDiagnosticLine(const WCHAR* timestamp, const WCHAR* severity, const WCHAR* message);
+void WriteDiagnosticLine(const WCHAR* timestamp, const WCHAR* severity, DWORD dwProcessId, const WCHAR* message);
 void RotateDiagFile();
 void CloseDiagFile();
 
@@ -319,7 +257,9 @@ BOOL EnsureDiagFileOpen()
         *pLastSlash = L'\0';
         // M5: create the log directory with a restrictive DACL (Full to SYSTEM/Admins,
         // Read&Execute to Users), re-applying it if the directory already exists.
-        EnsureLogDirSecured(szDir);
+        // Refuse a directory that is a reparse point or not SYSTEM/Administrators-owned.
+        if (!EnsureLogDirSecured(szDir))
+            return FALSE;
     }
 
     // M5: FILE_FLAG_OPEN_REPARSE_POINT so a pre-planted symlink/junction at the
@@ -354,6 +294,15 @@ void RotateDiagFile()
         g_hDiagFile = INVALID_HANDLE_VALUE;
     }
 
+    // This service runs as LocalSystem: never rename/delete through a directory that is a
+    // junction or not owned by SYSTEM/Administrators. Skipping rotation leaves the file to
+    // be re-vetted (and refused) by EnsureDiagFileOpen on the next write.
+    if (!EID_IsLogDirSafeForRotation(g_szDiagPath))
+    {
+        g_dwDiagFileSize = 0;
+        return;
+    }
+
     // Keep up to g_dwFileCount rotated generations (mirrors CSVLogger's rotation).
     // The i > 1 count-down cannot underflow when g_dwFileCount is 0 or 1.
     DWORD dwCount = g_dwFileCount ? g_dwFileCount : 1;
@@ -371,7 +320,7 @@ void RotateDiagFile()
     g_dwDiagFileSize = 0;
 }
 
-void WriteDiagnosticLine(const WCHAR* timestamp, const WCHAR* severity, const WCHAR* message)
+void WriteDiagnosticLine(const WCHAR* timestamp, const WCHAR* severity, DWORD dwProcessId, const WCHAR* message)
 {
     if (!g_fDiagnosticsEnabled || !EnsureDiagFileOpen())
         return;
@@ -389,10 +338,15 @@ void WriteDiagnosticLine(const WCHAR* timestamp, const WCHAR* severity, const WC
     char szMsg[3072] = {0};  // NOSONAR - LSASS-01: C-style buffer required by Win32 API
     WideCharToMultiByte(CP_UTF8, 0, timestamp, -1, szTs, sizeof(szTs), nullptr, nullptr);
     WideCharToMultiByte(CP_UTF8, 0, severity, -1, szSev, sizeof(szSev), nullptr, nullptr);
-    WideCharToMultiByte(CP_UTF8, 0, message, -1, szMsg, sizeof(szMsg), nullptr, nullptr);
+    if (WideCharToMultiByte(CP_UTF8, 0, message, -1, szMsg, sizeof(szMsg), nullptr, nullptr) == 0)
+        strcpy_s(szMsg, sizeof(szMsg), "(unconvertible message)");
 
+    // The provider GUID is not access-controlled: any local process can write
+    // events to it. Record which process wrote each line so a forged line can
+    // be told apart from one written by the EID components.
     char szLine[4096];  // NOSONAR - LSASS-01: C-style buffer required by Win32 API
-    int len = sprintf_s(szLine, sizeof(szLine), "%s %s %s\r\n", szTs, szSev, szMsg);
+    int len = sprintf_s(szLine, sizeof(szLine), "%s %s [pid %lu] %s\r\n", szTs, szSev,
+        static_cast<unsigned long>(dwProcessId), szMsg);
     if (len > 0)
     {
         DWORD dwWritten = 0;
@@ -467,6 +421,16 @@ VOID WINAPI EventCallback(PEVENT_RECORD pEvent)  // NOSONAR - API-01: signature 
         }
     }
 
+    // The payload is untrusted (anyone can write to the provider GUID): replace
+    // CR/LF and every other control or line-separator character so a payload
+    // cannot start a new, forged line in diagnostics.log.
+    for (size_t i = 0; i < ARRAYSIZE(szMessage) && szMessage[i] != L'\0'; i++)
+    {
+        const WCHAR ch = szMessage[i];
+        if (ch < 0x20 || ch == 0x7F || (ch >= 0x80 && ch <= 0x9F) || ch == 0x2028 || ch == 0x2029)
+            szMessage[i] = L' ';
+    }
+
     // If no user data, create a generic message
     if (szMessage[0] == L'\0')
     {
@@ -486,7 +450,7 @@ VOID WINAPI EventCallback(PEVENT_RECORD pEvent)  // NOSONAR - API-01: signature 
     if (level > static_cast<UCHAR>(g_dwDiagnosticsLevel))
         return; // more verbose than the configured ceiling
 
-    WriteDiagnosticLine(szTimestamp, GetSeverityName(level),
+    WriteDiagnosticLine(szTimestamp, GetSeverityName(level), pEvent->EventHeader.ProcessId,
                         szMessage[0] ? szMessage : L"(no message)");
 }
 
@@ -655,7 +619,15 @@ DWORD ServiceWorkerThread(LPVOID lpParam)
             wprintf(L"ProcessTrace failed: %u\n", status);
             // Try to restart trace session
             StopTraceSession();
-            Sleep(5000);
+            // Wait before retrying, but wake at once for a stop request. With diagnostics
+            // off (the default) there is no trace to process, so the service spends most of
+            // its time here; a plain Sleep kept it - and its executable, which the
+            // uninstaller deletes straight after stopping it - running for up to five
+            // seconds after the stop had been accepted.
+            if (WaitForSingleObject(g_StopEvent, 5000) == WAIT_OBJECT_0)
+            {
+                break;
+            }
             if (!StartTraceSession())
             {
                 break;
@@ -864,6 +836,81 @@ BOOL InstallService()
     return TRUE;
 }
 
+// How long -stop and -uninstall wait for the service process to exit.
+#define SERVICE_STOP_TIMEOUT_MS 30000  // NOSONAR - MACRO-01: Windows-style macro constant retained for API/preprocessor use
+
+// Ask the service to stop (unless it already is) and wait until its process has exited.
+// The uninstaller deletes EIDTraceConsumer.exe straight after -stop / -uninstall, and the file
+// stays in use until the process is gone - which is after SERVICE_STOPPED has been reported,
+// since the process still has to unwind and exit. Returning as soon as the stop request had
+// been accepted left the executable (and so the installation folder) behind.
+// hService needs SERVICE_STOP | SERVICE_QUERY_STATUS. Returns TRUE once the process has exited.
+static BOOL StopServiceAndWait(SC_HANDLE hService)
+{
+    SERVICE_STATUS_PROCESS ssp = {};
+    DWORD cbNeeded = 0;
+    if (!QueryServiceStatusEx(hService, SC_STATUS_PROCESS_INFO, reinterpret_cast<LPBYTE>(&ssp), sizeof(ssp), &cbNeeded))  // NOSONAR - CAST-01: Win32/COM interop cast, layout-verified
+    {
+        wprintf(L"QueryServiceStatusEx failed: %d\n", GetLastError());
+        return FALSE;
+    }
+    if (ssp.dwCurrentState == SERVICE_STOPPED)
+    {
+        wprintf(L"Service is already stopped\n");
+        return TRUE;
+    }
+
+    // Open the process while the service still runs, so the PID cannot have been reused.
+    HANDLE hProcess = (ssp.dwProcessId != 0) ? OpenProcess(SYNCHRONIZE, FALSE, ssp.dwProcessId) : nullptr;
+
+    if (ssp.dwCurrentState != SERVICE_STOP_PENDING)
+    {
+        wprintf(L"Stopping service...\n");
+        SERVICE_STATUS status = {};
+        if (!ControlService(hService, SERVICE_CONTROL_STOP, &status))
+        {
+            DWORD dwError = GetLastError();
+            if (dwError != ERROR_SERVICE_NOT_ACTIVE && dwError != ERROR_SERVICE_CANNOT_ACCEPT_CTRL)
+            {
+                wprintf(L"ControlService failed: %d\n", dwError);
+                if (hProcess)
+                    CloseHandle(hProcess);
+                return FALSE;
+            }
+        }
+    }
+
+    BOOL fStopped = FALSE;
+    if (hProcess)
+    {
+        fStopped = (WaitForSingleObject(hProcess, SERVICE_STOP_TIMEOUT_MS) == WAIT_OBJECT_0);
+        CloseHandle(hProcess);
+    }
+    else
+    {
+        // No handle on the process: the stopped state is the best available signal.
+        const ULONGLONG ullDeadline = GetTickCount64() + SERVICE_STOP_TIMEOUT_MS;
+        for (;;)
+        {
+            if (QueryServiceStatusEx(hService, SC_STATUS_PROCESS_INFO, reinterpret_cast<LPBYTE>(&ssp), sizeof(ssp), &cbNeeded) &&  // NOSONAR - CAST-01: Win32/COM interop cast, layout-verified
+                ssp.dwCurrentState == SERVICE_STOPPED)
+            {
+                fStopped = TRUE;
+                break;
+            }
+            if (GetTickCount64() >= ullDeadline)
+                break;
+            Sleep(250);
+        }
+    }
+
+    if (fStopped)
+        wprintf(L"Service stopped\n");
+    else
+        wprintf(L"Service did not stop within %d seconds\n", SERVICE_STOP_TIMEOUT_MS / 1000);
+    return fStopped;
+}
+
 BOOL UninstallService()
 {
     SC_HANDLE hSCManager = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
@@ -873,10 +920,12 @@ BOOL UninstallService()
         return FALSE;
     }
 
+    // SERVICE_QUERY_STATUS is needed to wait for the stop. The service used to be opened
+    // without it, so the status read before stopping it was never filled in.
     SC_HANDLE hService = OpenServiceW(
         hSCManager,
         SERVICE_NAME,
-        DELETE | SERVICE_STOP
+        DELETE | SERVICE_STOP | SERVICE_QUERY_STATUS
     );
 
     if (!hService)
@@ -894,16 +943,9 @@ BOOL UninstallService()
         return FALSE;
     }
 
-    // Stop the service
-    SERVICE_STATUS status;
-    QueryServiceStatus(hService, &status);
-    if (status.dwCurrentState != SERVICE_STOPPED)
-    {
-        wprintf(L"Stopping service...\n");
-        ControlService(hService, SERVICE_CONTROL_STOP, &status);
-        Sleep(1000);
-        QueryServiceStatus(hService, &status);
-    }
+    // Stop the service and wait for its process to exit. Delete it even if that times out:
+    // it is then removed as soon as the process does exit.
+    StopServiceAndWait(hService);
 
     // Delete the service
     if (!DeleteService(hService))
@@ -989,30 +1031,10 @@ BOOL StopServiceWrapper()
         return FALSE;
     }
 
-    SERVICE_STATUS status;
-    QueryServiceStatus(hService, &status);
-    if (status.dwCurrentState == SERVICE_STOPPED)
-    {
-        wprintf(L"Service is already stopped\n");
-        CloseServiceHandle(hService);
-        CloseServiceHandle(hSCManager);
-        return TRUE;
-    }
-
-    wprintf(L"Stopping service...\n");
-    BOOL result = ControlService(hService, SERVICE_CONTROL_STOP, &status);
+    BOOL result = StopServiceAndWait(hService);
 
     CloseServiceHandle(hService);
     CloseServiceHandle(hSCManager);
-
-    if (result)
-    {
-        wprintf(L"Service stop requested\n");
-    }
-    else
-    {
-        wprintf(L"ControlService failed: %d\n", GetLastError());
-    }
 
     return result;
 }

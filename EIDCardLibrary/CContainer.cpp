@@ -188,6 +188,11 @@ BOOL CContainer::Erase() const
 
 BOOL CContainer::IsOnReader(LPCTSTR szReaderName) const
 {
+	// _szReaderName is NULL if ValidateAndCopyString rejected or failed to copy it.
+	if (_szReaderName == nullptr || szReaderName == nullptr)
+	{
+		return FALSE;
+	}
 	return _tcscmp(_szReaderName,szReaderName) == 0;
 }
 
@@ -238,7 +243,12 @@ BOOL CContainer::ViewCertificate(HWND hWnd) const
 	LPCSTR					szOid;
 	certViewInfo.dwSize = sizeof(CRYPTUI_VIEWCERTIFICATE_STRUCT);
 	certViewInfo.hwndParent = hWnd;
-	certViewInfo.dwFlags = CRYPTUI_DISABLE_EDITPROPERTIES | CRYPTUI_DISABLE_ADDTOSTORE | CRYPTUI_DISABLE_EXPORT | CRYPTUI_DISABLE_HTMLLINK;
+	// This dialog can be opened from a credential provider tile, i.e. from a SYSTEM process.
+	// Remove every path out of it to a browser / file dialog / network fetch (CVE-2019-1388:
+	// the "Issuer Statement" button opened a SYSTEM browser): no issuer statement, no links,
+	// no hierarchy page, no store access and no URL retrieval beyond the local cache.
+	certViewInfo.dwFlags = CRYPTUI_DISABLE_EDITPROPERTIES | CRYPTUI_DISABLE_ADDTOSTORE | CRYPTUI_DISABLE_EXPORT | CRYPTUI_DISABLE_HTMLLINK
+		| CRYPTUI_DISABLE_ISSUERSTATEMENT | CRYPTUI_HIDE_HIERARCHYPAGE | CRYPTUI_CACHE_ONLY_URL_RETRIEVAL | CRYPTUI_DONT_OPEN_STORES;
 	certViewInfo.szTitle = TEXT("Info");
 	certViewInfo.pCertContext = _pCertContext;
 	certViewInfo.cPurposes = 0;
@@ -375,9 +385,9 @@ PEID_INTERACTIVE_LOGON CContainer::AllocateLogonStruct(PWSTR szPin, PDWORD pdwSi
 	PEID_INTERACTIVE_LOGON pRequest = nullptr;
 	DWORD dwRid = 0;
 	PWSTR szUserName = nullptr;
-	WCHAR szDomainName[MAX_COMPUTERNAME_LENGTH+1]; // NOSONAR - LSASS-01: C-style buffer required by Win32 API
+	WCHAR szDomainName[MAX_COMPUTERNAME_LENGTH+1] = L""; // NOSONAR - LSASS-01: C-style buffer required by Win32 API
 	DWORD dwSize;
-	DWORD dwTotalSize;
+	DWORD dwTotalSize = 0;
 	__try
 	{
 	
@@ -399,7 +409,11 @@ PEID_INTERACTIVE_LOGON CContainer::AllocateLogonStruct(PWSTR szPin, PDWORD pdwSi
 			__leave;
 		}
 		dwSize = ARRAYSIZE(szDomainName);
-		GetComputerName(szDomainName,&dwSize);
+		if (!GetComputerNameW(szDomainName,&dwSize))
+		{
+			EIDCardLibraryTrace(WINEVENT_LEVEL_ERROR,L"GetComputerNameW 0x%08x",GetLastError());
+			__leave;
+		}
 
 		// Validate string lengths to prevent integer overflow in buffer size calculations
 		if (wcslen(_szCardName) > MAX_PATH || wcslen(_szContainerName) > MAX_PATH ||

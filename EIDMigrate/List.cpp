@@ -48,7 +48,7 @@ HRESULT ListLocalCredentials(_In_ BOOL fVerbose)
         }
         else
         {
-            EIDM_TRACE_INFO(L"Found %u credential(s):", credentials.size());
+            EIDM_TRACE_INFO(L"Found %zu credential(s):", credentials.size());
 
             for (const auto& cred : credentials)
             {
@@ -112,7 +112,7 @@ HRESULT ListImportFileCredentials(_In_ const std::wstring& wsInputPath, _In_ BOO
     }
     else
     {
-        EIDM_TRACE_INFO(L"Found %u credential(s):", data.credentials.size());
+        EIDM_TRACE_INFO(L"Found %zu credential(s):", data.credentials.size());
         EIDM_TRACE_INFO(L"");
 
         for (const auto& cred : data.credentials)
@@ -125,7 +125,7 @@ HRESULT ListImportFileCredentials(_In_ const std::wstring& wsInputPath, _In_ BOO
     // Display groups
     if (!data.groups.empty())
     {
-        EIDM_TRACE_INFO(L"Found %u group(s):", data.groups.size());
+        EIDM_TRACE_INFO(L"Found %zu group(s):", data.groups.size());
         EIDM_TRACE_INFO(L"");
 
         for (const auto& group : data.groups)
@@ -134,7 +134,7 @@ HRESULT ListImportFileCredentials(_In_ const std::wstring& wsInputPath, _In_ BOO
 
             if (!group.wsMembers.empty())
             {
-                EIDM_TRACE_INFO(L"    Members (%u):", group.wsMembers.size());
+                EIDM_TRACE_INFO(L"    Members (%zu):", group.wsMembers.size());
                 for (const auto& member : group.wsMembers)  // NOSONAR - COMPLEXITY-01: refactor deferred; logic verified
                 {
                     EIDM_TRACE_INFO(L"      - %ls", member.c_str());

@@ -45,7 +45,9 @@ void EIDCardLibraryTracingUnRegister();
 #define EIDCardLibraryTrace(dwLevel, ...) /* NOSONAR - LOG-01: __FILE__ retained for logging macro */ \
 	EIDCardLibraryTraceEx(__FILE__,__LINE__,__FUNCTION__, dwLevel, __VA_ARGS__)  // NOSONAR - UAF-01: false positive - logging macro call passes __FILE__/__LINE__, no memory freed
 
-void EIDCardLibraryTraceEx(PCSTR szFile, DWORD dwLine, PCSTR szFunction, UCHAR dwLevel, PCWSTR szFormat,...);
+// _Printf_format_string_ lets /analyze check every call site's arguments
+// against its format string.
+void EIDCardLibraryTraceEx(PCSTR szFile, DWORD dwLine, PCSTR szFunction, UCHAR dwLevel, _Printf_format_string_ PCWSTR szFormat,...);
 
 #define EIDCardLibraryDumpMemory(memory, memorysize) /* NOSONAR - LOG-01: __FILE__ retained for logging macro */ \
 	EIDCardLibraryDumpMemoryEx(__FILE__,__LINE__,__FUNCTION__, memory, memorysize)
@@ -76,7 +78,7 @@ constexpr UCHAR SECURITY_AUDIT_WARNING  = 2;
 #define EIDSecurityAudit(dwAuditType, ...) /* NOSONAR - LOG-01: __FILE__ retained for logging macro */ \
 	EIDSecurityAuditEx(__FILE__,__LINE__,__FUNCTION__, dwAuditType, __VA_ARGS__)
 
-void EIDSecurityAuditEx(PCSTR szFile, DWORD dwLine, PCSTR szFunction, UCHAR dwAuditType, PCWSTR szFormat,...);
+void EIDSecurityAuditEx(PCSTR szFile, DWORD dwLine, PCSTR szFunction, UCHAR dwAuditType, _Printf_format_string_ PCWSTR szFormat,...);
 
 // Enhanced error logging with operation context
 // Provides structured error messages for easier debugging
@@ -90,7 +92,7 @@ void EIDLogErrorWithContextEx(
 	PCSTR szFunction,
 	const char* operation,
 	HRESULT hr,
-	PCWSTR szAdditionalContext,
+	_In_opt_z_ _Printf_format_string_ PCWSTR szAdditionalContext,
 	...);
 
 // LSASS-safe stack trace capture for error diagnostics

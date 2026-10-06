@@ -223,73 +223,7 @@ struct EID_CSV_CONFIG
 // Group Policy key: values present here override the local file/registry config (ADMX-managed).
 #define EID_CSV_POLICY_KEY          L"SOFTWARE\\Policies\\OpenAccessEID\\LogManager"  // NOSONAR - MACRO-01: Windows-style macro constant retained for API/preprocessor use
 
-// ================================================================
-// M5: Restrictive DACL for the log/config directory.
-// Full control to SYSTEM (SY) and Administrators (BA); Read&Execute only
-// (0x1200a9, no create/write) to Users (BU). PAI = protected, no inheritance
-// from the (Users-writable) ProgramData parent. Prevents a low-privileged
-// user from planting files/symlinks that a SYSTEM writer would follow.
-// ================================================================
-#define EID_LOG_DIR_SDDL            L"D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)"  // NOSONAR - MACRO-01: Windows-style macro constant retained for API/preprocessor use
-
-// Build a SECURITY_ATTRIBUTES carrying the restrictive log-dir DACL above.
-// On success returns TRUE, fills *psa and hands back the security descriptor in
-// *ppSD; the caller MUST LocalFree(*ppSD) once CreateDirectoryW has returned.
-// On failure returns FALSE and the caller should fall back to a NULL SD.
-inline BOOL BuildLogDirSecurityAttributes(SECURITY_ATTRIBUTES* psa, PSECURITY_DESCRIPTOR* ppSD)
-{
-    if (ppSD)
-        *ppSD = nullptr;
-    if (!psa || !ppSD)
-        return FALSE;
-
-    PSECURITY_DESCRIPTOR pSD = nullptr;
-    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            EID_LOG_DIR_SDDL, SDDL_REVISION_1, &pSD, nullptr))
-        return FALSE;
-
-    psa->nLength = sizeof(SECURITY_ATTRIBUTES);
-    psa->lpSecurityDescriptor = pSD;
-    psa->bInheritHandle = FALSE;
-    *ppSD = pSD;
-    return TRUE;
-}
-
-// Create the log directory with the restrictive DACL above, and - crucially - re-apply
-// that DACL when the directory already exists. CreateDirectoryW ignores its security
-// attributes for an existing directory, so on every machine upgraded from an earlier
-// build the directory would otherwise keep its inherited (Users-writable) ProgramData
-// ACL and M5 would never actually take effect where it matters.
-inline void EnsureLogDirSecured(PCWSTR pwszDir)
-{
-    if (!pwszDir || pwszDir[0] == L'\0')
-        return;
-
-    SECURITY_ATTRIBUTES sa;
-    PSECURITY_DESCRIPTOR pSD = nullptr;
-    if (!BuildLogDirSecurityAttributes(&sa, &pSD))
-    {
-        CreateDirectoryW(pwszDir, nullptr);
-        return;
-    }
-
-    const BOOL fCreated = CreateDirectoryW(pwszDir, &sa);
-    if (!fCreated && GetLastError() == ERROR_ALREADY_EXISTS)
-    {
-        PACL pDacl = nullptr;
-        BOOL fDaclPresent = FALSE;
-        BOOL fDaclDefaulted = FALSE;
-        if (GetSecurityDescriptorDacl(pSD, &fDaclPresent, &pDacl, &fDaclDefaulted) && fDaclPresent)
-        {
-            // PROTECTED_DACL_SECURITY_INFORMATION matches the SDDL's "PAI" - it severs
-            // inheritance from ProgramData rather than merging with it.
-            SetNamedSecurityInfoW(const_cast<PWSTR>(pwszDir), SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                nullptr, nullptr, pDacl, nullptr);
-        }
-    }
-    LocalFree(pSD);
-}
+#include "LogDirSecurity.h"
 
 // ================================================================
 // Configuration Management Functions

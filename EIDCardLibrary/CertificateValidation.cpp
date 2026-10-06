@@ -305,22 +305,26 @@ void InitChainValidationParams(ChainValidationParams* params)
 		CryptReleaseContext(hProv, 0);
 		return EID::make_unexpected(HRESULT_FROM_WIN32(GetLastError()));
 	}
-	// save reference to CSP (else we can't access private key)
-	if (!SetupCertificateContextWithKeyInfo(pCertContext, hProv, szProviderName, szContainerName, pCspInfo->KeySpec))
-	{
-		HRESULT hr = HRESULT_FROM_WIN32(GetLastError());
-		CertFreeCertificateContext(pCertContext);
-		CryptDestroyKey(phUserKey);
-		CryptReleaseContext(hProv, 0);
-		return EID::make_unexpected(hr);
-	}
-	// important : the hprov will be freed if the certificatecontext is freed, and that's a problem
+	// important : the hprov will be freed if the certificatecontext is freed, and that's a problem.
+	// Take the extra reference BEFORE handing hProv to the certificate context: once the
+	// key-context property is set, freeing the certificate releases hProv, so taking the
+	// reference afterwards meant a failed AddRef released the caller's handle twice.
 	if (!CryptContextAddRef(hProv, nullptr, 0))
 	{
 		HRESULT hr = HRESULT_FROM_WIN32(GetLastError());
 		EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING, L"CryptContextAddRef 0x%08x", hr);
 		CertFreeCertificateContext(pCertContext);
 		CryptDestroyKey(phUserKey);
+		CryptReleaseContext(hProv, 0);
+		return EID::make_unexpected(hr);
+	}
+	// save reference to CSP (else we can't access private key)
+	if (!SetupCertificateContextWithKeyInfo(pCertContext, hProv, szProviderName, szContainerName, pCspInfo->KeySpec))
+	{
+		HRESULT hr = HRESULT_FROM_WIN32(GetLastError());
+		CertFreeCertificateContext(pCertContext);
+		CryptDestroyKey(phUserKey);
+		CryptReleaseContext(hProv, 0);	// undo the AddRef above
 		CryptReleaseContext(hProv, 0);
 		return EID::make_unexpected(hr);
 	}

@@ -7,6 +7,7 @@
 #include <string>
 #include <functional>
 #include <vector>
+#include "../EIDMigrate/SecureMemory.h"
 
 // Worker thread context
 struct WORKER_CONTEXT {
@@ -18,7 +19,7 @@ struct WORKER_CONTEXT {
     // Operation-specific data
     std::wstring* pwszOutputFile;
     std::wstring* pwszInputFile;
-    std::wstring* pwszPassword;
+    SecureWString* pwszPassword;
     BOOL* pfValidateCerts;
     BOOL* pfIncludeGroups;
     BOOL* pfDryRun;

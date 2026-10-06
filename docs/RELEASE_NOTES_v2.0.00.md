@@ -16,6 +16,13 @@ Windows reads its LSA authentication-package list only at boot.
 smart-card policies (`RequireCardBoundCredentials`, `RequireRevocationCheck` and the
 rest) carry over, so users do not re-enrol.
 
+> **Correction (after release):** the paragraph above is wrong. The uninstaller of
+> v1.3.00 - and of v2.0.00 itself - deletes every user's stored credential while
+> unregistering, whatever its cleanup checkboxes say, and an upgrade runs it. Users
+> must re-enrol after upgrading from these versions. Fixed in the next release: its
+> uninstaller keeps stored credentials unless "Remove EID certificate mappings from
+> users" is ticked, and its installer warns before running an older uninstaller.
+
 | Item | New location | Action |
 |---|---|---|
 | LSA package | `OpenAccessEIDPackage.dll` (was `EIDAuthenticationPackage.dll`) | Update any scripts that name the DLL. |

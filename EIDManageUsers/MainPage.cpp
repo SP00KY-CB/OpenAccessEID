@@ -175,7 +175,7 @@ HRESULT RefreshUserList(HWND hwndDlg)
 
         if (fInclude)
         {
-            g_appState.users.push_back(info);
+            g_appState.users.push_back(std::move(info));
         }
     }
 

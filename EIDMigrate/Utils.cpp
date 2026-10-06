@@ -298,7 +298,10 @@ SecureWString PromptForPassphrase(_In_ PCWSTR pwszPrompt, _In_ BOOL fConfirm)
 
     WCHAR szBuffer[256];  // NOSONAR - LSASS-01: C-style buffer required by Win32 API
     if (fgetws(szBuffer, ARRAYSIZE(szBuffer), stdin) == nullptr)
+    {
+        SecureZeroMemory(szBuffer, sizeof(szBuffer));
         return SecureWString();
+    }
 
     // Trim newline
     size_t cchLen = wcslen(szBuffer); // NOSONAR - szBuffer is stack-allocated buffer, never NULL
@@ -314,13 +317,19 @@ SecureWString PromptForPassphrase(_In_ PCWSTR pwszPrompt, _In_ BOOL fConfirm)
 
         WCHAR szConfirm[256];  // NOSONAR - LSASS-01: C-style buffer required by Win32 API
         if (fgetws(szConfirm, ARRAYSIZE(szConfirm), stdin) == nullptr)
+        {
+            SecureZeroMemory(szConfirm, sizeof(szConfirm));
             return SecureWString();
+        }
 
         cchLen = wcslen(szConfirm); // NOSONAR - szConfirm is stack-allocated buffer, never NULL
         while (cchLen > 0 && (szConfirm[cchLen - 1] == L'\r' || szConfirm[cchLen - 1] == L'\n'))
             szConfirm[--cchLen] = L'\0';
 
-        if (wcscmp(szBuffer, szConfirm) != 0)
+        // Compare against the captured passphrase: szBuffer has already been wiped.
+        const bool fMatch = (cchLen == wsResult.size()) &&
+            (wmemcmp(wsResult.c_str(), szConfirm, cchLen) == 0);
+        if (!fMatch)
         {
             fwprintf(stderr, L"Error: Passphrases do not match.\n");
             SecureZeroMemory(szConfirm, sizeof(szConfirm));

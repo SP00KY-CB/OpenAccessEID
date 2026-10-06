@@ -24,3 +24,9 @@ NTSTATUS UserNameToToken(__in PLSA_UNICODE_STRING AccountName,
 						__out LPDWORD TokenLength,
 						__out PNTSTATUS SubStatus
 						);
+
+// Account-restriction check (disabled, locked out, expired, logon hours,
+// workstation). Returns STATUS_SUCCESS or a failure NTSTATUS, with the detail
+// in *SubStatus; *ExpirationTime receives the latest time the resulting
+// logon may last. Every path that issues a token for an account must call it.
+NTSTATUS CheckAuthorization(PWSTR UserName, NTSTATUS *SubStatus, LARGE_INTEGER *ExpirationTime);

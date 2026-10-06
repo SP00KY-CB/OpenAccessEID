@@ -23,6 +23,7 @@
  */
 
 #include "CSVLogger.h"
+#include "Tracing.h"
 #include "../EIDMigrate/Utils.h"
 #include <string>
 #include <cmath>
@@ -150,50 +151,91 @@ void EIDCSVLogger::RotateLogFile()
         s_hLogFile = INVALID_HANDLE_VALUE;
     }
 
-    // Determine rotation number
-    DWORD dwRotation = 1;
+    // Rotation renames and deletes files as SYSTEM. Re-verify, right before doing so, that
+    // the log directory (and the product directory above it) is a real directory owned by
+    // SYSTEM/Administrators - not a junction a user planted or swapped in - otherwise the
+    // MoveFileExW/DeleteFileW below would act on whatever the junction points at.
+    if (!EID_IsLogDirSafeForRotation(s_szCurrentLogPath))
+    {
+        EIDCardLibraryTrace(WINEVENT_LEVEL_ERROR,
+            L"[CONFIG_REJECT] log directory is a reparse point or not owned by SYSTEM/Administrators; CSV file logging disabled");
+        s_config.fEnabled = FALSE;
+        return;
+    }
+
+    // Shift the generations, newest first: drop .NNN (N = file count), move
+    // .(i-1) -> .i, then the live file -> .001 - the same scheme EIDTraceConsumer
+    // uses. (The previous "first free slot" search never detected a full set,
+    // because dwRotation started at 1, so once every slot existed each rotation
+    // overwrote .001.) Every step is checked: if one fails, rotation stops there
+    // and the live file is kept, rather than letting the next rename overwrite a
+    // generation that could not be moved and lose audit history. Nothing below
+    // replaces an existing file except the explicit delete of the oldest one.
+    // Paths are built with _snwprintf_s/_TRUNCATE: swprintf_s fast-fails the
+    // process (LSASS) when a path near MAX_PATH does not fit; on truncation the
+    // rotation is skipped instead.
     WCHAR szRotatedPath[MAX_PATH];  // NOSONAR - LSASS-01: C-style buffer for LSASS safety
+    WCHAR szOldPath[MAX_PATH];  // NOSONAR - LSASS-01: C-style buffer for LSASS safety
+    const DWORD dwCount = s_config.dwFileCount ? s_config.dwFileCount : 1;
+    BOOL fShifted = TRUE;
+    BOOL fNeedShift = TRUE;
 
-    // Find next available rotation slot
-    for (DWORD i = 1; i <= s_config.dwFileCount; i++)
+    // When .001 is free (a previous rotation shifted but could not rename the
+    // live file) there is nothing to shift: do not drop another generation.
+    if (_snwprintf_s(szRotatedPath, ARRAYSIZE(szRotatedPath), _TRUNCATE, L"%s.%03u", s_szCurrentLogPath, 1u) >= 0 &&
+        GetFileAttributesW(szRotatedPath) == INVALID_FILE_ATTRIBUTES && GetLastError() == ERROR_FILE_NOT_FOUND)
     {
-        swprintf_s(szRotatedPath, L"%s.%03u", s_szCurrentLogPath, i);
-        if (GetFileAttributesW(szRotatedPath) == INVALID_FILE_ATTRIBUTES)
+        fNeedShift = FALSE;
+    }
+
+    if (fNeedShift && _snwprintf_s(szRotatedPath, ARRAYSIZE(szRotatedPath), _TRUNCATE, L"%s.%03u", s_szCurrentLogPath, dwCount) < 0)
+    {
+        EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING, L"log path too long to rotate - rotation skipped");
+        fShifted = FALSE;
+    }
+    else if (fNeedShift && !DeleteFileW(szRotatedPath) && GetLastError() != ERROR_FILE_NOT_FOUND)
+    {
+        EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING, L"cannot delete oldest log generation (0x%08x) - rotation stopped", GetLastError());
+        fShifted = FALSE;
+    }
+
+    // Count down from dwCount so a count of 1 runs no iteration and the loop
+    // counter can never underflow. Shifts .00(i-1) -> .00i.
+    for (DWORD i = dwCount; fNeedShift && fShifted && i > 1; i--)
+    {
+        if (_snwprintf_s(szOldPath, ARRAYSIZE(szOldPath), _TRUNCATE, L"%s.%03u", s_szCurrentLogPath, i - 1) < 0 ||
+            _snwprintf_s(szRotatedPath, ARRAYSIZE(szRotatedPath), _TRUNCATE, L"%s.%03u", s_szCurrentLogPath, i) < 0)
         {
-            dwRotation = i;
-            break;
+            EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING, L"log path too long to rotate - rotation skipped");
+            fShifted = FALSE;
+        }
+        else if (!MoveFileExW(szOldPath, szRotatedPath, 0) && GetLastError() != ERROR_FILE_NOT_FOUND)
+        {
+            // A missing generation (gap) is fine; any other failure stops rotation.
+            EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING, L"cannot shift log generation %u (0x%08x) - rotation stopped", i - 1, GetLastError());
+            fShifted = FALSE;
         }
     }
 
-    // If all slots filled, rotate all files
-    if (dwRotation > s_config.dwFileCount)
+    // Rename the live file to .001. Only reset the state if the rename actually
+    // happened. On failure the oversized file is still in place, so clearing
+    // s_fHeaderWritten would append a second header row to it; EnsureLogFileOpen
+    // re-reads the true size and rotation is retried on the next event.
+    if (fShifted)
     {
-        // Delete oldest file
-        swprintf_s(szRotatedPath, L"%s.%03u", s_szCurrentLogPath, s_config.dwFileCount);
-        DeleteFileW(szRotatedPath);
-
-        // Rename remaining files
-        // Count down from dwFileCount so dwFileCount == 0 can't underflow the loop
-        // counter into a ~4-billion-iteration hang. Shifts .00(i-1) -> .00i.
-        for (DWORD i = s_config.dwFileCount; i > 1; i--)
+        if (_snwprintf_s(szRotatedPath, ARRAYSIZE(szRotatedPath), _TRUNCATE, L"%s.%03u", s_szCurrentLogPath, 1u) < 0)
         {
-            WCHAR szOldPath[MAX_PATH];  // NOSONAR - LSASS-01: C-style buffer for LSASS safety
-            swprintf_s(szOldPath, L"%s.%03u", s_szCurrentLogPath, i - 1);
-            swprintf_s(szRotatedPath, L"%s.%03u", s_szCurrentLogPath, i);
-            MoveFileExW(szOldPath, szRotatedPath, MOVEFILE_REPLACE_EXISTING);
+            EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING, L"log path too long to rotate - rotation skipped");
         }
-        dwRotation = 1;
-    }
-
-    // Rename current file to rotated
-    swprintf_s(szRotatedPath, L"%s.%03u", s_szCurrentLogPath, dwRotation);
-    // Only reset the state if the rename actually happened. On failure the oversized file
-    // is still in place, so clearing s_fHeaderWritten would append a second header row to
-    // it; EnsureLogFileOpen re-reads the true size and rotation is retried on the next event.
-    if (MoveFileExW(s_szCurrentLogPath, szRotatedPath, MOVEFILE_REPLACE_EXISTING))
-    {
-        s_dwCurrentFileSize = 0;
-        s_fHeaderWritten = FALSE;
+        else if (MoveFileExW(s_szCurrentLogPath, szRotatedPath, 0))
+        {
+            s_dwCurrentFileSize = 0;
+            s_fHeaderWritten = FALSE;
+        }
+        else
+        {
+            EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING, L"cannot rename the live log (0x%08x) - rotation stopped", GetLastError());
+        }
     }
 
     // Open new file
@@ -217,7 +259,17 @@ BOOL EIDCSVLogger::EnsureLogFileOpen()
         *pLastSlash = L'\0';
         // M5: create the log directory with a restrictive DACL (Full to SYSTEM/Admins,
         // Read&Execute to Users), re-applying it if the directory already exists.
-        EnsureLogDirSecured(szDir);
+        // A directory that is a reparse point or not owned by SYSTEM/Administrators (e.g.
+        // pre-created by an unprivileged user) is refused, not adopted: disable file
+        // logging rather than write or rotate there.
+        if (!EnsureLogDirSecured(szDir))
+        {
+            EIDCardLibraryTrace(WINEVENT_LEVEL_ERROR,
+                L"[CONFIG_REJECT] log directory is a reparse point or not owned by SYSTEM/Administrators; CSV file logging disabled");
+            s_config.fEnabled = FALSE;
+            SetLastError(ERROR_ACCESS_DENIED);
+            return FALSE;
+        }
     }
 
     // Open file for append (UTF-16 LE encoding)

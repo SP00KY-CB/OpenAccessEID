@@ -118,7 +118,7 @@ HRESULT ExportCredentials(  // NOSONAR - COMPLEXITY-01: refactor deferred; logic
     data.exportDate = GetExportDate();
     data.wsSourceMachine = options.wsSourceMachine;
     data.wsExportedBy = GetUserName();
-    data.credentials = credentials;
+    data.credentials = std::move(credentials);  // not used after this point
     data.stats.totalCredentials = 0;
     data.stats.certificateEncrypted = 0;
     data.stats.dpapiEncrypted = 0;
@@ -164,12 +164,11 @@ HRESULT ExportCredentials(  // NOSONAR - COMPLEXITY-01: refactor deferred; logic
     }
 
     // Build JSON and check size
+    // Only the size is traced: the payload carries the encrypted passwords and keys.
     std::string jsonPayload = ExportDataToJson(data);
     EIDM_TRACE_INFO(L"JSON payload size: %zu bytes", jsonPayload.size());
-    if (jsonPayload.size() < 100)
-    {
-        EIDM_TRACE_VERBOSE(L"JSON content: %S", jsonPayload.c_str());
-    }
+    if (!jsonPayload.empty())
+        SecureZeroMemory(&jsonPayload[0], jsonPayload.size());
 
     // Write encrypted file
     hr = WriteEncryptedFile(wsOutputPath, wsPassword, data);

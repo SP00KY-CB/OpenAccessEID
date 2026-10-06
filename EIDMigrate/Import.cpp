@@ -524,6 +524,15 @@ HRESULT ImportSingleCredential(  // NOSONAR - COMPLEXITY-01: refactor deferred; 
             {
                 EIDM_TRACE_INFO(L"Certificate installed successfully for: %ls", info.wsUsername.c_str());
             }
+            else if (hrCert == HRESULT_FROM_WIN32(ERROR_NOT_LOGGED_ON))
+            {
+                // The user's profile hive is not loaded (e.g. the account has never
+                // logged on), so its personal store cannot be opened. The certificate
+                // is still stored with the LSA credential below; it is NOT placed in
+                // anyone else's store.
+                EIDM_TRACE_WARN(L"Profile of %ls is not loaded; certificate not added to the user's personal store",
+                    info.wsUsername.c_str());
+            }
             else
             {
                 EIDM_TRACE_ERROR(L"Failed to install certificate for %ls: 0x%08X",

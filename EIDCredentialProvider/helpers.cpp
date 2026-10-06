@@ -94,10 +94,12 @@ HRESULT FieldDescriptorCopy(
                             )
 {
     HRESULT hr;  // NOSONAR - EXPLICIT-TYPE-03: HRESULT visible for security audit
-    CREDENTIAL_PROVIDER_FIELD_DESCRIPTOR cpfd;
+    // Zero-initialise so no uninitialised stack bytes reach LogonUI.
+    CREDENTIAL_PROVIDER_FIELD_DESCRIPTOR cpfd = {};
 
     cpfd.dwFieldID = rcpfd.dwFieldID;
     cpfd.cpft = rcpfd.cpft;
+    cpfd.guidFieldType = rcpfd.guidFieldType;
 
     if (rcpfd.pszLabel)
     {

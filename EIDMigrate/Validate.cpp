@@ -102,7 +102,7 @@ HRESULT ValidateFileFormat(
 
     if (!fValid)
     {
-        result.errors.push_back(wsError);
+        result.errors.push_back(std::move(wsError));
     }
 
     return hr;
@@ -151,7 +151,7 @@ HRESULT ValidateEncryptedContent(
     result.dwWarningCount = static_cast<DWORD>(data.groups.size());
 
     // Store credential details for validation
-    result.credentials = data.credentials;
+    result.credentials = std::move(data.credentials);
 
     // Store metadata
     result.wsSourceMachine = data.wsSourceMachine;
@@ -171,7 +171,7 @@ HRESULT ValidateCertificates(_Out_ VALIDATION_RESULT& result)
         if (cred.Certificate.empty())
         {
             std::wstring wsWarning = L"No certificate for user: " + cred.wsUsername;
-            result.warnings.push_back(wsWarning);
+            result.warnings.push_back(std::move(wsWarning));
             result.fAllCertsTrusted = FALSE;
             continue;
         }
@@ -188,7 +188,7 @@ HRESULT ValidateCertificates(_Out_ VALIDATION_RESULT& result)
             {
                 // NOSONAR - Nested if for clarity: check timestamp exists, then check expiry
                 std::wstring wsWarning = L"Certificate expired for user: " + cred.wsUsername;
-                result.warnings.push_back(wsWarning);
+                result.warnings.push_back(std::move(wsWarning));
                 result.fAllCertsTrusted = FALSE;
             }
         }
@@ -198,7 +198,7 @@ HRESULT ValidateCertificates(_Out_ VALIDATION_RESULT& result)
             if (CompareFileTime(&cred.ftCertValidFrom, &ftNow) > 0)  // NOSONAR - CONTROL-01: nested if kept for clarity
             {
                 std::wstring wsWarning = L"Certificate not yet valid for user: " + cred.wsUsername;
-                result.warnings.push_back(wsWarning);
+                result.warnings.push_back(std::move(wsWarning));
                 result.fAllCertsTrusted = FALSE;
             }
         }

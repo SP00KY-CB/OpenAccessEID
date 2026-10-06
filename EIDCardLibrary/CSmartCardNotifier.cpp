@@ -390,6 +390,10 @@ LONG CSmartCardConnectionNotifier::GetReaderStates(SCARD_READERSTATE rgscState[M
 		// init fake PNP reader
 		memset(&rgscState[0],0,sizeof(SCARD_READERSTATE));
 		rgscState[0].szReader = (LPWSTR) EIDAlloc((DWORD)(sizeof(WCHAR)*(wcslen(L"\\\\?PNP?\\NOTIFICATION")+1)));
+		if (!rgscState[0].szReader)
+		{
+			return SCARD_E_NO_MEMORY;
+		}
 		wcscpy_s((WCHAR*) rgscState[0].szReader,wcslen(L"\\\\?PNP?\\NOTIFICATION")+1,L"\\\\?PNP?\\NOTIFICATION"); // NOSONAR - SCARD_READERSTATE requires LPWSTR cast for string operations
 		rgscState[0].dwCurrentState = SCARD_STATE_UNAWARE;
 		rgscState[0].dwEventState = SCARD_STATE_UNAWARE;
@@ -458,6 +462,9 @@ LONG CSmartCardConnectionNotifier::GetReaderStates(SCARD_READERSTATE rgscState[M
 				EIDFree((PVOID)rgscState[dwI].szReader);
 				// so move the last to this place
 				rgscState[dwI].szReader = rgscState[dwPreviousRdrCount -1].szReader;
+				// The last slot leaves the active range below; drop its copy of
+				// the pointer so nothing can free or use it twice.
+				rgscState[dwPreviousRdrCount -1].szReader = nullptr;
 				rgscState[dwI].cbAtr = rgscState[dwPreviousRdrCount -1].cbAtr;
 				rgscState[dwI].dwCurrentState = rgscState[dwPreviousRdrCount -1].dwCurrentState;
 				rgscState[dwI].dwEventState = rgscState[dwPreviousRdrCount -1].dwEventState;
@@ -501,6 +508,14 @@ LONG CSmartCardConnectionNotifier::GetReaderStates(SCARD_READERSTATE rgscState[M
 			memset(&rgscState[dwPreviousRdrCount],0,sizeof(SCARD_READERSTATE));
 
 			rgscState[dwPreviousRdrCount].szReader = (LPWSTR) EIDAlloc((DWORD)(sizeof(WCHAR)*(wcslen(szReader[dwI])+1)));
+			if (!rgscState[dwPreviousRdrCount].szReader)
+			{
+				// Readers not yet added stay untracked; the next pass retries them.
+				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"No memory for reader %s",szReader[dwI]);
+				*dwRdrCount = dwPreviousRdrCount;
+				SCardFreeMemory(_hSCardContext,szListReaders);
+				return SCARD_E_NO_MEMORY;
+			}
 			wcscpy_s((WCHAR*) rgscState[dwPreviousRdrCount].szReader,wcslen(szReader[dwI])+1,szReader[dwI]); // NOSONAR - SCARD_READERSTATE requires LPWSTR cast for string operations
 			rgscState[dwPreviousRdrCount].dwCurrentState = SCARD_STATE_UNAWARE;
 			rgscState[dwPreviousRdrCount].dwEventState = SCARD_STATE_UNAWARE;

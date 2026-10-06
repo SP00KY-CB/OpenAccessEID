@@ -20,7 +20,13 @@ int APIENTRY _tWinMain(HINSTANCE hInstance,
 	g_hinst = hInstance;
 	int iNumArgs;
 	LPWSTR *pszCommandLine =  CommandLineToArgvW(lpCmdLine,&iNumArgs);
-	if (_tcscmp(pszCommandLine[0],TEXT("DIALOGREMOVEPOLICY")) == 0)
+	if (!pszCommandLine)
+	{
+		return 1;
+	}
+	const BOOL fRemovePolicy = iNumArgs > 0 && _tcscmp(pszCommandLine[0],TEXT("DIALOGREMOVEPOLICY")) == 0;
+	LocalFree(pszCommandLine);
+	if (fRemovePolicy)
 	{
 		DialogBox(g_hinst, MAKEINTRESOURCE(IDD_DIALOGREMOVEPOLICY), nullptr, WndProc_RemovePolicy);
 		return 0;

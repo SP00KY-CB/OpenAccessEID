@@ -14,6 +14,30 @@
 // Forward declarations from StoredCredentialManagement
 extern EID_PRIVATE_DATA_TYPE GetEncryptionTypeFromStoredData(const BYTE* pbStoredData, DWORD cbStoredData);
 
+// Overwrite the characters of a std::string holding secret material (decrypted
+// JSON, Base64 of an encrypted password or key) before it is released.
+static void WipeString(_Inout_ std::string& s) noexcept
+{
+    if (!s.empty())
+        SecureZeroMemory(&s[0], s.size());
+    s.clear();
+}
+
+namespace
+{
+    // Wipes the referenced string on scope exit, so every early return is covered.
+    class ScopedStringWipe
+    {
+    public:
+        explicit ScopedStringWipe(_Inout_ std::string& s) noexcept : m_s(s) {}
+        ~ScopedStringWipe() { WipeString(m_s); }
+        ScopedStringWipe(const ScopedStringWipe&) = delete;
+        ScopedStringWipe& operator=(const ScopedStringWipe&) = delete;
+    private:
+        std::string& m_s;
+    };
+}
+
 // Convert CredentialInfo to JSON
 std::string CredentialToJson(_In_ const CredentialInfo& info)
 {
@@ -56,6 +80,7 @@ std::string CredentialToJson(_In_ const CredentialInfo& info)
         std::string pwdBase64 = EncodeBase64(info.EncryptedPassword.data(),
             static_cast<DWORD>(info.EncryptedPassword.size()));
         builder.add("encryptedPassword", pwdBase64);
+        WipeString(pwdBase64);
     }
 
     // Symmetric key (only for certificate encryption)
@@ -64,6 +89,7 @@ std::string CredentialToJson(_In_ const CredentialInfo& info)
         std::string keyBase64 = EncodeBase64(info.SymmetricKey.data(),
             static_cast<DWORD>(info.SymmetricKey.size()));
         builder.add("symmetricKey", keyBase64);
+        WipeString(keyBase64);
     }
 
     builder.add("algorithm", WideToUtf8(info.wsAlgorithm));
@@ -99,7 +125,9 @@ std::string GroupToJson(_In_ const GroupInfo& group)
     builder.startObject();
     builder.add("name", WideToUtf8(group.wsName));
     builder.add("comment", WideToUtf8(group.wsComment));
-    builder.add("isBuiltin", group.fBuiltin);
+    // Serialise as a JSON boolean: a BOOL would pick add(int) and become a
+    // Number, which the type-checked asBool() on import reads as false.
+    builder.add("isBuiltin", group.fBuiltin != FALSE);
 
     // Members array
     JsonArray membersArray;
@@ -166,6 +194,7 @@ std::string ExportDataToJson(_In_ const ExportFileData& data)
             std::string pwdBase64 = EncodeBase64(cred.EncryptedPassword.data(),
                 static_cast<DWORD>(cred.EncryptedPassword.size()));
             credObj["encryptedPassword"] = std::make_shared<JsonValue>(pwdBase64);
+            WipeString(pwdBase64);
         }
 
         // Symmetric key
@@ -174,6 +203,7 @@ std::string ExportDataToJson(_In_ const ExportFileData& data)
             std::string keyBase64 = EncodeBase64(cred.SymmetricKey.data(),
                 static_cast<DWORD>(cred.SymmetricKey.size()));
             credObj["symmetricKey"] = std::make_shared<JsonValue>(keyBase64);
+            WipeString(keyBase64);
         }
 
         credObj["algorithm"] = std::make_shared<JsonValue>(WideToUtf8(cred.wsAlgorithm));
@@ -205,7 +235,7 @@ std::string ExportDataToJson(_In_ const ExportFileData& data)
         JsonObject groupObj;
         groupObj["name"] = std::make_shared<JsonValue>(WideToUtf8(group.wsName));
         groupObj["comment"] = std::make_shared<JsonValue>(WideToUtf8(group.wsComment));
-        groupObj["isBuiltin"] = std::make_shared<JsonValue>(group.fBuiltin);
+        groupObj["isBuiltin"] = std::make_shared<JsonValue>(group.fBuiltin != FALSE);  // JSON boolean, not Number
 
         JsonArray membersArray;
         for (const auto& member : group.wsMembers)
@@ -283,12 +313,14 @@ HRESULT JsonToCredential(_In_ const std::string& json, _Out_ CredentialInfo& inf
     {
         std::string pwdBase64 = obj["encryptedPassword"]->asString();
         info.EncryptedPassword = DecodeBase64(pwdBase64);
+        WipeString(pwdBase64);
     }
 
     if (obj.has("symmetricKey"))
     {
         std::string keyBase64 = obj["symmetricKey"]->asString();
         info.SymmetricKey = DecodeBase64(keyBase64);
+        WipeString(keyBase64);
     }
 
     if (obj.has("algorithm"))
@@ -326,8 +358,16 @@ HRESULT JsonToGroup(_In_ const std::string& json, _Out_ GroupInfo& group)
     if (obj.has("comment"))
         group.wsComment = Utf8ToWide(obj["comment"]->asString());
 
+    // Current files carry a JSON boolean; older (v1) files wrote the BOOL as a
+    // Number, so accept that too (non-zero = true).
     if (obj.has("isBuiltin"))
-        group.fBuiltin = obj["isBuiltin"]->asBool();
+    {
+        const auto& builtinVal = obj["isBuiltin"];
+        if (builtinVal->isBool())
+            group.fBuiltin = builtinVal->asBool() ? TRUE : FALSE;
+        else if (builtinVal->isNumber())
+            group.fBuiltin = (builtinVal->asNumber() != 0) ? TRUE : FALSE;
+    }
 
     // Parse members array
     if (obj.has("members") && obj["members"]->type() == JsonType::Array)
@@ -379,9 +419,11 @@ HRESULT JsonToExportData(_In_ const std::string& json, _Out_ ExportFileData& dat
                 // Serialize back to string and parse
                 std::string credJson = credVal->stringify();
                 CredentialInfo info;
-                if (SUCCEEDED(JsonToCredential(credJson, info)))  // NOSONAR - COMPLEXITY-01: refactor deferred; logic verified
+                HRESULT hrCred = JsonToCredential(credJson, info);
+                WipeString(credJson);  // holds the Base64 encrypted password / key
+                if (SUCCEEDED(hrCred))  // NOSONAR - COMPLEXITY-01: refactor deferred; logic verified
                 {
-                    data.credentials.push_back(info);
+                    data.credentials.push_back(std::move(info));
                 }
             }
         }
@@ -398,7 +440,7 @@ HRESULT JsonToExportData(_In_ const std::string& json, _Out_ ExportFileData& dat
                 GroupInfo group;
                 if (SUCCEEDED(JsonToGroup(groupJson, group)))  // NOSONAR - COMPLEXITY-01: refactor deferred; logic verified
                 {
-                    data.groups.push_back(group);
+                    data.groups.push_back(std::move(group));
                 }
             }
         }
@@ -493,8 +535,9 @@ HRESULT ValidateFileHeader(
         return E_INVALIDARG;
     }
 
-    // Validate version
-    if (header.FormatVersion != EIDMIGRATE_VERSION)
+    // Validate version (current, or legacy v1 which is still decryptable)
+    if (header.FormatVersion != EIDMIGRATE_VERSION &&
+        header.FormatVersion != EIDMIGRATE_VERSION_LEGACY_PBKDF2)
     {
         wsError = L"Unsupported file version";
         return E_INVALIDARG;
@@ -521,7 +564,8 @@ HRESULT WriteEncryptedFile(
     HANDLE hFile = INVALID_HANDLE_VALUE;  // NOSONAR (EXPLICIT-TYPE-02) - Explicit type preferred for clarity
     std::vector<BYTE> nonce(GCM_NONCE_SIZE);
 
-    // Convert to JSON
+    // Convert to JSON. jsonPayload is the whole plaintext export: wipe it on every exit.
+    ScopedStringWipe wipeJsonPayload(jsonPayload);
     jsonPayload = ExportDataToJson(data);
     if (jsonPayload.empty())
     {
@@ -606,6 +650,8 @@ HRESULT WriteEncryptedFile(
         fileHmac.data(), HMAC_SIZE))
     {
         EIDM_TRACE_ERROR(L"ComputeHMAC failed while writing the export file");
+        SecureZeroMemory(&derivedKey, sizeof(derivedKey));
+        SecureZeroMemory(plaintext.data(), plaintext.size());
         return HRESULT_FROM_WIN32(ERROR_ENCRYPTION_FAILED);
     }
 
@@ -709,11 +755,18 @@ HRESULT ReadEncryptedFile(
         return E_INVALIDARG;
     }
 
-    // Validate version
-    if (header.FormatVersion != EIDMIGRATE_VERSION)
+    // Validate version. Version 1 files were written with a non-standard PBKDF2
+    // chaining; keep them decryptable by selecting the legacy derivation.
+    if (header.FormatVersion != EIDMIGRATE_VERSION &&
+        header.FormatVersion != EIDMIGRATE_VERSION_LEGACY_PBKDF2)
     {
         EIDM_TRACE_ERROR(L"Unsupported file version: %u", header.FormatVersion);
         return E_INVALIDARG;
+    }
+    const BOOL fLegacyPbkdf2 = (header.FormatVersion == EIDMIGRATE_VERSION_LEGACY_PBKDF2) ? TRUE : FALSE;
+    if (fLegacyPbkdf2)
+    {
+        EIDM_TRACE_INFO(L"File format version %u: using the legacy key derivation", header.FormatVersion);
     }
 
     // SECURITY: the header's PayloadLength is attacker-controlled; validate it against the real
@@ -733,7 +786,7 @@ HRESULT ReadEncryptedFile(
     // attacker-supplied and an unclamped value of 1 would be a downgrade.
     CRYPTO_STATUS cryptoStatus = DeriveKeyFromPassphraseWithSalt(
         wsPassword.c_str(), wsPassword.length(), header.PBKDF2Salt, &derivedKey,
-        header.PBKDF2Iterations);
+        header.PBKDF2Iterations, fLegacyPbkdf2);
     if (cryptoStatus != CRYPTO_STATUS::CRYPTO_SUCCESS)
     {
         EIDM_TRACE_ERROR(L"Failed to derive decryption key (wrong passphrase?)");
@@ -752,6 +805,7 @@ HRESULT ReadEncryptedFile(
         fileHmac.data(), HMAC_SIZE))
     {
         EIDM_TRACE_ERROR(L"ComputeHMAC failed while verifying the import file");
+        SecureZeroMemory(&derivedKey, sizeof(derivedKey));
         return HRESULT_FROM_WIN32(ERROR_DECRYPTION_FAILED);
     }
 
@@ -783,8 +837,9 @@ HRESULT ReadEncryptedFile(
     const BYTE* pbCiphertext = fileData.data() + nCiphertextOffset;
     const BYTE* pbTag = header.GCMTag;  // Tag is in the header
 
-    // Prepare plaintext buffer
-    std::vector<BYTE> plaintext(nCiphertextSize);
+    // Prepare plaintext buffer, with one spare zero byte for the terminator so
+    // the decrypted data is never reallocated (which would free an unwiped copy)
+    std::vector<BYTE> plaintext(nCiphertextSize + 1);
     DWORD cbPlaintext = static_cast<DWORD>(nCiphertextSize);  // NOSONAR (EXPLICIT-TYPE-01) - Explicit type preferred for clarity
 
     // Decrypt with GCM
@@ -799,28 +854,25 @@ HRESULT ReadEncryptedFile(
     {
         SecureZeroMemory(&derivedKey, sizeof(derivedKey));
         SecureZeroMemory(fileData.data(), fileData.size());
+        SecureZeroMemory(plaintext.data(), plaintext.size());
         EIDM_TRACE_ERROR(L"Failed to decrypt data");
         return HRESULT_FROM_WIN32(ERROR_LOGON_FAILURE);
     }
 
-    // Add null terminator
-    plaintext.push_back(0); // NOSONAR - push_back used for primitive type (int); emplace_back provides no benefit
+    // Null terminator: the spare byte allocated above
+    plaintext[nCiphertextSize] = 0;
     std::string jsonPlaintext(reinterpret_cast<char*>(plaintext.data())); // NOSONAR - Cast BYTE* to char* for JSON parsing; vector stores encrypted data as bytes
+    ScopedStringWipe wipeJsonPlaintext(jsonPlaintext);
 
+    // Trace only the size: the content is the decrypted export (secret material).
     EIDM_TRACE_VERBOSE(L"Decrypted JSON size: %zu bytes", jsonPlaintext.size());
-    if (jsonPlaintext.size() > 0)
-    {
-        // Log first 100 chars for debugging
-        std::string preview = jsonPlaintext.substr(0, min(100, jsonPlaintext.size()));
-        EIDM_TRACE_VERBOSE(L"JSON preview: %S", preview.c_str());
-    }
 
     // Clear sensitive data
     SecureZeroMemory(&derivedKey, sizeof(derivedKey));
     SecureZeroMemory(plaintext.data(), plaintext.size());
     SecureZeroMemory(fileData.data(), fileData.size());
 
-    // Parse JSON
+    // Parse JSON (jsonPlaintext is wiped when this scope exits)
     return JsonToExportData(jsonPlaintext, data);
 }
 

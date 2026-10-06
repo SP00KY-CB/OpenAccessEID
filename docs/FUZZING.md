@@ -162,11 +162,13 @@ caller must catch. Two call chains matter, and the second is the serious one:
    guarded and falls back to the default configuration, because refusing to
    start the logger is strictly worse than starting it with defaults.
 
-   On a correctly installed machine `C:\ProgramData\OpenAccessEID\logging.json`
-   is created with SYSTEM/Administrators full control and Users read-only, so a
-   standard user cannot rewrite it. The parent directory does carry an inherited
-   `Users: Write` ACE, so the pre-first-save window (file absent) and disk
-   corruption both remain ways to reach the parser with bad bytes.
+   On a correctly installed machine the installer creates
+   `C:\ProgramData\OpenAccessEID` owned by Administrators, with inheritance
+   removed: SYSTEM/Administrators full control and Users read-only, so a standard
+   user cannot write `logging.json`. The loader also ignores `logging.json` unless
+   both the file and that directory are owned by SYSTEM or Administrators and
+   neither is a reparse point. Disk corruption, or a bad file written by an
+   administrator, remain ways to reach the parser with bad bytes.
 
 The `json` target catches the exception so it reports memory faults only. Do not
 widen that catch and call these gaps closed — they are fixed by adding handling
