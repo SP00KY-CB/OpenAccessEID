@@ -28,6 +28,7 @@
 constexpr DWORD TIMEOUT = 300;
 
 #pragma comment(lib,"Winscard")
+#pragma comment(lib,"User32")
 
 
 
@@ -91,6 +92,40 @@ HRESULT CSmartCardConnectionNotifier::Start()
 }
 
 
+// Stop() runs on LogonUI's UI thread (from the provider's destructor). A callback still running
+// on the notifier thread may be inside a call into LogonUI that is delivered to this thread with
+// SendMessage (a tile field update); a plain wait would then never return. So dispatch sent
+// messages - only those: posted and input messages stay queued - until the thread exits. The
+// wait itself is not bounded: the callback uses the provider, which must outlive it.
+static void WaitForThreadDispatchingSentMessages(HANDLE hThread)
+{
+	DWORD dwTimeout = 5000;
+	for (;;)
+	{
+		DWORD dwWait = MsgWaitForMultipleObjectsEx(1, &hThread, dwTimeout, QS_SENDMESSAGE, MWMO_INPUTAVAILABLE);
+		if (dwWait == WAIT_OBJECT_0)
+		{
+			return;
+		}
+		if (dwWait == WAIT_OBJECT_0 + 1)
+		{
+			// Delivers the pending sent messages; removes nothing from the queue.
+			MSG msg;
+			PeekMessage(&msg, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE);
+			continue;
+		}
+		if (dwWait == WAIT_TIMEOUT)
+		{
+			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"Notifier thread still running after %u ms (card read in progress?)",dwTimeout);
+			dwTimeout = INFINITE;
+			continue;
+		}
+		EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"MsgWaitForMultipleObjectsEx 0x%08X",GetLastError());
+		WaitForSingleObject(hThread,INFINITE);
+		return;
+	}
+}
+
 HRESULT CSmartCardConnectionNotifier::Stop()
 {
 	EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"Enter");
@@ -113,7 +148,7 @@ HRESULT CSmartCardConnectionNotifier::Stop()
 					EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"Unable to SCardCancel %X",lReturn);
 				}
 			}
-			WaitForSingleObject(_hThread,INFINITE);
+			WaitForThreadDispatchingSentMessages(_hThread);
 		}
 		else
 		{

@@ -67,9 +67,16 @@ CEIDProvider::CEIDProvider():
 
 CEIDProvider::~CEIDProvider()
 {
-	// Signal shutdown and wait for any running callback to complete (CWE-416 fix for #8)
+	// Signal shutdown and wait for any running callback to complete (CWE-416 fix for #8).
+	// LogonUI normally UnAdvises first; drop any events reference still held now, so a callback
+	// still running on the notifier thread raises no CredentialsChanged into a LogonUI that is
+	// tearing us down while we wait for it. Released below, with the lock dropped (never call
+	// into LogonUI under our lock).
 	EnterCriticalSection(&_csCallback);
 	_fShuttingDown = TRUE;
+	ICredentialProviderEvents* pcpeOld = _pcpe;
+	_pcpe = nullptr;
+	_upAdviseContext = 0;
 	LeaveCriticalSection(&_csCallback);
 
 	if (_pSmartCardConnectionNotifier)
@@ -91,13 +98,6 @@ CEIDProvider::~CEIDProvider()
 	}
 	_CredentialList.Unlock();
 
-	// LogonUI normally UnAdvises first; drop any events reference still held. Swap under
-	// _csCallback, release with it dropped (never call into LogonUI under our lock).
-	EnterCriticalSection(&_csCallback);
-	ICredentialProviderEvents* pcpeOld = _pcpe;
-	_pcpe = nullptr;
-	_upAdviseContext = 0;
-	LeaveCriticalSection(&_csCallback);
 	if (pcpeOld != nullptr)
 	{
 		pcpeOld->Release();

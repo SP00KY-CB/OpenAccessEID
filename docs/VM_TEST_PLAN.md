@@ -316,3 +316,10 @@ Wrong-PIN protection at the logon / unlock tile. Use a minidriver card (for exam
 | P8 | YubiKey (PIV, 3 PIN attempts) used through the Windows built-in PIV driver: uninstall the Yubico minidriver so `certutil -scinfo` shows the card as "Identity Device (NIST SP 800-73 [PIV])". Enter a wrong PIN once, then a second time. | The first is refused with "2 retries" (not a bare "incorrect PIN"). After the second the tile holds PIN entry: "This card has only 1 PIN attempt left ...", no PIN box. The YubiKey is **not** blocked (`ykman piv info` shows 1 PIN try left). | ☐ | |
 | P9 | Re-insert the YubiKey from P8 and enter the correct PIN. Then reinstall the Yubico minidriver. | Logon succeeds and the retry counter is back to 3. The diagnostics log shows "PIV PIN attempts left" lines only for the wrong PINs in P8. | ☐ | |
 
+## LSASS card-handle leak, diagnostics and logon-screen teardown
+
+| # | Step | Expected | ✓ | Notes |
+|---|------|----------|---|-------|
+| K1 | Note `(Get-Process lsass).HandleCount` (elevated PowerShell). Lock and unlock with the card 20 times, then read it again. Repeat with the YubiKey on the built-in PIV driver, entering a wrong PIN 2 times (re-insert, then the correct PIN). | No steady climb of about one or two handles per unlock or per wrong PIN; the count settles back within normal noise. | ☐ | |
+| K2 | With diagnostics enabled (`DiagnosticsLevel` 4 or above), enter a wrong PIN with the MyEID card. | The diagnostics log line reads "MgScCardAuthenticatePin 0x8010006B *pdwAttempts=N" (`SCARD_W_WRONG_CHV`), not `0x00000000`. | ☐ | |
+| K3 | At the lock screen, insert the card and immediately log on with the correct PIN; repeat 10 times, also removing and re-inserting the card while the logon screen is closing. | The logon screen never freezes or needs a reboot. If a card read is still running when the screen closes, the diagnostics log may show "Notifier thread still running after 5000 ms", and the screen still closes once the read ends. | ☐ | |
