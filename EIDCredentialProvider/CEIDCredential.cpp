@@ -964,6 +964,12 @@ HRESULT CEIDCredential::GetSerialization(
 {
     HRESULT hr;  // NOSONAR - EXPLICIT-TYPE-03: HRESULT visible for security audit
 
+    // Both outputs are written on every path below.
+    if (!pcpgsr || !pcpcs)
+    {
+        return E_INVALIDARG;
+    }
+
     // The PIN box is hidden while PIN entry is held; refuse a submission that gets here anyway
     // rather than send the PIN to the card.
     WCHAR szBlocked[EID_PIN_MESSAGE_CCH];  // NOSONAR - LSASS-01: C-style buffer for LSASS safety
