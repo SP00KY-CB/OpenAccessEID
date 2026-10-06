@@ -55,7 +55,7 @@ When a wrong PIN leaves the card with this many PIN attempts or fewer, the tile 
 - Enabled: the number below applies. Set it to 0 to turn this off.
 - Disabled or not configured: the default applies - the card's last attempt is held back (1).
 
-This needs the card to report how many PIN attempts it has left after a wrong PIN, as cards used through a smart card minidriver (for example MyEID) do. Cards that do not report it, such as PIV cards used through the Windows built-in PIV driver, are not held back.
+This needs to know how many PIN attempts the card has left after a wrong PIN. Cards used through a smart card minidriver (for example MyEID) report it, and PIV cards used through the Windows built-in PIV driver are asked for it without using an attempt. Cards that give neither are not held back.
 
 Registry: HKLM\SOFTWARE\Policies\Microsoft\Windows\SmartCardCredentialProvider!PinAttemptsReserved (DWORD, 0-10)</string>
 

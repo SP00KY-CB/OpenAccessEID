@@ -1509,7 +1509,13 @@ extern "C"
 						return STATUS_SMARTCARD_NO_KEYSET;
 					case SCARD_W_WRONG_CHV:
 						EIDSecurityAudit(SECURITY_AUDIT_FAILURE, L"[AUTH_PIN_ERROR] Smart card logon failed for user '%wZ': Wrong PIN", *AccountName);
-						*SubStatus = 0xFFFFFFFF;
+						// The tile needs the count to say how many attempts are left and to hold
+						// PIN entry before the card blocks (PinAttemptsReserved). Free the certificate
+						// first: it holds the Base CSP's context on the card, which may still hold a card
+						// transaction (TransactionTimeoutMilliseconds) that the query would wait behind.
+						CertFreeCertificateContext(pCertContext);
+						pCertContext = NULL;
+						*SubStatus = GetPinAttemptsAfterWrongPinIfPossible(pSmartCardCspInfo, pUnlockLogon->Logon.CspDataLength);
 						return STATUS_SMARTCARD_WRONG_PIN;
 					case SCARD_W_CHV_BLOCKED:
 						EIDSecurityAudit(SECURITY_AUDIT_FAILURE, L"[AUTH_PIN_ERROR] Smart card logon failed for user '%wZ': Card blocked (too many PIN attempts)", *AccountName);

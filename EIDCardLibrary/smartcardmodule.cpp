@@ -800,6 +800,134 @@ BOOL CheckPINandGetRemainingAttempts(LPCTSTR szReader, LPCTSTR szCard, PTSTR szP
 	return fReturn;
 }
 
+// Card name Windows gives a PIV card that it drives with its built-in PIV minidriver.
+static const TCHAR s_szInboxPivCardName[] = TEXT("Identity Device (NIST SP 800-73 [PIV])");
+
+// Decodes the status word a PIV card answers to a VERIFY with no data: 63Cx = x PIN attempts
+// left, 6983 = blocked. Anything else (9000 = already verified, or an error) leaves the count
+// unknown, 0xFFFFFFFF.
+static DWORD PinAttemptsFromVerifyStatus(const BYTE* pbResponse, DWORD cbResponse)
+{
+	if (cbResponse < 2)
+	{
+		return 0xFFFFFFFF;
+	}
+	const BYTE bSw1 = pbResponse[cbResponse - 2];
+	const BYTE bSw2 = pbResponse[cbResponse - 1];
+	if (bSw1 == 0x63 && (bSw2 & 0xF0) == 0xC0)
+	{
+		return bSw2 & 0x0F;
+	}
+	if (bSw1 == 0x69 && bSw2 == 0x83)
+	{
+		return 0;
+	}
+	return 0xFFFFFFFF;
+}
+
+// Reads how many attempts the PIV Card Application PIN has left without using one: per NIST
+// SP 800-73-4 part 2, a VERIFY with no data field only reports the PIN's status. The PIV
+// application is selected first and left selected, which is the state the PIV minidriver
+// expects. Returns 0xFFFFFFFF when the count cannot be read.
+static DWORD GetPivPinAttempts(LPCTSTR szReader)
+{
+	// SELECT the PIV application by its right-truncated AID A0 00 00 03 08 00 00 10 00.
+	static const BYTE s_bSelectPiv[] = { 0x00, 0xA4, 0x04, 0x00, 0x09,
+		0xA0, 0x00, 0x00, 0x03, 0x08, 0x00, 0x00, 0x10, 0x00 };
+	// VERIFY, key reference 80 (PIV Card Application PIN), no data.
+	static const BYTE s_bVerifyStatus[] = { 0x00, 0x20, 0x00, 0x80 };
+	SCARDCONTEXT hSCardContext = NULL;
+	SCARDHANDLE hSCardHandle = NULL;  // NOSONAR - EXPLICIT-TYPE-02: HANDLE visible for security audit
+	BOOL fTransaction = FALSE;
+	DWORD dwProtocol = 0;
+	DWORD dwAttempts = 0xFFFFFFFF;
+	BYTE bResponse[258];  // NOSONAR - LSASS-01: C-style buffer for LSASS safety
+	DWORD cbResponse;
+	LONG lReturn;
+	__try
+	{
+		lReturn = SCardEstablishContext(SCARD_SCOPE_USER, nullptr, nullptr, &hSCardContext);
+		if (SCARD_S_SUCCESS != lReturn)
+		{
+			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"SCardEstablishContext 0x%08X",lReturn);
+			__leave;
+		}
+		lReturn = SCardConnect(hSCardContext, szReader, SCARD_SHARE_SHARED, SCARD_PROTOCOL_Tx, &hSCardHandle, &dwProtocol);
+		if (SCARD_S_SUCCESS != lReturn)
+		{
+			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"SCardConnect 0x%08X",lReturn);
+			__leave;
+		}
+		lReturn = SCardBeginTransaction(hSCardHandle);
+		if (SCARD_S_SUCCESS != lReturn)
+		{
+			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"SCardBeginTransaction 0x%08X",lReturn);
+			__leave;
+		}
+		fTransaction = TRUE;
+		LPCSCARD_IO_REQUEST pioSendPci = (dwProtocol == SCARD_PROTOCOL_T0) ? SCARD_PCI_T0 : SCARD_PCI_T1;
+		cbResponse = ARRAYSIZE(bResponse);
+		lReturn = SCardTransmit(hSCardHandle, pioSendPci, s_bSelectPiv, ARRAYSIZE(s_bSelectPiv), nullptr, bResponse, &cbResponse);
+		// 9000, or 61xx when T=0 holds the application template back for a GET RESPONSE.
+		if (SCARD_S_SUCCESS != lReturn || cbResponse < 2
+			|| !((bResponse[cbResponse - 2] == 0x90 && bResponse[cbResponse - 1] == 0x00) || bResponse[cbResponse - 2] == 0x61))
+		{
+			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"SELECT PIV 0x%08X cb=%u", lReturn, cbResponse);
+			__leave;
+		}
+		cbResponse = ARRAYSIZE(bResponse);
+		lReturn = SCardTransmit(hSCardHandle, pioSendPci, s_bVerifyStatus, ARRAYSIZE(s_bVerifyStatus), nullptr, bResponse, &cbResponse);
+		if (SCARD_S_SUCCESS != lReturn)
+		{
+			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"VERIFY (status) 0x%08X",lReturn);
+			__leave;
+		}
+		dwAttempts = PinAttemptsFromVerifyStatus(bResponse, cbResponse);
+		EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"PIV PIN attempts left %d",dwAttempts);
+	}
+	__finally
+	{
+		if (fTransaction)
+		{
+			SCardEndTransaction(hSCardHandle, SCARD_LEAVE_CARD);
+		}
+		if (hSCardHandle)
+		{
+			SCardDisconnect(hSCardHandle, SCARD_LEAVE_CARD);
+		}
+		if (hSCardContext)
+		{
+			SCardReleaseContext(hSCardContext);
+		}
+	}
+	return dwAttempts;
+}
+
+DWORD GetPinAttemptsAfterWrongPinIfPossible(PEID_SMARTCARD_CSP_INFO pCspInfo, ULONG dwCspDataLength)
+{
+	if (!EIDValidateCspInfo(pCspInfo, dwCspDataLength))
+	{
+		return 0xFFFFFFFF;
+	}
+	LPCTSTR szCSPName = EIDCspInfoStringAt(pCspInfo, dwCspDataLength, pCspInfo->nCSPNameOffset);
+	LPCTSTR szCardName = EIDCspInfoStringAt(pCspInfo, dwCspDataLength, pCspInfo->nCardNameOffset);
+	LPCTSTR szReaderName = EIDCspInfoStringAt(pCspInfo, dwCspDataLength, pCspInfo->nReaderNameOffset);
+	if (!szCSPName || !szCardName || !szReaderName)
+	{
+		return 0xFFFFFFFF;
+	}
+	// Only the PIV cards CheckPINandGetRemainingAttemptsIfPossible leaves to the CSP; a card the
+	// minidriver check covered already reported its count, and another card may not speak PIV.
+	if (_tcscmp(MS_SCARD_PROV, szCSPName) != 0 || _tcscmp(s_szInboxPivCardName, szCardName) != 0)
+	{
+		return 0xFFFFFFFF;
+	}
+	EIDImpersonate();
+	DWORD dwAttempts = GetPivPinAttempts(szReaderName);
+	EIDRevertToSelf();
+	return dwAttempts;
+}
+
 NTSTATUS CheckPINandGetRemainingAttemptsIfPossible(PEID_SMARTCARD_CSP_INFO pCspInfo, ULONG dwCspDataLength, PTSTR szPin, NTSTATUS *pSubStatus)
 {
 	DWORD dwAttempts;
@@ -832,7 +960,7 @@ NTSTATUS CheckPINandGetRemainingAttemptsIfPossible(PEID_SMARTCARD_CSP_INFO pCspI
 	{
 		return 0;
 	}
-	if (_tcscmp(TEXT("Identity Device (NIST SP 800-73 [PIV])"), szCardName) == 0)
+	if (_tcscmp(s_szInboxPivCardName, szCardName) == 0)
 	{
 		return 0;
 	}
