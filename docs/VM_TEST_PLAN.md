@@ -302,18 +302,15 @@ leaving `EIDTraceConsumer.exe` and the installation folder behind):
 | L3 | Repeat L1 as a silent uninstall (`EIDUninstall.exe /S`). | Same result. | ☐ | |
 | L4 | Upgrade from **v2.1.00_TEST_REL** (whose uninstaller does not wait for the service). | Install completes with no "Error opening file for writing" prompt for `EIDTraceConsumer.exe`; after the reboot `sc query EIDTraceConsumer` is RUNNING from `C:\Program Files\OpenAccess EID\EIDTraceConsumer.exe`. | ☐ | |
 
-Wrong-PIN protection at the logon / unlock tile. Use a minidriver card (for example MyEID) whose PIN allows **8** wrong attempts and that can be unblocked with its PUK; check the count first. Rows P1-P7 use the default policies (delay from the 5th wrong PIN for 10 seconds; the card's last attempt held back).
+Wrong-PIN protection at the logon / unlock tile. Use a minidriver card (for example MyEID) whose PIN allows **5** wrong attempts and that can be unblocked with its PUK; check the count first. Rows P1-P5 use the default policy (the card's last attempt held back).
 
 | # | Step | Expected | ✓ | Notes |
 |---|------|----------|---|-------|
-| P1 | Enter a wrong PIN four times. | Each is refused with the usual "N retries" message; no wait between attempts. | ☐ | |
-| P2 | Enter a fifth wrong PIN and dismiss the error. | The PIN box and Submit button are hidden and the tile reads "Too many incorrect PINs. Try again in N seconds.", counting down from 10 once a second. The screen stays responsive. At 0 the PIN box comes back with focus. | ☐ | |
-| P3 | Enter a sixth wrong PIN. | Another 10-second countdown (the card now has 2 attempts left). | ☐ | |
-| P4 | Enter a seventh wrong PIN. | The card has 1 attempt left: no countdown; the tile reads "This card has only 1 PIN attempt left before it is blocked. Remove the card and insert it again to try again." with no PIN box, and stays like that however long you wait. The card is **not** blocked. | ☐ | |
-| P5 | Remove the card and insert it again, then enter the correct PIN. | The PIN box comes back at once, with no countdown. Logon succeeds, and the card's retry counter is back to 8 (a later wrong PIN reports 7 retries). | ☐ | |
-| P6 | Repeat P1-P4, then during a countdown (P2) remove and re-insert the card. | The PIN box comes back at once and five more wrong PINs are allowed before the next countdown. | ☐ | |
-| P7 | Repeat until the hold (P4), re-insert, and enter a wrong PIN once more. | That one attempt is allowed and the card is now blocked ("maximum number of PIN entry attempts"). Unblock it with the PUK. | ☐ | |
-| P8 | `gpedit.msc` → Computer Configuration → Administrative Templates → Windows Components → OpenAccess EID. | "Delay PIN entry after repeated wrong PINs" (5 / 10) and "Hold back the card's last PIN attempts until it is re-inserted" (1) are listed with those defaults. | ☐ | |
-| P9 | Enable the delay with 2 wrong PINs and 20 seconds, and the hold with 3 attempts. Repeat from P1. | The countdown starts at the 2nd wrong PIN and lasts 20 seconds; the hold starts as soon as the card reports 3 attempts left. | ☐ | |
-| P10 | Enable the delay with 0 seconds and the hold with 0. Repeat from P1 (unblock afterwards). | No countdown and no hold: every wrong PIN is sent to the card, which blocks after its 8th. | ☐ | |
-| P11 | With a PIV card used through the Windows built-in PIV driver (no vendor minidriver), enter wrong PINs. | The countdown applies; the hold does not (the driver does not report remaining attempts), as documented. | ☐ | |
+| P1 | Enter a wrong PIN three times. | Each is refused with the usual "N retries" message; no wait and no countdown between attempts. | ☐ | |
+| P2 | Enter a fourth wrong PIN. | The card has 1 attempt left: the tile reads "This card has only 1 PIN attempt left before it is blocked. Remove the card and insert it again to try again." with no PIN box, and stays like that however long you wait. The card is **not** blocked. | ☐ | |
+| P3 | Remove the card and insert it again, then enter the correct PIN. | The PIN box comes back at once. Logon succeeds, and the card's retry counter is back to 5 (a later wrong PIN reports 4 retries). | ☐ | |
+| P4 | Repeat P1-P2, re-insert, and enter a wrong PIN once more. | That one attempt is allowed and the card is now blocked ("maximum number of PIN entry attempts"). Unblock it with the PUK. | ☐ | |
+| P5 | `gpedit.msc` → Computer Configuration → Administrative Templates → Windows Components → OpenAccess EID. | "Hold back the card's last PIN attempts until it is re-inserted" is listed with the default 1. There is no "Delay PIN entry" policy. | ☐ | |
+| P6 | Enable the hold with 3 attempts. Repeat from P1. | The hold starts as soon as the card reports 3 attempts left (after the 2nd wrong PIN). | ☐ | |
+| P7 | Enable the hold with 0. Repeat from P1 (unblock afterwards). | No hold: every wrong PIN is sent to the card, which blocks after its 5th. | ☐ | |
+| P8 | With a PIV card used through the Windows built-in PIV driver (no vendor minidriver), enter wrong PINs. | No hold (the driver does not report remaining attempts), as documented; no countdown either. | ☐ | |

@@ -50,7 +50,6 @@ automatically - no per-admin-workstation install is required.
 | Policy | Registry value | Default |
 |--------|---------------|---------|
 | Enforce CSP whitelist | `EnforceCSPWhitelist` (DWORD) | `0` (Disabled) |
-| Delay PIN entry after repeated wrong PINs | `PinDelayThreshold` (DWORD, 1-100), `PinDelaySeconds` (DWORD, 0-300; 0 = no delay) | `5`, `10` |
 | Hold back the card's last PIN attempts until it is re-inserted | `PinAttemptsReserved` (DWORD, 0-10; 0 = off) | `1` |
 
 `EnforceCSPWhitelist` is the security-critical addition - when enabled it

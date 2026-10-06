@@ -44,55 +44,18 @@ static wchar_t s_wszUnknownError[] = L"Unknow Error";  // NOSONAR - GLOBAL-01: N
 // Message shown in place of the PIN box once the card is removed while this tile is selected.
 static const wchar_t s_szReconnectCard[] = L"Please reconnect your smart card";
 
-// Wrong-PIN protection policies (values under the SmartCardCredentialProvider policy key):
-// defaults when not configured, and the largest value honoured.
-constexpr DWORD EID_PIN_DELAY_THRESHOLD_DEFAULT = 5;    // wrong PINs before the countdown
-constexpr DWORD EID_PIN_DELAY_THRESHOLD_MAX = 100;
-constexpr DWORD EID_PIN_DELAY_SECONDS_DEFAULT = 10;     // countdown length; 0 = no countdown
-constexpr DWORD EID_PIN_DELAY_SECONDS_MAX = 300;
-constexpr DWORD EID_PIN_ATTEMPTS_RESERVED_DEFAULT = 1;  // card attempts held back; 0 = no hold
+// Card PIN attempts held back until the card is re-inserted (policy PinAttemptsReserved, under
+// the SmartCardCredentialProvider policy key): default when not configured, and the largest
+// value honoured. 0 = no hold.
+constexpr DWORD EID_PIN_ATTEMPTS_RESERVED_DEFAULT = 1;
 constexpr DWORD EID_PIN_ATTEMPTS_RESERVED_MAX = 10;
-constexpr DWORD EID_PIN_THROTTLE_TICK_MS = 1000;
-constexpr size_t EID_PIN_MESSAGE_CCH = 192;  // room for the longest PIN-entry message
-
-struct PIN_ENTRY_POLICY
-{
-	DWORD dwDelayThreshold;
-	DWORD dwDelaySeconds;
-	DWORD dwAttemptsReserved;
-};
+constexpr size_t EID_PIN_MESSAGE_CCH = 192;  // room for the held-PIN message
 
 // Read on every wrong PIN, so a policy change applies from the next one.
-static PIN_ENTRY_POLICY ReadPinEntryPolicy()
+static DWORD ReadPinAttemptsReserved()
 {
-	PIN_ENTRY_POLICY policy;
-	policy.dwDelayThreshold = GetPolicyValueOrDefault(GPOPolicy::PinDelayThreshold, EID_PIN_DELAY_THRESHOLD_DEFAULT);
-	if (policy.dwDelayThreshold == 0)
-	{
-		policy.dwDelayThreshold = 1;
-	}
-	else if (policy.dwDelayThreshold > EID_PIN_DELAY_THRESHOLD_MAX)
-	{
-		policy.dwDelayThreshold = EID_PIN_DELAY_THRESHOLD_MAX;
-	}
-	policy.dwDelaySeconds = GetPolicyValueOrDefault(GPOPolicy::PinDelaySeconds, EID_PIN_DELAY_SECONDS_DEFAULT);
-	if (policy.dwDelaySeconds > EID_PIN_DELAY_SECONDS_MAX)
-	{
-		policy.dwDelaySeconds = EID_PIN_DELAY_SECONDS_MAX;
-	}
-	policy.dwAttemptsReserved = GetPolicyValueOrDefault(GPOPolicy::PinAttemptsReserved, EID_PIN_ATTEMPTS_RESERVED_DEFAULT);
-	if (policy.dwAttemptsReserved > EID_PIN_ATTEMPTS_RESERVED_MAX)
-	{
-		policy.dwAttemptsReserved = EID_PIN_ATTEMPTS_RESERVED_MAX;
-	}
-	return policy;
-}
-
-// Message shown in place of the PIN box while the countdown runs.
-static void FormatPinThrottleMessage(DWORD dwSecondsLeft, PWSTR pwszBuffer, size_t cchBuffer)
-{
-	StringCchPrintfW(pwszBuffer, cchBuffer, L"Too many incorrect PINs. Try again in %lu second%ls.",
-		dwSecondsLeft, dwSecondsLeft == 1 ? L"" : L"s");
+	const DWORD dwReserved = GetPolicyValueOrDefault(GPOPolicy::PinAttemptsReserved, EID_PIN_ATTEMPTS_RESERVED_DEFAULT);
+	return dwReserved > EID_PIN_ATTEMPTS_RESERVED_MAX ? EID_PIN_ATTEMPTS_RESERVED_MAX : dwReserved;
 }
 
 // Message shown in place of the PIN box while PIN entry is held until the card is re-inserted.
@@ -101,18 +64,6 @@ static void FormatPinHeldMessage(DWORD dwTriesLeft, PWSTR pwszBuffer, size_t cch
 	StringCchPrintfW(pwszBuffer, cchBuffer,
 		L"This card has only %lu PIN attempt%ls left before it is blocked. Remove the card and insert it again to try again.",
 		dwTriesLeft, dwTriesLeft == 1 ? L"" : L"s");
-}
-
-// Arms the countdown timer for one tick from now. One-shot: each tick re-arms it, so a slow
-// tick can never overlap the next one.
-static void ArmPinThrottleTimer(PTP_TIMER pTimer)
-{
-	// Negative = relative, in 100 ns units.
-	const ULONGLONG ullDue = static_cast<ULONGLONG>(-static_cast<LONGLONG>(EID_PIN_THROTTLE_TICK_MS) * 10000);
-	FILETIME ftDue;
-	ftDue.dwLowDateTime = static_cast<DWORD>(ullDue & 0xFFFFFFFF);
-	ftDue.dwHighDateTime = static_cast<DWORD>(ullDue >> 32);
-	SetThreadpoolTimer(pTimer, &ftDue, 0, 0);
 }
 
 // CEIDCredential ////////////////////////////////////////////////////////
@@ -364,10 +315,7 @@ BOOL CEIDCredential::MarkReconnected()
 		_fDisconnected = FALSE;
 		_dwFieldStateGen++;
 		SecureClearPin();
-		// The card has been re-inserted: release a hold and start the wrong-PIN count afresh.
-		// A countdown still running ends at its next tick (it sees no time left).
-		_dwWrongPinCount = 0;
-		_ullPinThrottleEnd = 0;
+		// The card has been re-inserted: release a PIN hold.
 		_fPinHeld = FALSE;
 	}
 	LeaveCriticalSection(&_csFields);
@@ -376,9 +324,9 @@ BOOL CEIDCredential::MarkReconnected()
 
 void CEIDCredential::UpdateConnectionFields()
 {
-	// Several threads push - the notifier thread on a card removal or re-insertion, LogonUI's
-	// thread when PIN entry is blocked after a wrong PIN, the countdown timer when it ends - each with no
-	// lock held, so two pushes can interleave and leave LogonUI showing a mix of both states.
+	// Two threads push - the notifier thread on a card removal or re-insertion, LogonUI's thread
+	// when a wrong PIN holds PIN entry - each with no lock held, so two pushes can interleave and
+	// leave LogonUI showing a mix of both states.
 	// So each push checks afterwards whether the state changed while it was pushing, and if it
 	// did pushes again: whichever push finishes last leaves the current state on screen.
 	for (int iPass = 0; iPass < 3; iPass++)
@@ -447,38 +395,13 @@ void CEIDCredential::UpdateConnectionFields()
 	}
 }
 
-DWORD CEIDCredential::PinThrottleSecondsLeft() const
-{
-	const ULONGLONG ullNow = GetTickCount64();
-	if (_ullPinThrottleEnd <= ullNow)
-	{
-		return 0;
-	}
-	return static_cast<DWORD>((_ullPinThrottleEnd - ullNow + 999) / 1000);
-}
-
 BOOL CEIDCredential::GetPinEntryBlock(PWSTR pwszMessage, size_t cchMessage) const
 {
-	// A hold outranks a countdown: either way no attempt is allowed, but only re-inserting
-	// the card ends a hold.
-	if (_fPinHeld)
+	if (_fPinHeld && pwszMessage)
 	{
-		if (pwszMessage)
-		{
-			FormatPinHeldMessage(_dwCardTriesLeft, pwszMessage, cchMessage);
-		}
-		return TRUE;
+		FormatPinHeldMessage(_dwCardTriesLeft, pwszMessage, cchMessage);
 	}
-	const DWORD dwSecondsLeft = PinThrottleSecondsLeft();
-	if (dwSecondsLeft != 0)
-	{
-		if (pwszMessage)
-		{
-			FormatPinThrottleMessage(dwSecondsLeft, pwszMessage, cchMessage);
-		}
-		return TRUE;
-	}
-	return FALSE;
+	return _fPinHeld;
 }
 
 BOOL CEIDCredential::IsPinEntryBlocked() const
@@ -489,128 +412,29 @@ BOOL CEIDCredential::IsPinEntryBlocked() const
 	return fBlocked;
 }
 
-// Counts a wrong PIN. When the card is down to its reserved PIN attempts, holds PIN entry until
-// the card is re-inserted; otherwise, from the PinDelayThreshold-th wrong PIN on, starts the
-// countdown that has to run out before the next attempt. Called on LogonUI's thread
-// (ReportResult). ntsSubstatus is the number of PIN attempts the card has left, or 0xFFFFFFFF
-// when the card did not say (the hold then cannot apply).
+// When a wrong PIN leaves the card with PinAttemptsReserved or fewer PIN attempts, holds PIN entry
+// until the card is re-inserted. Called on LogonUI's thread (ReportResult). ntsSubstatus is the
+// number of PIN attempts the card has left, or 0xFFFFFFFF when the card did not say (the hold then
+// cannot apply).
 void CEIDCredential::RecordWrongPin(NTSTATUS ntsSubstatus)
 {
-	const PIN_ENTRY_POLICY policy = ReadPinEntryPolicy();
+	const DWORD dwReserved = ReadPinAttemptsReserved();
 	const DWORD dwTriesLeft = static_cast<DWORD>(ntsSubstatus);
 	// None left means the card is blocked already: there is nothing left to hold back.
-	const BOOL fHold = (dwTriesLeft != 0xFFFFFFFF && dwTriesLeft != 0 && dwTriesLeft <= policy.dwAttemptsReserved);
-	BOOL fStarted = FALSE;
-	EnterCriticalSection(&_csFields);
-	if (_dwWrongPinCount < MAXDWORD)
+	const BOOL fHold = (dwTriesLeft != 0xFFFFFFFF && dwTriesLeft != 0 && dwTriesLeft <= dwReserved);
+	EIDCardLibraryTrace(WINEVENT_LEVEL_INFO,L"EVID: wrong PIN tile=%p triesLeft=%lu hold=%d",(void*)this,dwTriesLeft,fHold);
+	if (!fHold)
 	{
-		_dwWrongPinCount++;
-	}
-	if (fHold)
-	{
-		// No countdown on top: nothing is allowed until the card is re-inserted anyway.
-		_fPinHeld = TRUE;
-		_dwCardTriesLeft = dwTriesLeft;
-		_dwFieldStateGen++;
-		fStarted = TRUE;
-	}
-	else if (policy.dwDelaySeconds != 0 && _dwWrongPinCount >= policy.dwDelayThreshold)
-	{
-		if (_pPinThrottleTimer == nullptr)
-		{
-			TP_CALLBACK_ENVIRON env;
-			InitializeThreadpoolEnvironment(&env);
-			// The last tick releases the timer's reference to the tile, which may be the last
-			// one and with it this DLL's last reference: keep the DLL loaded until it returns.
-			SetThreadpoolCallbackLibrary(&env, HINST_THISDLL);
-			_pPinThrottleTimer = CreateThreadpoolTimer(PinThrottleTimerCallback, this, &env);
-			DestroyThreadpoolEnvironment(&env);
-			if (_pPinThrottleTimer != nullptr)
-			{
-				AddRef();  // held by the timer; released by its last tick
-				ArmPinThrottleTimer(_pPinThrottleTimer);
-			}
-			else
-			{
-				// No countdown without a timer to end it (the PIN box would stay hidden); the
-				// card's own retry counter still applies.
-				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"CreateThreadpoolTimer 0x%08x - wrong-PIN countdown not started",GetLastError());
-			}
-		}
-		// A timer that is still running (a countdown reset by a re-insertion, not yet past
-		// its next tick) carries on with the new deadline.
-		if (_pPinThrottleTimer != nullptr)
-		{
-			_ullPinThrottleEnd = GetTickCount64() + policy.dwDelaySeconds * 1000ULL;
-			_dwFieldStateGen++;
-			fStarted = TRUE;
-		}
-	}
-	const DWORD dwCount = _dwWrongPinCount;
-	LeaveCriticalSection(&_csFields);
-	EIDCardLibraryTrace(WINEVENT_LEVEL_INFO,L"EVID: wrong PIN tile=%p count=%lu triesLeft=%lu hold=%d blocked=%d",(void*)this,dwCount,dwTriesLeft,fHold,fStarted);
-
-	if (fStarted)
-	{
-		// Hide the PIN box and submit button and say why.
-		UpdateConnectionFields();
-	}
-}
-
-VOID CALLBACK CEIDCredential::PinThrottleTimerCallback(PTP_CALLBACK_INSTANCE pInstance, PVOID pvContext, PTP_TIMER pTimer)
-{
-	UNREFERENCED_PARAMETER(pInstance);
-	static_cast<CEIDCredential*>(pvContext)->OnPinThrottleTick(pTimer);
-}
-
-// Runs on a thread-pool thread, once a second while the countdown runs; the timer's reference
-// keeps the tile alive. Calls into LogonUI with no lock held, like the notifier thread does.
-void CEIDCredential::OnPinThrottleTick(PTP_TIMER pTimer)
-{
-	WCHAR szMessage[EID_PIN_MESSAGE_CCH];  // NOSONAR - LSASS-01: C-style buffer for LSASS safety
-	EnterCriticalSection(&_csFields);
-	const DWORD dwSecondsLeft = PinThrottleSecondsLeft();
-	const BOOL fDisconnected = _fDisconnected;
-	if (dwSecondsLeft == 0)
-	{
-		// Over, or reset by a card re-insertion. From here on this tick owns the timer: a
-		// wrong PIN from now on starts a new one.
-		_ullPinThrottleEnd = 0;
-		_pPinThrottleTimer = nullptr;
-		_dwFieldStateGen++;
-	}
-	// While the countdown runs this is its message (or a hold's, which outranks it).
-	GetPinEntryBlock(szMessage, ARRAYSIZE(szMessage));
-	const DWORD dwGen = _dwFieldStateGen;
-	LeaveCriticalSection(&_csFields);
-
-	if (dwSecondsLeft != 0)
-	{
-		if (ICredentialProviderCredentialEvents* pEvents = GetEventsAddRef())
-		{
-			pEvents->SetFieldString(this, SFI_MESSAGE, fDisconnected ? s_szReconnectCard : szMessage);
-			pEvents->Release();
-		}
-		// A card removal or re-insertion pushed its own state meanwhile: this message may
-		// have overwritten it, so push the whole current state again.
-		EnterCriticalSection(&_csFields);
-		const BOOL fChanged = (_dwFieldStateGen != dwGen);
-		LeaveCriticalSection(&_csFields);
-		if (fChanged)
-		{
-			UpdateConnectionFields();
-		}
-		ArmPinThrottleTimer(pTimer);
 		return;
 	}
 
-	EIDCardLibraryTrace(WINEVENT_LEVEL_INFO,L"EVID: wrong-PIN countdown over tile=%p",(void*)this);
-	// Bring back the PIN prompt (or the reconnect message, if the card is out).
+	EnterCriticalSection(&_csFields);
+	_fPinHeld = TRUE;
+	_dwCardTriesLeft = dwTriesLeft;
+	_dwFieldStateGen++;
+	LeaveCriticalSection(&_csFields);
+	// Hide the PIN box and submit button and say why.
 	UpdateConnectionFields();
-	// Allowed from the timer's own callback: it is freed once this callback returns.
-	CloseThreadpoolTimer(pTimer);
-	// The timer's reference. May delete this tile: nothing may touch a member after it.
-	Release();
 }
 
 // LogonUI calls this in order to give us a callback in case we need to notify it of anything.
@@ -754,8 +578,8 @@ HRESULT CEIDCredential::GetFieldState(
         {
             *pcpfs = CPFS_HIDDEN;
         }
-        // Likewise the PIN entry and submit button while PIN entry is blocked (wrong-PIN
-        // countdown, or the card's last attempts held back until it is re-inserted).
+        // Likewise the PIN entry and submit button while PIN entry is held (the card's last
+        // attempts held back until it is re-inserted).
         if ((dwFieldID == SFI_PIN || dwFieldID == SFI_SUBMIT_BUTTON) && IsPinEntryBlocked())
         {
             *pcpfs = CPFS_HIDDEN;
@@ -1140,8 +964,8 @@ HRESULT CEIDCredential::GetSerialization(
 {
     HRESULT hr;  // NOSONAR - EXPLICIT-TYPE-03: HRESULT visible for security audit
 
-    // The PIN box is hidden while PIN entry is blocked; refuse a submission that gets here
-    // anyway rather than send the PIN to the card.
+    // The PIN box is hidden while PIN entry is held; refuse a submission that gets here anyway
+    // rather than send the PIN to the card.
     WCHAR szBlocked[EID_PIN_MESSAGE_CCH];  // NOSONAR - LSASS-01: C-style buffer for LSASS safety
     EnterCriticalSection(&_csFields);
     const BOOL fBlocked = GetPinEntryBlock(szBlocked, ARRAYSIZE(szBlocked));
@@ -1157,7 +981,7 @@ HRESULT CEIDCredential::GetSerialization(
             *pcpsiOptionalStatusIcon = CPSI_WARNING;
         }
         *pcpgsr = CPGSR_NO_CREDENTIAL_NOT_FINISHED;
-        EIDCardLibraryTrace(WINEVENT_LEVEL_INFO,L"Submission refused: PIN entry blocked");
+        EIDCardLibraryTrace(WINEVENT_LEVEL_INFO,L"Submission refused: PIN entry held");
         return S_OK;
     }
 
@@ -1384,8 +1208,9 @@ HRESULT CEIDCredential::ReportResult(
         }
     }
 
-    // Wrong-PIN protection: count wrong PINs (ntsSubstatus is the card's attempts left), which
-    // may block PIN entry; a successful logon starts the count afresh.
+    // Wrong-PIN protection: a wrong PIN that leaves the card with its reserved attempts holds
+    // PIN entry until the card is re-inserted (ntsSubstatus is the card's attempts left); a
+    // successful logon releases it.
     if (ntsStatus == STATUS_SMARTCARD_WRONG_PIN)
     {
         RecordWrongPin(ntsSubstatus);
@@ -1393,7 +1218,6 @@ HRESULT CEIDCredential::ReportResult(
     else if (ntsStatus == STATUS_SUCCESS)
     {
         EnterCriticalSection(&_csFields);
-        _dwWrongPinCount = 0;
         _fPinHeld = FALSE;
         LeaveCriticalSection(&_csFields);
     }

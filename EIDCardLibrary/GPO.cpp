@@ -59,8 +59,6 @@ const GPOInfo MyGPOInfo[] =  // NOSONAR - Const lookup table for GPO settings
   {szMainGPOKey, L"EnforceCSPWhitelist" },  // Security: block CSPs not in whitelist
   {szMainGPOKey, L"RequireCardBoundCredentials" },  // Security (H3): only card-wrapped credentials allowed when set
   {szMainGPOKey, L"RequireRevocationCheck" },  // Security (M1): fail-closed when revocation cannot be confirmed offline
-  {szMainGPOKey, L"PinDelayThreshold" },  // Logon tile: wrong PINs before the countdown
-  {szMainGPOKey, L"PinDelaySeconds" },  // Logon tile: countdown length; 0 = off
   {szMainGPOKey, L"PinAttemptsReserved" }  // Logon tile: card attempts held back until re-insertion; 0 = off
 };
 

@@ -47,18 +47,6 @@ Note: self-signed (peer-trust) card certificates have no CRL and cannot be revoc
 
 Registry: HKLM\SOFTWARE\Policies\Microsoft\Windows\SmartCardCredentialProvider!RequireRevocationCheck (DWORD)</string>
 
-      <string id="PinEntryDelay">Delay PIN entry after repeated wrong PINs</string>
-      <string id="PinEntryDelay_Help">Slows down repeated wrong PINs at the OpenAccess EID logon and unlock tile. Once the set number of wrong PINs has been entered, each further wrong PIN hides the PIN box for the set number of seconds while the tile counts down ("Too many incorrect PINs. Try again in N seconds.").
-
-Removing the smart card and inserting it again resets the count and ends the delay at once. So does a successful logon.
-
-- Enabled: the values below apply. Set the delay to 0 to turn the delay off.
-- Disabled or not configured: the default applies - a 10-second delay after each wrong PIN from the 5th on.
-
-This delay does not change the card's own PIN retry counter, which blocks the card after the number of wrong PINs it allows. To stop typing from blocking the card, see "Hold back the card's last PIN attempts until it is re-inserted".
-
-Registry: HKLM\SOFTWARE\Policies\Microsoft\Windows\SmartCardCredentialProvider!PinDelayThreshold (DWORD, 1-100) and !PinDelaySeconds (DWORD, 0-300)</string>
-
       <string id="PinAttemptsReserved">Hold back the card's last PIN attempts until it is re-inserted</string>
       <string id="PinAttemptsReserved_Help">Stops wrong PINs typed at the OpenAccess EID logon and unlock tile from using up the smart card's last PIN attempts and blocking the card. A blocked card can then only be used again after it is unblocked with its PUK or by its issuer.
 
@@ -164,10 +152,6 @@ Registry: HKLM\SOFTWARE\Policies\OpenAccessEID\LogManager!AutoStart (DWORD)</str
     </stringTable>
 
     <presentationTable>
-      <presentation id="PinEntryDelay">
-        <decimalTextBox refId="PinDelayThreshold_Dec" defaultValue="5">Wrong PINs allowed before the delay starts:</decimalTextBox>
-        <decimalTextBox refId="PinDelaySeconds_Dec" defaultValue="10">Delay after each further wrong PIN (seconds, 0 = no delay):</decimalTextBox>
-      </presentation>
       <presentation id="PinAttemptsReserved">
         <decimalTextBox refId="PinAttemptsReserved_Dec" defaultValue="1">Card PIN attempts to hold back (0 = none):</decimalTextBox>
       </presentation>
