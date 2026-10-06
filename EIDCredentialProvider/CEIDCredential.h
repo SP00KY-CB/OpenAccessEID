@@ -97,8 +97,10 @@ public:
 	//    sets the flag only if the tile is still selected (atomically with SetDeselected) and
 	//    returns FALSE when it is not (the caller then erases it); MarkReconnected returns
 	//    TRUE if it cleared the flag.
-	//  - UpdateConnectionFields() then pushes the current state to LogonUI; it is called
-	//    with no lock held.
+	//  - UpdateConnectionFields() then pushes the current state to LogonUI (the reconnect
+	//    message, the held-PIN message, or the PIN prompt); it is called with no lock held,
+	//    and pushes again if the state changed while it was pushing.
+	// MarkReconnected also releases a PIN hold: re-inserting the card starts over.
 	BOOL IsSelected() const;
 	BOOL IsDisconnected() const;
 	BOOL MarkDisconnectedIfSelected();
@@ -115,6 +117,18 @@ public:
 	ICredentialProviderCredentialEvents* GetEventsAddRef();
 	// Whether the "view certificate" command link may be shown in the current scenario.
 	BOOL IsCertificateLinkAllowed() const;
+
+	// Wrong-PIN protection (policy PinAttemptsReserved): once a wrong PIN leaves the card with
+	// PinAttemptsReserved or fewer PIN attempts, PIN entry is held - the PIN box and submit
+	// button hidden and the message saying why - until the card is re-inserted, so typing
+	// cannot use up the card's last attempts and block it. Each re-insertion then allows one
+	// attempt. Re-inserting the card (MarkReconnected; a tile created for a newly inserted card
+	// starts afresh) or a successful logon releases the hold.
+	void RecordWrongPin(NTSTATUS ntsSubstatus);
+	// Caller must hold _csFields. TRUE while PIN entry is held; then also fills pwszMessage,
+	// when given, with the text shown in place of the PIN box.
+	BOOL GetPinEntryBlock(PWSTR pwszMessage, size_t cchMessage) const;
+	BOOL IsPinEntryBlocked() const;
 
     LONG                                  _cRef;
 
@@ -138,11 +152,14 @@ public:
 	BOOL        _fSelected;      // TRUE while LogonUI has this tile zoomed (between SetSelected/SetDeselected).
 	BOOL        _fDisconnected;  // TRUE while the card is absent and the tile shows the reconnect prompt.
 	CEIDProvider* _pProvider;   // Owning provider; used to drop this tile when deselected while disconnected.
-	// Guards _rgFieldStrings, _pCredProvCredentialEvents, _fSelected, _fDisconnected and
-	// _pProvider against the smart-card notifier thread (the disconnect morph / revive) racing
-	// LogonUI's UI thread. May be taken while the factory's list lock is held (that is the only
-	// nesting), never the other way round; never held across a call into LogonUI or into the
-	// provider/tile list.
+	BOOL        _fPinHeld = FALSE;         // PIN entry held until the card is re-inserted (card nearly blocked).
+	DWORD       _dwCardTriesLeft = 0;      // PIN attempts the card reported left when the hold started.
+	DWORD       _dwFieldStateGen = 0;      // Bumped whenever the disconnected flag or the hold changes; see UpdateConnectionFields.
+	// Guards _rgFieldStrings, _pCredProvCredentialEvents, _fSelected, _fDisconnected,
+	// _pProvider and the PIN hold against the smart-card notifier thread (the disconnect morph /
+	// revive) racing LogonUI's UI thread. May be taken while the factory's list lock is held
+	// (that is the only nesting), never the other way round; never held across a call into
+	// LogonUI or into the provider/tile list.
 	mutable CRITICAL_SECTION _csFields;
 
 };

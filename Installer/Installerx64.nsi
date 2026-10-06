@@ -263,6 +263,13 @@ Section "Core" SecCore
   Push "$INSTDIR\EIDManageUsers.exe"
   Call AddFileSize
 
+  ; The previous version's uninstaller (run by .onInit) stopped the trace
+  ; consumer service, but up to v2.1.00 it did not wait for the service process
+  ; to exit, so its EIDTraceConsumer.exe may still be in use here.
+  ${If} ${FileExists} "$INSTDIR\EIDTraceConsumer.exe"
+    Push "$INSTDIR\EIDTraceConsumer.exe"
+    Call RemoveTraceConsumerExe
+  ${EndIf}
   FILE "..\x64\Release\EIDTraceConsumer.exe"
   Push "$INSTDIR\EIDTraceConsumer.exe"
   Call AddFileSize
@@ -735,9 +742,16 @@ Section "Uninstall"
   ; otherwise the running service holds the file open and leaves a stale service.
   ; Remove the trace-config GPO-apply scheduled task
   nsExec::ExecToLog '"$SYSDIR\schtasks.exe" /Delete /F /TN "OpenAccess EID\Apply Trace Config"'
+  ; Both wait (up to 30 seconds) for the service process to exit.
   nsExec::ExecToLog '"$INSTDIR\EIDTraceConsumer.exe" -stop'
+  Pop $0
   nsExec::ExecToLog '"$INSTDIR\EIDTraceConsumer.exe" -uninstall'
-  Delete "$INSTDIR\EIDTraceConsumer.exe"
+  Pop $0
+  ${If} $0 != 0
+    DetailPrint "Warning: removing the EID Trace Consumer service returned $0 - it is removed once its process exits"
+  ${EndIf}
+  Push "$INSTDIR\EIDTraceConsumer.exe"
+  Call un.RemoveTraceConsumerExe
   Delete "$INSTDIR\cred_provider.ico"
 
   ; Disable-LsaProtection.ps1 keeps its backup of the original RunAsPPL values
@@ -784,8 +798,16 @@ Section "Uninstall"
   ; Delete uninstaller
   Delete "$INSTDIR\EIDUninstall.exe"
 
-  ; Remove installation directory
+  ; Remove installation directory. If something above could only be queued
+  ; for deletion at the reboot, remove the folder at the reboot as well (after
+  ; those files, which were queued first). Not recursive: anything else in it
+  ; is not ours, and is left alone along with the folder.
+  ClearErrors
   RMDir "$INSTDIR"
+  ${If} ${Errors}
+  ${AndIf} ${FileExists} "$INSTDIR\*.*"
+    RMDir /REBOOTOK "$INSTDIR"
+  ${EndIf}
 
   ; Remove registry keys
   SetRegView 64
@@ -945,6 +967,72 @@ Function InstallSystemDll
   Pop $R8
   Pop $R9
 FunctionEnd
+
+;--------------------------------
+;Trace consumer executable removal
+
+; Push <path of EIDTraceConsumer.exe> / Call [un.]RemoveTraceConsumerExe
+; The trace consumer service keeps its executable in use until its process has
+; exited, which can be some seconds after the stop request was accepted - and
+; the -stop / -uninstall of v2.1.00 and earlier did not wait for it at all. A
+; single Delete made too early failed silently and left the file behind, and
+; with it the installation folder (RMDir only removes an empty folder). So the
+; delete is retried for up to 30 seconds. If the file is still in use after
+; that, it is renamed aside (Windows allows renaming a running executable) and
+; the renamed copy is deleted at the next reboot: queuing a reboot-time delete
+; of the path itself would also delete the EIDTraceConsumer.exe an upgrade
+; writes there before that reboot.
+!macro OAEID_RemoveTraceConsumerExeFn UN
+Function ${UN}RemoveTraceConsumerExe
+  Exch $R9
+  Push $R8
+  StrCpy $R8 0
+  ${DoWhile} ${FileExists} "$R9"
+    Delete "$R9"
+    ${IfNot} ${FileExists} "$R9"
+      ${Break}
+    ${EndIf}
+    IntOp $R8 $R8 + 1
+    ${If} $R8 >= 60
+      ${Break}
+    ${EndIf}
+    Sleep 500
+  ${Loop}
+
+  ${If} ${FileExists} "$R9"
+    System::Call 'ole32::CoCreateGuid(g .s)'
+    Pop $R8
+    StrCpy $R8 "$R9.oaeid-old-$R8"
+    ClearErrors
+    Rename "$R9" "$R8"
+    ${If} ${Errors}
+      !if "${UN}" == "un."
+        ; A plain uninstall runs from a temporary copy and nothing is written to
+        ; this path afterwards. Run in place ($EXEDIR is the installation
+        ; folder), it is the installer of an upgrade that is running it, and
+        ; that writes a new EIDTraceConsumer.exe here - which a reboot-time
+        ; delete of the path would remove.
+        ${If} $EXEDIR != $INSTDIR
+          Delete /REBOOTOK "$R9"
+          DetailPrint "WARNING: $R9 is still in use; it will be deleted at the next reboot."
+        ${Else}
+          DetailPrint "WARNING: $R9 is still in use and could not be moved aside."
+        ${EndIf}
+      !else
+        DetailPrint "WARNING: $R9 is still in use by the previous version's trace consumer service and could not be moved aside."
+      !endif
+    ${Else}
+      Delete /REBOOTOK "$R8"
+      DetailPrint "$R9 was still in use; moved aside, to be deleted at the next reboot."
+    ${EndIf}
+  ${EndIf}
+
+  Pop $R8
+  Pop $R9
+FunctionEnd
+!macroend
+!insertmacro OAEID_RemoveTraceConsumerExeFn ""
+!insertmacro OAEID_RemoveTraceConsumerExeFn "un."
 
 ;--------------------------------
 ;Upgrade from uninstallers that delete enrolments

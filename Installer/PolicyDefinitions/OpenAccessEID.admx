@@ -81,6 +81,21 @@
       <disabledValue><decimal value="0" /></disabledValue>
     </policy>
 
+    <!-- Wrong-PIN protection at the logon / unlock tile. Not configured or disabled = the
+         default (the card's last PIN attempt held back). -->
+    <policy name="PinAttemptsReserved"
+            class="Machine"
+            displayName="$(string.PinAttemptsReserved)"
+            explainText="$(string.PinAttemptsReserved_Help)"
+            key="SOFTWARE\Policies\Microsoft\Windows\SmartCardCredentialProvider"
+            presentation="$(presentation.PinAttemptsReserved)">
+      <parentCategory ref="OpenAccessEID" />
+      <supportedOn ref="SUPPORTED_EIDAuth_1_0" />
+      <elements>
+        <decimal id="PinAttemptsReserved_Dec" valueName="PinAttemptsReserved" minValue="0" maxValue="10" />
+      </elements>
+    </policy>
+
     <!-- ============ EIDLogManager settings (SOFTWARE\Policies\OpenAccessEID\LogManager) ============ -->
 
     <policy name="LogCSVEnabled" class="Machine"

@@ -28,6 +28,7 @@
 #include "../EIDCardLibrary/guid.h"
 #include "../EIDCardLibrary/EIDCardLibrary.h"
 #include "../EIDCardLibrary/Package.h"
+#include "../EIDCardLibrary/GPO.h"
 
 #include <wincred.h>
 #include <CodeAnalysis/Warnings.h>
@@ -42,6 +43,28 @@ static wchar_t s_wszUnknownError[] = L"Unknow Error";  // NOSONAR - GLOBAL-01: N
 
 // Message shown in place of the PIN box once the card is removed while this tile is selected.
 static const wchar_t s_szReconnectCard[] = L"Please reconnect your smart card";
+
+// Card PIN attempts held back until the card is re-inserted (policy PinAttemptsReserved, under
+// the SmartCardCredentialProvider policy key): default when not configured, and the largest
+// value honoured. 0 = no hold.
+constexpr DWORD EID_PIN_ATTEMPTS_RESERVED_DEFAULT = 1;
+constexpr DWORD EID_PIN_ATTEMPTS_RESERVED_MAX = 10;
+constexpr size_t EID_PIN_MESSAGE_CCH = 192;  // room for the held-PIN message
+
+// Read on every wrong PIN, so a policy change applies from the next one.
+static DWORD ReadPinAttemptsReserved()
+{
+	const DWORD dwReserved = GetPolicyValueOrDefault(GPOPolicy::PinAttemptsReserved, EID_PIN_ATTEMPTS_RESERVED_DEFAULT);
+	return dwReserved > EID_PIN_ATTEMPTS_RESERVED_MAX ? EID_PIN_ATTEMPTS_RESERVED_MAX : dwReserved;
+}
+
+// Message shown in place of the PIN box while PIN entry is held until the card is re-inserted.
+static void FormatPinHeldMessage(DWORD dwTriesLeft, PWSTR pwszBuffer, size_t cchBuffer)
+{
+	StringCchPrintfW(pwszBuffer, cchBuffer,
+		L"This card has only %lu PIN attempt%ls left before it is blocked. Remove the card and insert it again to try again.",
+		dwTriesLeft, dwTriesLeft == 1 ? L"" : L"s");
+}
 
 // CEIDCredential ////////////////////////////////////////////////////////
 
@@ -275,6 +298,7 @@ BOOL CEIDCredential::MarkDisconnectedIfSelected()
 	if (fSelected && !_fDisconnected)
 	{
 		_fDisconnected = TRUE;
+		_dwFieldStateGen++;
 		// Never keep a typed PIN across a card removal.
 		SecureClearPin();
 	}
@@ -289,7 +313,10 @@ BOOL CEIDCredential::MarkReconnected()
 	if (fWasDisconnected)
 	{
 		_fDisconnected = FALSE;
+		_dwFieldStateGen++;
 		SecureClearPin();
+		// The card has been re-inserted: release a PIN hold.
+		_fPinHeld = FALSE;
 	}
 	LeaveCriticalSection(&_csFields);
 	return fWasDisconnected;
@@ -297,51 +324,119 @@ BOOL CEIDCredential::MarkReconnected()
 
 void CEIDCredential::UpdateConnectionFields()
 {
-	EnterCriticalSection(&_csFields);
-	// Push whatever the state is now (it is only changed on this same notifier thread).
-	const BOOL fDisconnected = _fDisconnected;
-	ICredentialProviderCredentialEvents* pEvents = _pCredProvCredentialEvents;
-	PWSTR pwszMessage = nullptr;
-	if (pEvents != nullptr)
+	// Two threads push - the notifier thread on a card removal or re-insertion, LogonUI's thread
+	// when a wrong PIN holds PIN entry - each with no lock held, so two pushes can interleave and
+	// leave LogonUI showing a mix of both states.
+	// So each push checks afterwards whether the state changed while it was pushing, and if it
+	// did pushes again: whichever push finishes last leaves the current state on screen.
+	for (int iPass = 0; iPass < 3; iPass++)
 	{
-		pEvents->AddRef();
-		if (!fDisconnected && _rgFieldStrings[SFI_MESSAGE])
+		WCHAR szBlocked[EID_PIN_MESSAGE_CCH];  // NOSONAR - LSASS-01: C-style buffer for LSASS safety
+		EnterCriticalSection(&_csFields);
+		const DWORD dwGen = _dwFieldStateGen;
+		const BOOL fDisconnected = _fDisconnected;
+		const BOOL fBlocked = GetPinEntryBlock(szBlocked, ARRAYSIZE(szBlocked));
+		ICredentialProviderCredentialEvents* pEvents = _pCredProvCredentialEvents;
+		PWSTR pwszMessage = nullptr;
+		if (pEvents != nullptr)
 		{
-			// Private copy so the string can be handed to LogonUI outside the lock.
-			SHStrDupW(_rgFieldStrings[SFI_MESSAGE], &pwszMessage);
+			pEvents->AddRef();
+			if (!fDisconnected && !fBlocked && _rgFieldStrings[SFI_MESSAGE])
+			{
+				// Private copy so the string can be handed to LogonUI outside the lock.
+				SHStrDupW(_rgFieldStrings[SFI_MESSAGE], &pwszMessage);
+			}
+		}
+		LeaveCriticalSection(&_csFields);
+		EIDCardLibraryTrace(WINEVENT_LEVEL_INFO,L"EVID: UpdateConnectionFields tile=%p fDisconnected=%d pinBlocked=%d advised=%d",(void*)this,fDisconnected,fBlocked,pEvents!=nullptr);
+
+		if (!pEvents)
+		{
+			// Not currently advised by LogonUI; the state is enough for the next query.
+			EIDCardLibraryTrace(WINEVENT_LEVEL_INFO,L"EVID: UpdateConnectionFields tile=%p SKIPPED field updates (not advised)",(void*)this);
+			return;
+		}
+
+		if (fDisconnected)
+		{
+			pEvents->SetFieldState(this, SFI_PIN, CPFS_HIDDEN);
+			pEvents->SetFieldState(this, SFI_SUBMIT_BUTTON, CPFS_HIDDEN);
+			pEvents->SetFieldState(this, SFI_CERTIFICATE, CPFS_HIDDEN);
+			pEvents->SetFieldString(this, SFI_PIN, L"");
+			pEvents->SetFieldString(this, SFI_MESSAGE, s_szReconnectCard);
+		}
+		else if (fBlocked)
+		{
+			pEvents->SetFieldState(this, SFI_PIN, CPFS_HIDDEN);
+			pEvents->SetFieldState(this, SFI_SUBMIT_BUTTON, CPFS_HIDDEN);
+			pEvents->SetFieldString(this, SFI_PIN, L"");
+			pEvents->SetFieldString(this, SFI_MESSAGE, szBlocked);
+		}
+		else
+		{
+			pEvents->SetFieldState(this, SFI_PIN, _rgFieldStatePairs[SFI_PIN].cpfs);
+			pEvents->SetFieldState(this, SFI_SUBMIT_BUTTON, _rgFieldStatePairs[SFI_SUBMIT_BUTTON].cpfs);
+			pEvents->SetFieldState(this, SFI_CERTIFICATE,
+				IsCertificateLinkAllowed() ? _rgFieldStatePairs[SFI_CERTIFICATE].cpfs : CPFS_HIDDEN);
+			pEvents->SetFieldString(this, SFI_PIN, L"");
+			pEvents->SetFieldString(this, SFI_MESSAGE, pwszMessage ? pwszMessage : L"");
+			pEvents->SetFieldInteractiveState(this, SFI_PIN, CPFIS_FOCUSED);
+		}
+		CoTaskMemFree(pwszMessage);
+		pEvents->Release();
+
+		EnterCriticalSection(&_csFields);
+		const BOOL fChanged = (_dwFieldStateGen != dwGen);
+		LeaveCriticalSection(&_csFields);
+		if (!fChanged)
+		{
+			return;
 		}
 	}
-	LeaveCriticalSection(&_csFields);
-	EIDCardLibraryTrace(WINEVENT_LEVEL_INFO,L"EVID: UpdateConnectionFields tile=%p fDisconnected=%d advised=%d",(void*)this,fDisconnected,pEvents!=nullptr);
+}
 
-	if (!pEvents)
+BOOL CEIDCredential::GetPinEntryBlock(PWSTR pwszMessage, size_t cchMessage) const
+{
+	if (_fPinHeld && pwszMessage)
 	{
-		// Not currently advised by LogonUI; the state is enough for the next query.
-		EIDCardLibraryTrace(WINEVENT_LEVEL_INFO,L"EVID: UpdateConnectionFields tile=%p SKIPPED field updates (not advised)",(void*)this);
+		FormatPinHeldMessage(_dwCardTriesLeft, pwszMessage, cchMessage);
+	}
+	return _fPinHeld;
+}
+
+BOOL CEIDCredential::IsPinEntryBlocked() const
+{
+	EnterCriticalSection(&_csFields);
+	const BOOL fBlocked = GetPinEntryBlock(nullptr, 0);
+	LeaveCriticalSection(&_csFields);
+	return fBlocked;
+}
+
+// When a wrong PIN leaves the card with PinAttemptsReserved or fewer PIN attempts, holds PIN entry
+// until the card is re-inserted. Called on LogonUI's thread (ReportResult). ntsSubstatus is the
+// number of PIN attempts the card has left, or 0xFFFFFFFF when the card did not say (the hold then
+// cannot apply).
+void CEIDCredential::RecordWrongPin(NTSTATUS ntsSubstatus)
+{
+	const DWORD dwReserved = ReadPinAttemptsReserved();
+	const DWORD dwTriesLeft = static_cast<DWORD>(ntsSubstatus);
+	// None left means the card is blocked already: there is nothing left to hold back.
+	const BOOL fHold = (dwTriesLeft != 0xFFFFFFFF && dwTriesLeft != 0 && dwTriesLeft <= dwReserved);
+	EIDCardLibraryTrace(WINEVENT_LEVEL_INFO,L"EVID: wrong PIN tile=%p triesLeft=%lu hold=%d",(void*)this,dwTriesLeft,fHold);
+	if (!fHold)
+	{
 		return;
 	}
 
-	if (fDisconnected)
-	{
-		pEvents->SetFieldState(this, SFI_PIN, CPFS_HIDDEN);
-		pEvents->SetFieldState(this, SFI_SUBMIT_BUTTON, CPFS_HIDDEN);
-		pEvents->SetFieldState(this, SFI_CERTIFICATE, CPFS_HIDDEN);
-		pEvents->SetFieldString(this, SFI_PIN, L"");
-		pEvents->SetFieldString(this, SFI_MESSAGE, s_szReconnectCard);
-	}
-	else
-	{
-		pEvents->SetFieldState(this, SFI_PIN, _rgFieldStatePairs[SFI_PIN].cpfs);
-		pEvents->SetFieldState(this, SFI_SUBMIT_BUTTON, _rgFieldStatePairs[SFI_SUBMIT_BUTTON].cpfs);
-		pEvents->SetFieldState(this, SFI_CERTIFICATE,
-			IsCertificateLinkAllowed() ? _rgFieldStatePairs[SFI_CERTIFICATE].cpfs : CPFS_HIDDEN);
-		pEvents->SetFieldString(this, SFI_PIN, L"");
-		pEvents->SetFieldString(this, SFI_MESSAGE, pwszMessage ? pwszMessage : L"");
-		pEvents->SetFieldInteractiveState(this, SFI_PIN, CPFIS_FOCUSED);
-	}
-	CoTaskMemFree(pwszMessage);
-	pEvents->Release();
+	EnterCriticalSection(&_csFields);
+	_fPinHeld = TRUE;
+	_dwCardTriesLeft = dwTriesLeft;
+	_dwFieldStateGen++;
+	LeaveCriticalSection(&_csFields);
+	// Hide the PIN box and submit button and say why.
+	UpdateConnectionFields();
 }
+
 // LogonUI calls this in order to give us a callback in case we need to notify it of anything.
 HRESULT CEIDCredential::Advise(
     ICredentialProviderCredentialEvents* pcpce
@@ -483,6 +578,12 @@ HRESULT CEIDCredential::GetFieldState(
         {
             *pcpfs = CPFS_HIDDEN;
         }
+        // Likewise the PIN entry and submit button while PIN entry is held (the card's last
+        // attempts held back until it is re-inserted).
+        if ((dwFieldID == SFI_PIN || dwFieldID == SFI_SUBMIT_BUTTON) && IsPinEntryBlocked())
+        {
+            *pcpfs = CPFS_HIDDEN;
+        }
         // The certificate viewer must not be reachable as SYSTEM on the secure desktop (logon /
         // unlock screens, UAC prompt in consent.exe); see IsCertificateLinkAllowed.
         if (dwFieldID == SFI_CERTIFICATE && !IsCertificateLinkAllowed())
@@ -515,10 +616,15 @@ HRESULT CEIDCredential::GetStringValue(
     {
         // Make a copy of the string and return that. The caller
         // is responsible for freeing it.
+        WCHAR szBlocked[EID_PIN_MESSAGE_CCH];  // NOSONAR - LSASS-01: C-style buffer for LSASS safety
         EnterCriticalSection(&_csFields);
         if (_fDisconnected && dwFieldID == SFI_MESSAGE)
         {
             hr = SHStrDupW(s_szReconnectCard, ppwsz);
+        }
+        else if (dwFieldID == SFI_MESSAGE && GetPinEntryBlock(szBlocked, ARRAYSIZE(szBlocked)))
+        {
+            hr = SHStrDupW(szBlocked, ppwsz);
         }
         else
         {
@@ -856,9 +962,28 @@ HRESULT CEIDCredential::GetSerialization(
     CREDENTIAL_PROVIDER_STATUS_ICON* pcpsiOptionalStatusIcon
     )
 {
-    UNREFERENCED_PARAMETER(ppwszOptionalStatusText);
-    UNREFERENCED_PARAMETER(pcpsiOptionalStatusIcon);
     HRESULT hr;  // NOSONAR - EXPLICIT-TYPE-03: HRESULT visible for security audit
+
+    // The PIN box is hidden while PIN entry is held; refuse a submission that gets here anyway
+    // rather than send the PIN to the card.
+    WCHAR szBlocked[EID_PIN_MESSAGE_CCH];  // NOSONAR - LSASS-01: C-style buffer for LSASS safety
+    EnterCriticalSection(&_csFields);
+    const BOOL fBlocked = GetPinEntryBlock(szBlocked, ARRAYSIZE(szBlocked));
+    LeaveCriticalSection(&_csFields);
+    if (fBlocked)
+    {
+        if (ppwszOptionalStatusText)
+        {
+            SHStrDupW(szBlocked, ppwszOptionalStatusText);
+        }
+        if (pcpsiOptionalStatusIcon)
+        {
+            *pcpsiOptionalStatusIcon = CPSI_WARNING;
+        }
+        *pcpgsr = CPGSR_NO_CREDENTIAL_NOT_FINISHED;
+        EIDCardLibraryTrace(WINEVENT_LEVEL_INFO,L"Submission refused: PIN entry held");
+        return S_OK;
+    }
 
     WCHAR wsz[MAX_COMPUTERNAME_LENGTH+1];  // NOSONAR - LSASS-01: C-style buffer for LSASS safety
     DWORD cch = ARRAYSIZE(wsz);
@@ -1081,6 +1206,20 @@ HRESULT CEIDCredential::ReportResult(
             pEvents->SetFieldString(this, SFI_PIN, L"");
             pEvents->Release();
         }
+    }
+
+    // Wrong-PIN protection: a wrong PIN that leaves the card with its reserved attempts holds
+    // PIN entry until the card is re-inserted (ntsSubstatus is the card's attempts left); a
+    // successful logon releases it.
+    if (ntsStatus == STATUS_SMARTCARD_WRONG_PIN)
+    {
+        RecordWrongPin(ntsSubstatus);
+    }
+    else if (ntsStatus == STATUS_SUCCESS)
+    {
+        EnterCriticalSection(&_csFields);
+        _fPinHeld = FALSE;
+        LeaveCriticalSection(&_csFields);
     }
 
     // Since NULL is a valid value for *ppwszOptionalStatusText and *pcpsiOptionalStatusIcon
