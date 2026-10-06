@@ -305,8 +305,8 @@ void InitChainValidationParams(ChainValidationParams* params)
 		CryptReleaseContext(hProv, 0);
 		return EID::make_unexpected(HRESULT_FROM_WIN32(GetLastError()));
 	}
-	// important : the hprov will be freed if the certificatecontext is freed, and that's a problem.
-	// Take the extra reference BEFORE handing hProv to the certificate context: once the
+	// The certificate context releases hProv when it is freed, so it needs a reference of its own.
+	// Take that reference BEFORE handing hProv to the certificate context: once the
 	// key-context property is set, freeing the certificate releases hProv, so taking the
 	// reference afterwards meant a failed AddRef released the caller's handle twice.
 	if (!CryptContextAddRef(hProv, nullptr, 0))
@@ -332,7 +332,9 @@ void InitChainValidationParams(ChainValidationParams* params)
 
 	// Cleanup key handle - the provider handle is referenced by the certificate
 	CryptDestroyKey(phUserKey);
-	// Don't release hProv - it's now owned by the certificate context
+	// The certificate now owns the reference taken above and releases it when it is freed;
+	// drop ours, or every call leaks a CSP context (and its card handle) in LSASS.
+	CryptReleaseContext(hProv, 0);
 
 	return pCertContext;
 }
