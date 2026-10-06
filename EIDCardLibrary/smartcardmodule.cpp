@@ -739,13 +739,13 @@ BOOL CheckPINandGetRemainingAttempts(LPCTSTR szReader, LPCTSTR szCard, PTSTR szP
 		dwError = MgScCardAcquireContext(&pContext,hSCardContext,hSCardHandle,szCard,bAtr.data(),cbAtr,0);
 		if ( dwError )
 		{
-			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"MgScCardAcquireContext 0x%08X",lReturn);
+			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"MgScCardAcquireContext 0x%08X",dwError);
 			__leave;
 		}
 		dwError = MgScCardAuthenticatePin(&pContext,s_wszCardUserUser,szPin,pdwAttempts);
 		if ( dwError )
 		{
-			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"MgScCardAuthenticatePin 0x%08X *pdwAttempts=%d",lReturn, *pdwAttempts);
+			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"MgScCardAuthenticatePin 0x%08X *pdwAttempts=%d",dwError, *pdwAttempts);
 			__leave;
 		}
 		EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"cardmodule authentication successful");
