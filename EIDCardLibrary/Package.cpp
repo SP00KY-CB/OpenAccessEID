@@ -1014,9 +1014,11 @@ DWORD GetCurrentRid()
 		return 0;
 	}
 
+PSID EIDGetAccountDomainSid();  // CompleteToken.cpp
+
 BOOL EIDBuildEnrolmentStatement(DWORD dwRid, const FILETIME* pftTime, PCCERT_CONTEXT pCertContext, PBYTE pbStatement, DWORD cbStatement)
 {
-	static const char s_szPurpose[] = "OpenAccessEID enrolment proof v1";
+	static const char s_szPurpose[] = "OpenAccessEID enrolment proof v2";
 	static_assert(sizeof(s_szPurpose) - 1 == 32, "the purpose string is 32 bytes");
 	if (!pftTime || !pCertContext || !pbStatement || cbStatement != EID_ENROLMENT_STATEMENT_SIZE)
 	{
@@ -1045,6 +1047,23 @@ BOOL EIDBuildEnrolmentStatement(DWORD dwRid, const FILETIME* pftTime, PCCERT_CON
 		{
 			SetLastError(ERROR_INVALID_DATA);
 		}
+		return FALSE;
+	}
+	p += 32;
+	// Bind the statement to this machine: client and LSASS run on the same one.
+	PSID pDomainSid = EIDGetAccountDomainSid();
+	if (!pDomainSid)
+	{
+		SetLastError(ERROR_NONE_MAPPED);
+		return FALSE;
+	}
+	cbHash = 32;
+	const BOOL fHashed = CryptHashCertificate(NULL, CALG_SHA_256, 0, static_cast<const BYTE*>(pDomainSid), GetLengthSid(pDomainSid), p, &cbHash) && cbHash == 32;
+	const DWORD dwHashError = GetLastError();
+	EIDFree(pDomainSid);
+	if (!fHashed)
+	{
+		SetLastError(dwHashError ? dwHashError : ERROR_INVALID_DATA);
 		return FALSE;
 	}
 	return TRUE;

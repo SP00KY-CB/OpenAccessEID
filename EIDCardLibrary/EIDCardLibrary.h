@@ -202,9 +202,11 @@ using PEID_CALLPACKAGE_BUFFER = EID_CALLPACKAGE_BUFFER*;
 constexpr DWORD EID_MAX_CERTIFICATE_SIZE = 16384;
 
 // Enrolment proof of possession: the statement the card signs (SHA-1, CryptSignHash) is
-// "OpenAccessEID enrolment proof v1" (32 bytes), the RID (4 bytes, little endian), the
-// FILETIME (8 bytes) and the SHA-256 of the DER certificate (32 bytes).
-constexpr DWORD EID_ENROLMENT_STATEMENT_SIZE = 32 + 4 + 8 + 32;
+// "OpenAccessEID enrolment proof v2" (32 bytes), the RID (4 bytes, little endian), the
+// FILETIME (8 bytes), the SHA-256 of the DER certificate (32 bytes) and the SHA-256 of
+// this machine's account-domain SID (32 bytes), so a statement signed for RID n on one
+// machine is no good for RID n on another.
+constexpr DWORD EID_ENROLMENT_STATEMENT_SIZE = 32 + 4 + 8 + 32 + 32;
 // An RSA-4096 signature is 512 bytes.
 constexpr DWORD EID_MAX_ENROLMENT_SIGNATURE_SIZE = 512;
 BOOL EIDBuildEnrolmentStatement(DWORD dwRid, const FILETIME* pftTime, PCCERT_CONTEXT pCertContext, PBYTE pbStatement, DWORD cbStatement);

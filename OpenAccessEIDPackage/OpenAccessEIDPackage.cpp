@@ -366,7 +366,14 @@ extern "C"
 					// is current user = TRUE
 					dwError = 0;
 					fReturn = TRUE;
-					__leave;
+					if (!pfIsAdmin)
+					{
+						__leave;
+					}
+					// The caller wants to know about administrators too: an elevated
+					// administrator enrolling their own account is exempt from the
+					// proof of possession like for any other account. Fall through;
+					// nothing below can take this TRUE back.
 				}
 			}
 			// is admin ?
@@ -413,7 +420,7 @@ extern "C"
 					*pfIsAdmin = TRUE;
 				}
 			}
-			else
+			else if (!fReturn)
 			{
 				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"Access denied for rid 0x%x", dwRid);
 			}
@@ -429,7 +436,8 @@ extern "C"
 			if (pTokenUser) EIDFree(pTokenUser);
 			if (AdministratorsGroup) FreeSid(AdministratorsGroup);
 		}
-		SetLastError(dwError);
+		// The same-user match stands even when the administrator check after it failed.
+		SetLastError(fReturn ? 0 : dwError);
 		return fReturn;
 	}
 
@@ -1354,6 +1362,7 @@ extern "C"
 		// The __except below turns any exception into a failed logon, and LSA
 		// ignores the outputs of a failed logon, so it releases these itself.
 		BOOL fSessionCreated = FALSE;
+		BOOL fPrimaryCredentialBuilt = FALSE;
 		__try
 		{
 		// INNER SEH - do not remove. This function has eighteen early `return`
@@ -1707,6 +1716,7 @@ extern "C"
 				PSID pSid = MyTokenInformation->User.User.Sid;
 				Status = CompletePrimaryCredential(*AuthenticatingAuthority,*AccountName,pSid,LogonId,szPassword,PrimaryCredentials);
 				EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"CompletePrimaryCredential Status = 0x%08X",Status);
+				fPrimaryCredentialBuilt = (Status == STATUS_SUCCESS);
 			}
 			if (Status == STATUS_SUCCESS)
 			{
@@ -1731,6 +1741,12 @@ extern "C"
 					MyLsaDispatchTable->FreeClientBuffer(ClientRequest, *ProfileBuffer);
 					*ProfileBuffer = NULL;
 					*ProfileBufferLength = 0;
+				}
+				if (fPrimaryCredentialBuilt)
+				{
+					// It holds a copy of the password.
+					FreePrimaryCredential(PrimaryCredentials);
+					fPrimaryCredentialBuilt = FALSE;
 				}
 				MyLsaDispatchTable->DeleteLogonSession(LogonId);
 				fSessionCreated = FALSE;
@@ -1809,6 +1825,10 @@ extern "C"
 			// such as access violations are not handled here at all).
 			EIDCardLibraryTrace(WINEVENT_LEVEL_ERROR,L"NT exception in LsaApLogonUserEx2: 0x%08x",GetExceptionCode());
 			EIDLogStackTrace(GetExceptionCode());
+			if (fPrimaryCredentialBuilt)
+			{
+				FreePrimaryCredential(PrimaryCredentials);
+			}
 			if (fSessionCreated)
 			{
 				MyLsaDispatchTable->DeleteLogonSession(LogonId);

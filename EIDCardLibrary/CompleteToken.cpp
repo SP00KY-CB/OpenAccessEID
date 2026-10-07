@@ -339,6 +339,7 @@ void DebugPrintSid(const WCHAR* Name, PSID Sid);
 	if (pGroupSid) { EIDFree(pGroupSid); pGroupSid = nullptr; }
 	if (pGroupInfo) { NetApiBufferFree(pGroupInfo); pGroupInfo = nullptr; }
 	if (pLocalGroupInfo) { NetApiBufferFree(pLocalGroupInfo); pLocalGroupInfo = nullptr; }
+	if (pAccountDomainSid) { EIDFree(pAccountDomainSid); pAccountDomainSid = nullptr; }
 
 	EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE, L"Leave");
 	return std::make_pair(TokenInformation, Size);

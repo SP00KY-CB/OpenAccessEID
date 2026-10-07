@@ -380,8 +380,11 @@ static BOOL IsAcceptableCredentialKey(PCCERT_CONTEXT pCertContext)
 // card's key, over EIDBuildEnrolmentStatement(dwRid, time, certificate) (Package.cpp). Without
 // it, anyone could bind a certificate they do not hold - certificates are public - to their own
 // account before its owner enrols it, so the owner's card would then log on to the wrong
-// account and the owner could not enrol. The time must be within EID_ENROLMENT_PROOF_SKEW_MS.
-constexpr ULONGLONG EID_ENROLMENT_PROOF_SKEW_MS = 5ULL * 60ULL * 1000ULL;
+// account and the owner could not enrol. The time must be within EID_ENROLMENT_PROOF_SKEW_MS:
+// it is taken before the card asks for its PIN, so the window allows for a slow PIN entry. A
+// statement names the account, the certificate and this machine, so replaying it within the
+// window can only repeat the same enrolment.
+constexpr ULONGLONG EID_ENROLMENT_PROOF_SKEW_MS = 15ULL * 60ULL * 1000ULL;
 
 BOOL EIDVerifyEnrolmentProof(__in DWORD dwRid, __in PCCERT_CONTEXT pCertContext, __in const FILETIME* pftTime,
 	__in_bcount(cbSignature) const BYTE* pbSignature, __in DWORD cbSignature)
@@ -1444,10 +1447,20 @@ BOOL CStoredCredentialManager::GetSignatureChallenge(__out PBYTE* ppChallenge, _
 }
 BOOL CStoredCredentialManager::RemoveStoredCredential(__in DWORD dwRid)
 {
+	BOOL fReturn = FALSE;
+	DWORD dwError = 0;
 	LockStoredCredentials();
-	const BOOL fReturn = StorePrivateData(dwRid, nullptr, 0);
-	const DWORD dwError = GetLastError();
-	UnlockStoredCredentials();
+	// Released in __finally: a handled exception in StorePrivateData must not leave
+	// the lock held, which would block every later enrolment, re-seal and removal.
+	__try
+	{
+		fReturn = StorePrivateData(dwRid, nullptr, 0);
+		dwError = GetLastError();
+	}
+	__finally
+	{
+		UnlockStoredCredentials();
+	}
 	SetLastError(dwError);
 	return fReturn;
 }
@@ -1670,6 +1683,23 @@ static void FreeLsaString(__inout PLSA_UNICODE_STRING String, BOOL fSecret)
 	String->MaximumLength = 0;
 }
 
+void FreePrimaryCredential(__inout PSECPKG_PRIMARY_CRED PrimaryCredentials)
+{
+	if (!PrimaryCredentials)
+	{
+		return;
+	}
+	FreeLsaString(&PrimaryCredentials->DownlevelName, FALSE);
+	FreeLsaString(&PrimaryCredentials->DomainName, FALSE);
+	FreeLsaString(&PrimaryCredentials->Password, TRUE);
+	FreeLsaString(&PrimaryCredentials->LogonServer, FALSE);
+	if (PrimaryCredentials->UserSid)
+	{
+		EIDFree(PrimaryCredentials->UserSid);
+		PrimaryCredentials->UserSid = nullptr;
+	}
+}
+
 NTSTATUS CompletePrimaryCredential(__in PLSA_UNICODE_STRING AuthenticatingAuthority,  // NOSONAR - API-01: signature dictated by Windows/callback API
 						__in PLSA_UNICODE_STRING AccountName,  // NOSONAR - API-01: signature dictated by Windows/callback API
 						__in PSID UserSid,
@@ -1709,15 +1739,7 @@ NTSTATUS CompletePrimaryCredential(__in PLSA_UNICODE_STRING AuthenticatingAuthor
 	if (!fOk)
 	{
 		EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"out of memory building the primary credential");
-		FreeLsaString(&PrimaryCredentials->DownlevelName, FALSE);
-		FreeLsaString(&PrimaryCredentials->DomainName, FALSE);
-		FreeLsaString(&PrimaryCredentials->Password, TRUE);
-		FreeLsaString(&PrimaryCredentials->LogonServer, FALSE);
-		if (PrimaryCredentials->UserSid)
-		{
-			EIDFree(PrimaryCredentials->UserSid);
-			PrimaryCredentials->UserSid = nullptr;
-		}
+		FreePrimaryCredential(PrimaryCredentials);
 		return STATUS_INSUFFICIENT_RESOURCES;
 	}
 	EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"Leave");
@@ -1744,21 +1766,12 @@ BOOL CStoredCredentialManager::GetResponseFromChallenge(__in PBYTE pChallenge, _
 		return FALSE;
 	}
 }
+// Note: the Base CSP keeps the PIN set with CryptSetProvParam in a per-process cache
+// (encrypted in memory), which in LSASS outlives the logon. There is no documented way to
+// clear it; setting a NULL PIN is undocumented and, inside LSASS, could fault or be sent to
+// the card as a wrong PIN, so it is deliberately not attempted.
 // SonarQube S134: Won't Fix - SEH-protected function (__try/__finally)
 // Code cannot be extracted from __try blocks per LSASS safety requirements
-// The Base CSP keeps the PIN set with CryptSetProvParam in a per-process cache (encrypted in
-// memory). In LSASS that process serves every user, so drop it once the card operation that
-// needed it is over. Clearing it by setting a NULL PIN is not documented for CryptSetProvParam,
-// so this is limited to the Microsoft Base Smart Card CSP and its result is ignored.
-static void PurgeBaseCspPinCache(HCRYPTPROV hProv, PCRYPT_KEY_PROV_INFO pProvInfo, DWORD dwKeySpec)
-{
-	if (!hProv || !pProvInfo || !pProvInfo->pwszProvName || _wcsicmp(pProvInfo->pwszProvName, MS_SCARD_PROV_W) != 0)
-	{
-		return;
-	}
-	CryptSetProvParam(hProv, (dwKeySpec == AT_KEYEXCHANGE ? PP_KEYEXCHANGE_PIN : PP_SIGNATURE_PIN), nullptr, 0);
-}
-
 BOOL CStoredCredentialManager::GetResponseFromCryptedChallenge(__in PBYTE pChallenge, __in DWORD dwChallengeSize, __in PCCERT_CONTEXT pCertContext, __in PWSTR Pin, __out PBYTE *pSymetricKey, __out DWORD *usSize)  // NOSONAR - COMPLEXITY-01: refactor deferred; logic verified
 {
 	BOOL fReturn = FALSE;
@@ -1926,7 +1939,6 @@ BOOL CStoredCredentialManager::GetResponseFromCryptedChallenge(__in PBYTE pChall
 		}
 		if (pbPin)
 		{
-			PurgeBaseCspPinCache(hProv, pProvInfo, dwKeySpec);
 			SecureZeroMemory(pbPin , dwPinLen);
 			EIDFree(pbPin);
 		}
@@ -2089,7 +2101,6 @@ BOOL CStoredCredentialManager::GetResponseFromSignatureChallenge(__in PBYTE pbCh
 	{
 		if (pbPin)
 		{
-			PurgeBaseCspPinCache(hProv, pKeyProvInfo, dwKeySpec);
 			SecureZeroMemory(pbPin , dwPinLen);
 			EIDFree(pbPin);
 		}

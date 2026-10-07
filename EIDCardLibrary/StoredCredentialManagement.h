@@ -103,4 +103,7 @@ NTSTATUS CompletePrimaryCredential(__in PLSA_UNICODE_STRING AuthenticatingAuthor
 						__in PLUID LogonId,
 						__in PWSTR szPassword,
 						__out  PSECPKG_PRIMARY_CRED PrimaryCredentials);
+// Wipes the password and frees every buffer CompletePrimaryCredential allocated, for a
+// logon that fails after the primary credentials were built.
+void FreePrimaryCredential(__inout PSECPKG_PRIMARY_CRED PrimaryCredentials);
 #endif
