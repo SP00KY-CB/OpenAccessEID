@@ -51,8 +51,15 @@ Git 2.30 or later                    # source checkout
 # ---------------------------------------------------------------------------
 # Installer (Release builds only)  -- resolved by build.ps1
 # ---------------------------------------------------------------------------
-NSIS 3.08 or later                   # Nullsoft Scriptable Install System - https://nsis.sourceforge.io/
-                                     # Install via: choco install nsis -y
+NSIS 3.09 or later                   # Nullsoft Scriptable Install System - https://nsis.sourceforge.io/
+                                     # 3.13 recommended; CI pins 3.13.0 (windows-ci.yaml, scan-artifacts.yml).
+                                     # 3.08 and earlier are refused, by build.ps1 (makensis /VERSION)
+                                     # and by Installerx64.nsi itself: they let Everyone delete and
+                                     # re-create the installer's plugins folder ($PLUGINSDIR), which a
+                                     # SYSTEM-context deployment (SCCM, Intune, GPO) puts in
+                                     # C:\Windows\Temp - a standard user could then swap the DLLs the
+                                     # installer loads as SYSTEM (CVE-2023-37378).
+                                     # Install via: choco install nsis --version 3.13.0 -y
                                      # build.ps1 searches these paths in order:
                                      #   C:\Program Files (x86)\NSIS\makensis.exe
                                      #   C:\Program Files\NSIS\makensis.exe
@@ -134,7 +141,7 @@ Microsoft Visual C++ 2015-2022 Redistributable (x64)   # installed by NSIS insta
 #      & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" `
 #          -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64
 #
-# 2. Confirm NSIS:
+# 2. Confirm NSIS (must print v3.09 or later):
 #      makensis /VERSION
 #
 # 3. Confirm smart-card stack is live:

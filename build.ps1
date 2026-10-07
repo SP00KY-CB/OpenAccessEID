@@ -318,6 +318,30 @@ if ($Configuration -eq "Release") {
     }
 
     if ($makensisPath) {
+        # NSIS 3.08 and earlier let Everyone delete and re-create the
+        # installer's plugins folder ($PLUGINSDIR, CVE-2023-37378). A
+        # SYSTEM-context deployment puts that folder in C:\Windows\Temp, so a
+        # standard user could swap the DLLs the installer loads as SYSTEM.
+        # Installerx64.nsi refuses such a compiler as well; checking here
+        # gives a plain message. CI pins 3.13.0.
+        $nsisMinimum = [version]'3.9'
+        $nsisVersionText = (& $makensisPath /VERSION | Out-String).Trim()
+        $nsisVersion = $null
+        if ($nsisVersionText -match '^v?(\d+)\.(\d+)') {
+            $nsisVersion = [version]"$([int]$Matches[1]).$([int]$Matches[2])"
+        }
+        if ($null -eq $nsisVersion -or $nsisVersion -lt $nsisMinimum) {
+            Write-Host ""
+            Write-Host "============================================================" -ForegroundColor Red
+            Write-Host "INSTALLER BUILD FAILED: NSIS 3.09 or later is required" -ForegroundColor Red
+            Write-Host "============================================================" -ForegroundColor Red
+            Write-Host "$makensisPath reports version '$nsisVersionText'." -ForegroundColor Yellow
+            Write-Host "NSIS 3.08 and earlier let a standard user take over the installer's plugins folder when it runs as SYSTEM (CVE-2023-37378)." -ForegroundColor Yellow
+            Write-Host "Install a current NSIS (CI uses 3.13.0): choco install nsis --version 3.13.0 -y" -ForegroundColor Cyan
+            exit 1
+        }
+        Write-Host "NSIS version: $nsisVersionText" -ForegroundColor Gray
+
         # Delete old installer
         $installerPath = "Installer\EIDInstallx64.exe"
         if (Test-Path $installerPath) {

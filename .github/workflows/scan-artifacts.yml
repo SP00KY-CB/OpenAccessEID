@@ -92,8 +92,12 @@ jobs:
           name: build-artifacts
           path: artifacts
 
+      # Pinned like windows-ci.yaml, so a new NSIS release cannot change the
+      # installer without a reviewed commit. Installerx64.nsi refuses NSIS
+      # 3.08 and earlier (CVE-2023-37378: Everyone can delete and re-create
+      # the plugins folder of an installer running as SYSTEM).
       - name: Install NSIS
-        run: choco install nsis -y
+        run: choco install nsis --version 3.13.0 -y --no-progress
 
       # The installer embeds three vendor minidrivers that are gitignored and
       # staged at build time. Cache them so we don't re-hit vendor sites every
