@@ -52,7 +52,6 @@ static_assert(CREDENTIALKEYLENGTH == EID_CHALLENGE_LENGTH,
 	"challenge length in InputValidation.h must match CREDENTIALKEYLENGTH");
 constexpr ALG_ID CREDENTIALCRYPTALG = CALG_AES_256;
 constexpr LPCWSTR CREDENTIAL_LSAPREFIX = L"L$_EID_";
-constexpr LPCWSTR CREDENTIAL_CONTAINER = L"EIDCredential";
 
 #pragma comment(lib,"Crypt32")
 #pragma comment(lib,"advapi32")
@@ -67,7 +66,27 @@ extern "C"
 
 // level 1
 #include "StoredCredentialManagement.h"  // NOSONAR - INCLUDE-01: include order/casing significant for Windows SDK
+#include <new>
 CStoredCredentialManager *CStoredCredentialManager::theSingleInstance = nullptr;
+static INIT_ONCE s_StoredCredentialManagerInitOnce = INIT_ONCE_STATIC_INIT;
+
+// InitOnce serialises concurrent first calls (LSA calls in on many threads).
+// The instance lives for the life of the process. Returning FALSE when the
+// allocation fails leaves the INIT_ONCE open, so a later call tries again.
+BOOL CALLBACK CStoredCredentialManager::CreateInstanceOnce(PINIT_ONCE, PVOID, PVOID*)
+{
+	theSingleInstance = new (std::nothrow) CStoredCredentialManager;  // NOSONAR - OWNERSHIP-01: singleton instance intentionally persists for process lifetime
+	return theSingleInstance != nullptr;
+}
+
+CStoredCredentialManager* CStoredCredentialManager::Instance()
+{
+	if (!InitOnceExecuteOnce(&s_StoredCredentialManagerInitOnce, CreateInstanceOnce, nullptr, nullptr))
+	{
+		return nullptr;
+	}
+	return theSingleInstance;
+}
 
 //=============================================================================
 // HELPER FUNCTIONS FOR COMPLEXITY REDUCTION
@@ -244,6 +263,176 @@ bool IsPivFallbackError(DWORD dwError) noexcept
 
 } // anonymous namespace
 
+
+// Every write of the per-RID stored credentials (enrolment, re-seal, removal) holds this lock
+// across its read-check-write sequence, so two writers cannot interleave: two enrolments
+// cannot bind one certificate to two accounts, and a re-seal cannot resurrect a credential
+// removed meanwhile. Recursive (a critical section), because UpdateCredential holds it while
+// calling CreateCredential. The password filter routes its re-seal through the package
+// (EIDResealStoredCredential), so both LSASS modules use this one lock.
+static CRITICAL_SECTION s_csStoredCredentials;
+static INIT_ONCE s_StoredCredentialsLockInit = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK InitStoredCredentialsLock(PINIT_ONCE, PVOID, PVOID*)
+{
+	InitializeCriticalSection(&s_csStoredCredentials);
+	return TRUE;
+}
+
+static void LockStoredCredentials()
+{
+	InitOnceExecuteOnce(&s_StoredCredentialsLockInit, InitStoredCredentialsLock, nullptr, nullptr);
+	EnterCriticalSection(&s_csStoredCredentials);
+}
+
+static void UnlockStoredCredentials()
+{
+	LeaveCriticalSection(&s_csStoredCredentials);
+}
+
+// The CAPI work done here with the package's own provider - random challenges, importing a
+// public key or an AES key, hashing, signature checks, encryption - needs no persistent key
+// container. A verify context creates none; the shared named container "EIDCredential" that
+// every call used to create and delete raced between concurrent calls.
+static BOOL AcquireEphemeralProvider(HCRYPTPROV* phProv)
+{
+	return CryptAcquireContext(phProv, nullptr, CREDENTIALPROVIDER, PROV_RSA_AES, CRYPT_VERIFYCONTEXT | CRYPT_SILENT);
+}
+
+// Keys accepted at enrolment: RSA, 1024 to 4096 bits, public exponent 3 to 65537. A huge
+// modulus or exponent made every later signature check (and the per-RID scan) expensive.
+constexpr DWORD EID_MIN_RSA_KEY_BITS = 1024;
+constexpr DWORD EID_MAX_RSA_KEY_BITS = 4096;
+constexpr DWORD EID_MAX_RSA_PUBLIC_EXPONENT = 65537;
+
+static BOOL IsAcceptableCredentialKey(PCCERT_CONTEXT pCertContext)
+{
+	if (!pCertContext || !pCertContext->pCertInfo)
+	{
+		return FALSE;
+	}
+	PCERT_PUBLIC_KEY_INFO pKeyInfo = &pCertContext->pCertInfo->SubjectPublicKeyInfo;
+	if (!pKeyInfo->Algorithm.pszObjId || strcmp(pKeyInfo->Algorithm.pszObjId, szOID_RSA_RSA) != 0)
+	{
+		EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"certificate key is not RSA");
+		return FALSE;
+	}
+	const DWORD dwBits = CertGetPublicKeyLength(X509_ASN_ENCODING, pKeyInfo);
+	if (dwBits < EID_MIN_RSA_KEY_BITS || dwBits > EID_MAX_RSA_KEY_BITS)
+	{
+		EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"RSA key of %u bits refused (%u-%u)", dwBits, EID_MIN_RSA_KEY_BITS, EID_MAX_RSA_KEY_BITS);
+		return FALSE;
+	}
+	DWORD cbBlob = 0;
+	if (!CryptDecodeObject(X509_ASN_ENCODING, RSA_CSP_PUBLICKEYBLOB, pKeyInfo->PublicKey.pbData, pKeyInfo->PublicKey.cbData, 0, nullptr, &cbBlob)
+		|| cbBlob < sizeof(PUBLICKEYSTRUC) + sizeof(RSAPUBKEY))
+	{
+		return FALSE;
+	}
+	PBYTE pbBlob = static_cast<PBYTE>(EIDAlloc(cbBlob));
+	if (!pbBlob)
+	{
+		return FALSE;
+	}
+	BOOL fAcceptable = FALSE;
+	if (CryptDecodeObject(X509_ASN_ENCODING, RSA_CSP_PUBLICKEYBLOB, pKeyInfo->PublicKey.pbData, pKeyInfo->PublicKey.cbData, 0, pbBlob, &cbBlob)
+		&& cbBlob >= sizeof(PUBLICKEYSTRUC) + sizeof(RSAPUBKEY))
+	{
+		const RSAPUBKEY* pRsa = reinterpret_cast<const RSAPUBKEY*>(pbBlob + sizeof(PUBLICKEYSTRUC));
+		fAcceptable = pRsa->pubexp >= 3 && pRsa->pubexp <= EID_MAX_RSA_PUBLIC_EXPONENT;
+		if (!fAcceptable)
+		{
+			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"RSA public exponent %u refused", pRsa->pubexp);
+		}
+	}
+	EIDFree(pbBlob);
+	return fAcceptable;
+}
+
+// Enrolment proof of possession. The enrolment request carries a signature, made with the
+// card's key, over EIDBuildEnrolmentStatement(dwRid, time, certificate) (Package.cpp). Without
+// it, anyone could bind a certificate they do not hold - certificates are public - to their own
+// account before its owner enrols it, so the owner's card would then log on to the wrong
+// account and the owner could not enrol. The time must be within EID_ENROLMENT_PROOF_SKEW_MS.
+constexpr ULONGLONG EID_ENROLMENT_PROOF_SKEW_MS = 5ULL * 60ULL * 1000ULL;
+
+BOOL EIDVerifyEnrolmentProof(__in DWORD dwRid, __in PCCERT_CONTEXT pCertContext, __in const FILETIME* pftTime,
+	__in_bcount(cbSignature) const BYTE* pbSignature, __in DWORD cbSignature)
+{
+	BOOL fReturn = FALSE;
+	DWORD dwError = NTE_BAD_SIGNATURE;
+	HCRYPTPROV hProv = NULL;  // Windows handle type - keep as NULL
+	HCRYPTKEY hKey = NULL;  // Windows handle type - keep as NULL
+	HCRYPTHASH hHash = NULL;  // Windows handle type - keep as NULL
+	BYTE rgbStatement[EID_ENROLMENT_STATEMENT_SIZE];  // NOSONAR - LSASS-01: C-style buffer for LSASS safety
+	__try
+	{
+		if (!pCertContext || !pftTime || !pbSignature || cbSignature == 0 || cbSignature > EID_MAX_ENROLMENT_SIGNATURE_SIZE)
+		{
+			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"enrolment proof absent or malformed");
+			__leave;
+		}
+		FILETIME ftNow;
+		GetSystemTimeAsFileTime(&ftNow);
+		ULARGE_INTEGER uNow;
+		ULARGE_INTEGER uProof;
+		uNow.LowPart = ftNow.dwLowDateTime;
+		uNow.HighPart = ftNow.dwHighDateTime;
+		uProof.LowPart = pftTime->dwLowDateTime;
+		uProof.HighPart = pftTime->dwHighDateTime;
+		const ULONGLONG ullSkew100ns = EID_ENROLMENT_PROOF_SKEW_MS * 10000ULL;
+		const ULONGLONG ullDiff = (uNow.QuadPart > uProof.QuadPart) ? uNow.QuadPart - uProof.QuadPart : uProof.QuadPart - uNow.QuadPart;
+		if (ullDiff > ullSkew100ns)
+		{
+			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"enrolment proof time is outside the allowed window");
+			__leave;
+		}
+		if (!EIDBuildEnrolmentStatement(dwRid, pftTime, pCertContext, rgbStatement, sizeof(rgbStatement)))
+		{
+			dwError = GetLastError();
+			__leave;
+		}
+		if (!AcquireEphemeralProvider(&hProv))
+		{
+			dwError = GetLastError();
+			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"CryptAcquireContext 0x%08x",dwError);
+			__leave;
+		}
+		if (!CryptImportPublicKeyInfo(hProv, X509_ASN_ENCODING, &(pCertContext->pCertInfo->SubjectPublicKeyInfo), &hKey))
+		{
+			dwError = GetLastError();
+			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"CryptImportPublicKeyInfo 0x%08x",dwError);
+			__leave;
+		}
+		if (!CryptCreateHash(hProv, CALG_SHA, NULL, 0, &hHash)
+			|| !CryptHashData(hHash, rgbStatement, sizeof(rgbStatement), 0))
+		{
+			dwError = GetLastError();
+			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"hash 0x%08x",dwError);
+			__leave;
+		}
+		if (!CryptVerifySignature(hHash, pbSignature, cbSignature, hKey, nullptr, 0))
+		{
+			dwError = GetLastError();
+			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"enrolment proof signature does not verify 0x%08x",dwError);
+			__leave;
+		}
+		dwError = 0;
+		fReturn = TRUE;
+	}
+	__finally
+	{
+		if (hHash)
+			CryptDestroyHash(hHash);
+		if (hKey)
+			CryptDestroyKey(hKey);
+		if (hProv)
+			CryptReleaseContext(hProv, 0);
+	}
+	SetLastError(dwError);
+	return fReturn;
+}
+
 // SonarQube S134: Won't Fix - SEH-protected function (__try/__finally)
 // Code cannot be extracted from __try blocks per LSASS safety requirements
 BOOL CStoredCredentialManager::GetUsernameFromCertContext(__in PCCERT_CONTEXT pContext, __out PWSTR *pszUsername, __out PDWORD pdwRid)
@@ -255,6 +444,7 @@ BOOL CStoredCredentialManager::GetUsernameFromCertContext(__in PCCERT_CONTEXT pC
 	BOOL fReturn = FALSE;
 	PEID_PRIVATE_DATA pPrivateData = nullptr;
 	DWORD dwError = 0;
+	DWORD dwMatches = 0;
 	__try
 	{
 		if (!pContext)
@@ -289,12 +479,28 @@ BOOL CStoredCredentialManager::GetUsernameFromCertContext(__in PCCERT_CONTEXT pC
 			DWORD dwPrivateDataSize = 0;
 			if (RetrievePrivateData(pUserInfo[dwI].usri3_user_id, &pPrivateData, &dwPrivateDataSize))
 			{
-				BOOL fMatched = FALSE;
 				if (pPrivateData->dwCertificatSize == pContext->cbCertEncoded &&
 					memcmp(pPrivateData->Data + pPrivateData->dwCertificatOffset, pContext->pbCertEncoded, pContext->cbCertEncoded) == 0)  // NOSONAR - COMPLEXITY-01: refactor deferred; logic verified
 				{
 					// found
-					fMatched = TRUE;
+					dwMatches++;
+					if (dwMatches > 1)
+					{
+						// One certificate bound to two accounts: refuse rather than pick one.
+						EIDCardLibraryTrace(WINEVENT_LEVEL_ERROR,L"certificate is bound to more than one account - refusing");
+						EIDSecurityAudit(SECURITY_AUDIT_FAILURE, L"[AUTH_CERT_ERROR] Certificate is bound to rids 0x%x and 0x%x; logon refused", *pdwRid, pUserInfo[dwI].usri3_user_id);
+						EIDFreePrivateData(pPrivateData, dwPrivateDataSize);
+						pPrivateData = nullptr;
+						if (*pszUsername)
+						{
+							EIDFree(*pszUsername);
+							*pszUsername = nullptr;
+						}
+						*pdwRid = 0;
+						fReturn = FALSE;
+						dwError = ERROR_DUP_NAME;
+						__leave;
+					}
 					*pdwRid = pUserInfo[dwI].usri3_user_id;
 					PCWSTR Username = pUserInfo[dwI].usri3_name;
 					*pszUsername = (PWSTR) EIDAlloc((DWORD)(wcslen(Username) +1) * sizeof(WCHAR));
@@ -317,10 +523,7 @@ BOOL CStoredCredentialManager::GetUsernameFromCertContext(__in PCCERT_CONTEXT pC
 				}
 				EIDFreePrivateData(pPrivateData, dwPrivateDataSize);
 				pPrivateData = nullptr;
-				if (fMatched)
-				{
-					break;
-				}
+				// No break: keep scanning so a certificate bound to two accounts is refused.
 			}
 		}
 		if (!fReturn)
@@ -330,6 +533,11 @@ BOOL CStoredCredentialManager::GetUsernameFromCertContext(__in PCCERT_CONTEXT pC
 	}
 	__finally
 	{
+		if (pPrivateData)
+		{
+			EIDFreePrivateData(pPrivateData, 0);
+			pPrivateData = nullptr;
+		}
 		if (pUserInfo)
 			NetApiBufferFree(pUserInfo);
 	}
@@ -645,6 +853,7 @@ BOOL CStoredCredentialManager::CreateCredential(__in DWORD dwRid, __in PCCERT_CO
 	PBYTE pbPublicKey = nullptr;
 	DWORD dwSize = 0;
 	BOOL fBoundElsewhere = FALSE;
+	BOOL fLocked = FALSE;
 
 	__try
 	{
@@ -664,6 +873,15 @@ BOOL CStoredCredentialManager::CreateCredential(__in DWORD dwRid, __in PCCERT_CO
 		{
 			dwError = ERROR_INVALID_PARAMETER;
 			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING, L"certificate missing or too large (max %u bytes)", EID_MAX_CERTIFICATE_SIZE);
+			__leave;
+		}
+
+		// A new enrolment (fCheckPassword: the untrusted call) must use an acceptable key. A
+		// re-seal keeps the key that was already enrolled.
+		if (fCheckPassword && !IsAcceptableCredentialKey(pCertContext))
+		{
+			dwError = NTE_BAD_KEY;
+			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING, L"certificate key refused for rid 0x%x", dwRid);
 			__leave;
 		}
 
@@ -687,6 +905,9 @@ BOOL CStoredCredentialManager::CreateCredential(__in DWORD dwRid, __in PCCERT_CO
 		// first, have the administrator's card log on to it. Refuse to bind a
 		// certificate that is already bound to a different account; re-enrolling
 		// or re-sealing the same account is unaffected.
+		// Hold the stored-credential lock from this check to the store below.
+		LockStoredCredentials();
+		fLocked = TRUE;
 		if (!IsCertificateBoundToOtherRid(dwRid, pCertContext, &fBoundElsewhere))
 		{
 			dwError = GetLastError();
@@ -786,24 +1007,12 @@ BOOL CStoredCredentialManager::CreateCredential(__in DWORD dwRid, __in PCCERT_CO
 			}
 
 			// Import the public key into hKey
-			fStatus = CryptAcquireContext(&hProv, CREDENTIAL_CONTAINER, CREDENTIALPROVIDER, PROV_RSA_AES, 0);
+			fStatus = AcquireEphemeralProvider(&hProv);
 			if (!fStatus)
 			{
 				dwError = GetLastError();
-				if (dwError == NTE_BAD_KEYSET)
-				{
-					fStatus = CryptAcquireContext(&hProv, CREDENTIAL_CONTAINER, CREDENTIALPROVIDER, PROV_RSA_AES, CRYPT_NEWKEYSET);
-				}
-				if (!fStatus)
-				{
-					dwError = GetLastError();
-					EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING, L"CryptAcquireContext 0x%08x", dwError);
-					__leave;
-				}
-			}
-			else
-			{
-				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING, L"Container already existed !!");
+				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"CryptAcquireContext 0x%08x",dwError);
+				__leave;
 			}
 
 			fStatus = CryptImportKey(hProv, pbPublicKey, dwSize, NULL, 0, &hKey);
@@ -902,7 +1111,10 @@ BOOL CStoredCredentialManager::CreateCredential(__in DWORD dwRid, __in PCCERT_CO
 		if (hProv)
 		{
 			CryptReleaseContext(hProv, 0);
-			CryptAcquireContext(&hProv, CREDENTIAL_CONTAINER, CREDENTIALPROVIDER, PROV_RSA_AES, CRYPT_DELETEKEYSET);
+		}
+		if (fLocked)
+		{
+			UnlockStoredCredentials();
 		}
 	}
 
@@ -914,17 +1126,19 @@ BOOL CStoredCredentialManager::CreateCredential(__in DWORD dwRid, __in PCCERT_CO
 // Code cannot be extracted from __try blocks per LSASS safety requirements
 BOOL CStoredCredentialManager::UpdateCredential(__in PLUID pLuid, __in PUNICODE_STRING Password)
 {
-	DWORD dwRid = 0;
-	WCHAR szComputer[UNLEN+1];  // NOSONAR - LSASS-01: C-style buffer for LSASS safety
-	WCHAR szUser[256];  // NOSONAR - LSASS-01: C-style buffer for LSASS safety
-	DWORD dwSize = ARRAYSIZE(szComputer);
 	DWORD dwError = 0;
 	BOOL fReturn = FALSE;
-	USER_INFO_3* pUserInfo = nullptr;
 	PSECURITY_LOGON_SESSION_DATA pLogonSessionData = nullptr;
+	LSA_HANDLE hPolicy = nullptr;
+	PPOLICY_ACCOUNT_DOMAIN_INFO pDomainInfo = nullptr;
 	NTSTATUS status;  // NOSONAR - EXPLICIT-TYPE-01: NTSTATUS visible for security audit
 	__try
 	{
+		if (!pLuid || !Password)
+		{
+			dwError = ERROR_INVALID_PARAMETER;
+			__leave;
+		}
 		status = LsaGetLogonSessionData(pLuid, &pLogonSessionData);
 		if (status != STATUS_SUCCESS)
 		{
@@ -932,44 +1146,55 @@ BOOL CStoredCredentialManager::UpdateCredential(__in PLUID pLuid, __in PUNICODE_
 			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"LsaGetLogonSessionData 0x%08x",status);
 			__leave;
 		}
-		GetComputerName(szComputer,&dwSize);
-		if (!(pLogonSessionData->LogonDomain.Length == dwSize * sizeof(WCHAR)
-			&& memcmp(pLogonSessionData->LogonDomain.Buffer,szComputer, dwSize * sizeof(WCHAR)) == 0))
+		// Map the session to a RID by its SID, not its user name: only a SID in this machine's
+		// account domain (domain SID + one RID) is a local account this package can hold.
+		PSID pUserSid = pLogonSessionData->Sid;
+		if (!pUserSid || !IsValidSid(pUserSid))
 		{
 			dwError = ERROR_NONE_MAPPED;
-			EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"not a local account '%wZ'", &(pLogonSessionData->LogonDomain));
+			EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"logon session has no SID");
 			__leave;
 		}
-		// get the user ID (RID)
-		PUNICODE_STRING UserName = &(pLogonSessionData->UserName);
-		if (!UserName)
+		LSA_OBJECT_ATTRIBUTES ObjectAttributes;
+		memset(&ObjectAttributes, 0, sizeof(ObjectAttributes));
+		status = LsaOpenPolicy(nullptr, &ObjectAttributes, POLICY_VIEW_LOCAL_INFORMATION, &hPolicy);
+		if (status != STATUS_SUCCESS)
+		{
+			dwError = LsaNtStatusToWinError(status);
+			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"LsaOpenPolicy 0x%08x",status);
+			__leave;
+		}
+		status = LsaQueryInformationPolicy(hPolicy, PolicyAccountDomainInformation, reinterpret_cast<PVOID*>(&pDomainInfo));
+		if (status != STATUS_SUCCESS || !pDomainInfo || !pDomainInfo->DomainSid)
+		{
+			dwError = (status != STATUS_SUCCESS) ? LsaNtStatusToWinError(status) : ERROR_NONE_MAPPED;
+			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"LsaQueryInformationPolicy 0x%08x",status);
+			__leave;
+		}
+		const UCHAR cDomain = *GetSidSubAuthorityCount(pDomainInfo->DomainSid);
+		if (*GetSidSubAuthorityCount(pUserSid) != cDomain + 1
+			|| memcmp(GetSidIdentifierAuthority(pUserSid), GetSidIdentifierAuthority(pDomainInfo->DomainSid), sizeof(SID_IDENTIFIER_AUTHORITY)) != 0)
 		{
 			dwError = ERROR_NONE_MAPPED;
-			EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"UserName null");
+			EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"not a local account");
 			__leave;
 		}
-		EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"using userName '%wZ'", UserName);
-
-		// SECURITY FIX: Validate UserName->Length before memcpy to prevent buffer overflow (CWE-120)
-		if (UserName->Buffer && UserName->Length)
+		for (UCHAR i = 0; i < cDomain; i++)
 		{
-			if (UserName->Length > sizeof(szUser) - sizeof(WCHAR))
+			if (*GetSidSubAuthority(pUserSid, i) != *GetSidSubAuthority(pDomainInfo->DomainSid, i))
 			{
-				dwError = ERROR_BUFFER_OVERFLOW;
-				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING, L"UserName too long: %d bytes (max %d)", UserName->Length, (int)(sizeof(szUser) - sizeof(WCHAR)));
+				dwError = ERROR_NONE_MAPPED;
+				EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"not a local account");
 				__leave;
 			}
-			memcpy(szUser, UserName->Buffer, UserName->Length);
 		}
-		szUser[UserName->Length/2] = L'\0';
-		dwError = NetUserGetInfo(szComputer, szUser, 3, (LPBYTE*) &pUserInfo);
-		if (NERR_Success != dwError)
+		const DWORD dwRid = *GetSidSubAuthority(pUserSid, cDomain);
+		if (Password->Length == 0 || !Password->Buffer)
 		{
-			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"NetUserEnum 0x%08x",dwError);
+			dwError = ERROR_INVALID_PARAMETER;
 			__leave;
 		}
-		dwRid = pUserInfo->usri3_user_id;
-		if (!UpdateCredential(dwRid, (Password->Length > 0 ? Password->Buffer:  nullptr), Password->Length))
+		if (!UpdateCredential(dwRid, Password->Buffer, Password->Length))
 		{
 			dwError = GetLastError();
 			__leave;
@@ -978,15 +1203,13 @@ BOOL CStoredCredentialManager::UpdateCredential(__in PLUID pLuid, __in PUNICODE_
 	}
 	__finally
 	{
-		if (pUserInfo) NetApiBufferFree(pUserInfo);
+		if (pDomainInfo) LsaFreeMemory(pDomainInfo);
+		if (hPolicy) LsaClose(hPolicy);
 		if (pLogonSessionData) LsaFreeReturnBuffer(pLogonSessionData);
 	}
 	SetLastError(dwError);
 	return fReturn;
 }
-
-// SonarQube S134: Won't Fix - SEH-protected function (__try/__finally)
-// Code cannot be extracted from __try blocks per LSASS safety requirements
 BOOL CStoredCredentialManager::UpdateCredential(__in DWORD dwRid, __in PWSTR szPassword, __in_opt USHORT usPasswordLen)
 {
 	BOOL fReturn = FALSE;
@@ -994,6 +1217,7 @@ BOOL CStoredCredentialManager::UpdateCredential(__in DWORD dwRid, __in PWSTR szP
 	DWORD dwError = 0;
 	PCCERT_CONTEXT pCertContext = nullptr;
 	BOOL fEncrypt;
+	BOOL fLocked = FALSE;
 	__try
 	{
 		if (!dwRid)
@@ -1002,6 +1226,10 @@ BOOL CStoredCredentialManager::UpdateCredential(__in DWORD dwRid, __in PWSTR szP
 			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"dwRid 0x%08x",dwError);
 			__leave;
 		}
+		// Read the stored certificate and re-seal under one lock: a credential removed after
+		// the read must not be written back.
+		LockStoredCredentials();
+		fLocked = TRUE;
 		fStatus = GetCertContextFromRid(dwRid, &pCertContext, &fEncrypt);
 		if (!fStatus)
 		{
@@ -1023,6 +1251,10 @@ BOOL CStoredCredentialManager::UpdateCredential(__in DWORD dwRid, __in PWSTR szP
 		// SECURITY FIX: Free certificate context to prevent memory leak (CWE-401 fix for #26)
 		if (pCertContext)
 			CertFreeCertificateContext(pCertContext);
+		if (fLocked)
+		{
+			UnlockStoredCredentials();
+		}
 	}
 	SetLastError(dwError);
 	return fReturn;
@@ -1131,25 +1363,12 @@ BOOL CStoredCredentialManager::GetSignatureChallenge(__out PBYTE* ppChallenge, _
 	DWORD dwError = 0;
 	__try
 	{
-		fStatus = CryptAcquireContext(&hProv,CREDENTIAL_CONTAINER,CREDENTIALPROVIDER,PROV_RSA_AES,0);
-		if(!fStatus)
+		fStatus = AcquireEphemeralProvider(&hProv);
+		if (!fStatus)
 		{
 			dwError = GetLastError();
-			if (dwError == NTE_BAD_KEYSET)
-			{
-				fStatus = CryptAcquireContext(&hProv,CREDENTIAL_CONTAINER,CREDENTIALPROVIDER,PROV_RSA_AES,CRYPT_NEWKEYSET);
-				dwError = GetLastError();
-			}
-			if (!fStatus)
-			{
-				dwError = GetLastError();
-				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"CryptAcquireContext 0x%08x",dwError);
-				__leave;
-			}
-		}
-		else
-		{
-			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"Container already existed !!");
+			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"CryptAcquireContext 0x%08x",dwError);
+			__leave;
 		}
 		*pdwChallengeSize = CREDENTIALKEYLENGTH;
 		*ppChallenge = (PBYTE) EIDAlloc(CREDENTIALKEYLENGTH);
@@ -1170,11 +1389,21 @@ BOOL CStoredCredentialManager::GetSignatureChallenge(__out PBYTE* ppChallenge, _
 	}
 	__finally
 	{
+		// Never hand back a buffer that was not filled.
+		if (!fReturn && ppChallenge && *ppChallenge)
+		{
+			SecureZeroMemory(*ppChallenge, CREDENTIALKEYLENGTH);
+			EIDFree(*ppChallenge);
+			*ppChallenge = nullptr;
+		}
+		if (!fReturn && pdwChallengeSize)
+		{
+			*pdwChallengeSize = 0;
+		}
 
 		if (hProv)
 		{
 			CryptReleaseContext(hProv, 0);
-			CryptAcquireContext(&hProv,CREDENTIAL_CONTAINER,CREDENTIALPROVIDER,PROV_RSA_AES,CRYPT_DELETEKEYSET);
 		}
 	}
 	SetLastError(dwError);
@@ -1182,7 +1411,12 @@ BOOL CStoredCredentialManager::GetSignatureChallenge(__out PBYTE* ppChallenge, _
 }
 BOOL CStoredCredentialManager::RemoveStoredCredential(__in DWORD dwRid)
 {
-	return StorePrivateData(dwRid, nullptr, 0);
+	LockStoredCredentials();
+	const BOOL fReturn = StorePrivateData(dwRid, nullptr, 0);
+	const DWORD dwError = GetLastError();
+	UnlockStoredCredentials();
+	SetLastError(dwError);
+	return fReturn;
 }
 // SonarQube S134: Won't Fix - SEH-protected function (__try/__finally)
 // Code cannot be extracted from __try blocks per LSASS safety requirements
@@ -1342,6 +1576,48 @@ BOOL CStoredCredentialManager::GetPassword(__in DWORD dwRid, __in PCCERT_CONTEXT
 // LEVEL 1
 ////////////////////////////////////////////////////////////////////////////////
 
+// Copies a counted string into a new LSA-heap buffer. Sets Length/MaximumLength only once the
+// buffer exists, so a failed allocation never leaves a length with a NULL buffer.
+static BOOL CopyLsaString(__out PLSA_UNICODE_STRING Destination, __in PCWSTR Source, __in USHORT Length, __in USHORT MaximumLength)
+{
+	Destination->Length = 0;
+	Destination->MaximumLength = 0;
+	Destination->Buffer = nullptr;
+	if (MaximumLength == 0)
+	{
+		return TRUE;
+	}
+	PWSTR Buffer = (PWSTR) EIDAlloc(MaximumLength);
+	if (!Buffer)
+	{
+		return FALSE;
+	}
+	memset(Buffer, 0, MaximumLength);
+	if (Source && Length)
+	{
+		memcpy(Buffer, Source, Length);
+	}
+	Destination->Buffer = Buffer;
+	Destination->Length = Length;
+	Destination->MaximumLength = MaximumLength;
+	return TRUE;
+}
+
+static void FreeLsaString(__inout PLSA_UNICODE_STRING String, BOOL fSecret)
+{
+	if (String->Buffer)
+	{
+		if (fSecret)
+		{
+			SecureZeroMemory(String->Buffer, String->MaximumLength);
+		}
+		EIDFree(String->Buffer);
+	}
+	String->Buffer = nullptr;
+	String->Length = 0;
+	String->MaximumLength = 0;
+}
+
 NTSTATUS CompletePrimaryCredential(__in PLSA_UNICODE_STRING AuthenticatingAuthority,  // NOSONAR - API-01: signature dictated by Windows/callback API
 						__in PLSA_UNICODE_STRING AccountName,  // NOSONAR - API-01: signature dictated by Windows/callback API
 						__in PSID UserSid,
@@ -1349,68 +1625,51 @@ NTSTATUS CompletePrimaryCredential(__in PLSA_UNICODE_STRING AuthenticatingAuthor
 						__in PWSTR szPassword,  // NOSONAR - API-01: signature dictated by Windows/callback API
 						__out  PSECPKG_PRIMARY_CRED PrimaryCredentials)
 {
-
 	EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"Enter");
 	memset(PrimaryCredentials, 0, sizeof(SECPKG_PRIMARY_CRED));
+	if (!AuthenticatingAuthority || !AccountName || !UserSid || !LogonId || !szPassword)
+	{
+		return STATUS_INVALID_PARAMETER;
+	}
+	const size_t cchPassword = wcsnlen(szPassword, (USHRT_MAX / sizeof(WCHAR)) + 1);
+	if (cchPassword > USHRT_MAX / sizeof(WCHAR))
+	{
+		return STATUS_INVALID_PARAMETER;
+	}
 	PrimaryCredentials->LogonId.HighPart = LogonId->HighPart;
 	PrimaryCredentials->LogonId.LowPart = LogonId->LowPart;
-
-	PrimaryCredentials->DownlevelName.Length = AccountName->Length;
-	PrimaryCredentials->DownlevelName.MaximumLength = AccountName->MaximumLength;
-	PrimaryCredentials->DownlevelName.Buffer = (PWSTR) EIDAlloc(AccountName->MaximumLength);
-	if (PrimaryCredentials->DownlevelName.Buffer)
-	{
-		memcpy(PrimaryCredentials->DownlevelName.Buffer, AccountName->Buffer, AccountName->MaximumLength);
-	}
-
-	PrimaryCredentials->DomainName.Length = AuthenticatingAuthority->Length;
-	PrimaryCredentials->DomainName.MaximumLength = AuthenticatingAuthority->MaximumLength;
-	PrimaryCredentials->DomainName.Buffer = (PWSTR) EIDAlloc(AuthenticatingAuthority->MaximumLength);
-	if (PrimaryCredentials->DomainName.Buffer)
-	{
-		memcpy(PrimaryCredentials->DomainName.Buffer, AuthenticatingAuthority->Buffer, AuthenticatingAuthority->MaximumLength);
-	}
-
-	PrimaryCredentials->Password.Length = (USHORT) wcslen(szPassword) * sizeof(WCHAR);
-	PrimaryCredentials->Password.MaximumLength = PrimaryCredentials->Password.Length;
-	PrimaryCredentials->Password.Buffer = (PWSTR) EIDAlloc(PrimaryCredentials->Password.MaximumLength);
-	if (PrimaryCredentials->Password.Buffer)
-	{
-		memcpy(PrimaryCredentials->Password.Buffer, szPassword, PrimaryCredentials->Password.Length);
-	}
-
-	// we decide that the password cannot be changed so copy it into old pass
-	PrimaryCredentials->OldPassword.Length = 0;
-	PrimaryCredentials->OldPassword.MaximumLength = 0;
-	PrimaryCredentials->OldPassword.Buffer = nullptr;//(PWSTR) FunctionTable->AllocateLsaHeap(PrimaryCredentials->OldPassword.MaximumLength);;
-	
 	// the flag PRIMARY_CRED_INTERACTIVE_SMARTCARD_LOGON is used for the "force smart card policy"
 	// the flag PRIMARY_CRED_CLEAR_PASSWORD is used to tell the password to DPAPI
 	PrimaryCredentials->Flags = PRIMARY_CRED_CLEAR_PASSWORD | PRIMARY_CRED_INTERACTIVE_SMARTCARD_LOGON;
+	// OldPassword, DnsDomainName and Upn stay empty: the password cannot be changed here.
 
-	PrimaryCredentials->UserSid = (PSID)EIDAlloc(GetLengthSid(UserSid));
-	if (PrimaryCredentials->UserSid)
+	const USHORT cbPassword = static_cast<USHORT>(cchPassword * sizeof(WCHAR));
+	const DWORD cbSid = GetLengthSid(UserSid);
+	BOOL fOk = CopyLsaString(&PrimaryCredentials->DownlevelName, AccountName->Buffer, AccountName->Length, AccountName->MaximumLength)
+		&& CopyLsaString(&PrimaryCredentials->DomainName, AuthenticatingAuthority->Buffer, AuthenticatingAuthority->Length, AuthenticatingAuthority->MaximumLength)
+		&& CopyLsaString(&PrimaryCredentials->Password, szPassword, cbPassword, cbPassword)
+		&& CopyLsaString(&PrimaryCredentials->LogonServer, AuthenticatingAuthority->Buffer, AuthenticatingAuthority->Length, AuthenticatingAuthority->MaximumLength);
+	if (fOk)
 	{
-		CopySid(GetLengthSid(UserSid),PrimaryCredentials->UserSid,UserSid);
+		PrimaryCredentials->UserSid = (PSID)EIDAlloc(cbSid);
+		fOk = PrimaryCredentials->UserSid && CopySid(cbSid, PrimaryCredentials->UserSid, UserSid);
 	}
-
-	PrimaryCredentials->DnsDomainName.Length = 0;
-	PrimaryCredentials->DnsDomainName.MaximumLength = 0;
-	PrimaryCredentials->DnsDomainName.Buffer = nullptr;
-
-	PrimaryCredentials->Upn.Length = 0;
-	PrimaryCredentials->Upn.MaximumLength = 0;
-	PrimaryCredentials->Upn.Buffer = nullptr;
-
-	PrimaryCredentials->LogonServer.Length = AuthenticatingAuthority->Length;
-	PrimaryCredentials->LogonServer.MaximumLength = AuthenticatingAuthority->MaximumLength;
-	PrimaryCredentials->LogonServer.Buffer = (PWSTR) EIDAlloc(AuthenticatingAuthority->MaximumLength);
-	if (PrimaryCredentials->LogonServer.Buffer)
+	if (!fOk)
 	{
-		memcpy(PrimaryCredentials->LogonServer.Buffer, AuthenticatingAuthority->Buffer, AuthenticatingAuthority->MaximumLength);
+		EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"out of memory building the primary credential");
+		FreeLsaString(&PrimaryCredentials->DownlevelName, FALSE);
+		FreeLsaString(&PrimaryCredentials->DomainName, FALSE);
+		FreeLsaString(&PrimaryCredentials->Password, TRUE);
+		FreeLsaString(&PrimaryCredentials->LogonServer, FALSE);
+		if (PrimaryCredentials->UserSid)
+		{
+			EIDFree(PrimaryCredentials->UserSid);
+			PrimaryCredentials->UserSid = nullptr;
+		}
+		return STATUS_INSUFFICIENT_RESOURCES;
 	}
 	EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"Leave");
-	return STATUS_SUCCESS;	
+	return STATUS_SUCCESS;
 }
 
 BOOL CStoredCredentialManager::GetResponseFromChallenge(__in PBYTE pChallenge, __in DWORD dwChallengeSize,__in DWORD dwChallengeType, __in PCCERT_CONTEXT pCertContext, __in PWSTR Pin, __out PBYTE *pSymetricKey, __out DWORD *usSize)
@@ -1435,6 +1694,19 @@ BOOL CStoredCredentialManager::GetResponseFromChallenge(__in PBYTE pChallenge, _
 }
 // SonarQube S134: Won't Fix - SEH-protected function (__try/__finally)
 // Code cannot be extracted from __try blocks per LSASS safety requirements
+// The Base CSP keeps the PIN set with CryptSetProvParam in a per-process cache (encrypted in
+// memory). In LSASS that process serves every user, so drop it once the card operation that
+// needed it is over. Clearing it by setting a NULL PIN is not documented for CryptSetProvParam,
+// so this is limited to the Microsoft Base Smart Card CSP and its result is ignored.
+static void PurgeBaseCspPinCache(HCRYPTPROV hProv, PCRYPT_KEY_PROV_INFO pProvInfo, DWORD dwKeySpec)
+{
+	if (!hProv || !pProvInfo || !pProvInfo->pwszProvName || _wcsicmp(pProvInfo->pwszProvName, MS_SCARD_PROV_W) != 0)
+	{
+		return;
+	}
+	CryptSetProvParam(hProv, (dwKeySpec == AT_KEYEXCHANGE ? PP_KEYEXCHANGE_PIN : PP_SIGNATURE_PIN), nullptr, 0);
+}
+
 BOOL CStoredCredentialManager::GetResponseFromCryptedChallenge(__in PBYTE pChallenge, __in DWORD dwChallengeSize, __in PCCERT_CONTEXT pCertContext, __in PWSTR Pin, __out PBYTE *pSymetricKey, __out DWORD *usSize)  // NOSONAR - COMPLEXITY-01: refactor deferred; logic verified
 {
 	BOOL fReturn = FALSE;
@@ -1600,6 +1872,7 @@ BOOL CStoredCredentialManager::GetResponseFromCryptedChallenge(__in PBYTE pChall
 		}
 		if (pbPin)
 		{
+			PurgeBaseCspPinCache(hProv, pProvInfo, dwKeySpec);
 			SecureZeroMemory(pbPin , dwPinLen);
 			EIDFree(pbPin);
 		}
@@ -1760,6 +2033,7 @@ BOOL CStoredCredentialManager::GetResponseFromSignatureChallenge(__in PBYTE pbCh
 	{
 		if (pbPin)
 		{
+			PurgeBaseCspPinCache(hProv, pKeyProvInfo, dwKeySpec);
 			SecureZeroMemory(pbPin , dwPinLen);
 			EIDFree(pbPin);
 		}
@@ -1795,13 +2069,13 @@ BOOL CStoredCredentialManager::GenerateSymetricKeyAndEncryptIt(__in HCRYPTPROV h
 	DWORD dwSize;
 	KEY_BLOB bKey;
 	DWORD dwError = 0;
+	DWORD dwBlockLen = 0;
 	__try
 	{
 		EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"Enter");
 		*pSymetricKey = nullptr;
 		*phKey = NULL;
 		dwSize = sizeof(DWORD);
-		DWORD dwBlockLen;
 		// key is generated here
 		bKey.bType = PLAINTEXTKEYBLOB;
 		bKey.bVersion = CUR_BLOB_VERSION;
@@ -1829,6 +2103,13 @@ BOOL CStoredCredentialManager::GenerateSymetricKeyAndEncryptIt(__in HCRYPTPROV h
 		{
 			dwError = GetLastError();
 			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"CryptEncrypt 0x%08x",GetLastError());
+			__leave;
+		}
+		// dwBlockLen is the RSA modulus size: it must hold the AES key plus PKCS#1 padding.
+		if (dwBlockLen < CREDENTIALKEYLENGTH/8 + 11)
+		{
+			dwError = NTE_BAD_KEY;
+			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"RSA block of %u bytes too small for the key",dwBlockLen);
 			__leave;
 		}
 		*pSymetricKey = (PBYTE) EIDAlloc(dwBlockLen);
@@ -1864,6 +2145,8 @@ BOOL CStoredCredentialManager::GenerateSymetricKeyAndEncryptIt(__in HCRYPTPROV h
 		{
 			if (*pSymetricKey)
 			{
+				// May still hold the raw AES key if the encryption failed.
+				SecureZeroMemory(*pSymetricKey, dwBlockLen);
 				EIDFree(*pSymetricKey);
 				*pSymetricKey = nullptr;
 			}
@@ -1892,6 +2175,7 @@ BOOL CStoredCredentialManager::EncryptPasswordAndSaveIt(__in HCRYPTKEY hKey, __i
 	DWORD dwEncryptedSize;
 	DWORD dwRoundNumber;
 	DWORD dwError = 0;
+	DWORD cbEncryptedBuffer = 0;
 	__try
 	{
 		EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"Enter");
@@ -1950,7 +2234,7 @@ BOOL CStoredCredentialManager::EncryptPasswordAndSaveIt(__in HCRYPTKEY hKey, __i
 			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"encrypted password size overflow");
 			__leave;
 		}
-		const DWORD cbEncryptedBuffer = cbEncrypted + dwBlockLen;
+		cbEncryptedBuffer = cbEncrypted + dwBlockLen;
 		*pEncryptedPassword = (PBYTE) EIDAlloc(cbEncryptedBuffer);
 		if (!*pEncryptedPassword)
 		{
@@ -2003,6 +2287,8 @@ BOOL CStoredCredentialManager::EncryptPasswordAndSaveIt(__in HCRYPTKEY hKey, __i
 		{
 			if (*pEncryptedPassword)  // NOSONAR - CONTROL-01: nested if kept for cleanup clarity
 			{
+				// Holds the plaintext password if encryption failed part-way.
+				SecureZeroMemory(*pEncryptedPassword, cbEncryptedBuffer);
 				EIDFree(*pEncryptedPassword);
 				*pEncryptedPassword = nullptr;
 			}
@@ -2053,6 +2339,7 @@ BOOL CStoredCredentialManager::GetPasswordFromCryptedChallengeResponse(__in DWOR
 	DWORD dwBlockLen;
 	DWORD dwRoundNumber;
 	DWORD dwError = 0;
+	DWORD cbPasswordAlloc = 0;     // size of *pszPassword, for the cleanup zeroize
 	PEID_PRIVATE_DATA pEidPrivateData = nullptr;
 	DWORD dwPrivateDataSize = 0;   // allocation size, for the cleanup zeroize
 	__try
@@ -2095,24 +2382,12 @@ BOOL CStoredCredentialManager::GetPasswordFromCryptedChallengeResponse(__in DWOR
 		bKey.cb = dwResponseSize;
 		memcpy(bKey.Data, pResponse, dwResponseSize);
 		// import the aes key
-		fStatus = CryptAcquireContext(&hProv,CREDENTIAL_CONTAINER,CREDENTIALPROVIDER,PROV_RSA_AES,0);
-		if(!fStatus)
+		fStatus = AcquireEphemeralProvider(&hProv);
+		if (!fStatus)
 		{
 			dwError = GetLastError();
-			if (dwError == NTE_BAD_KEYSET)
-			{
-				fStatus = CryptAcquireContext(&hProv,CREDENTIAL_CONTAINER,CREDENTIALPROVIDER,PROV_RSA_AES,CRYPT_NEWKEYSET);
-				dwError = GetLastError();
-			}
-			if (!fStatus)
-			{
-				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"CryptAcquireContext 0x%08x",dwError);
-				__leave;
-			}
-		}
-		else
-		{
-			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"Container already existed !!");
+			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"CryptAcquireContext 0x%08x",dwError);
+			__leave;
 		}
 		fStatus = CryptImportKey(hProv,(PBYTE) &bKey,sizeof(KEY_BLOB),0,CRYPT_EXPORTABLE,&hKey);
 		if(!fStatus)
@@ -2148,14 +2423,17 @@ BOOL CStoredCredentialManager::GetPasswordFromCryptedChallengeResponse(__in DWOR
 			__leave;
 		}
 		// usPasswordLen is USHORT, so this product always fits a DWORD
-		DWORD cbPasswordBuffer = dwRoundNumber * dwBlockLen;
-		*pszPassword = (PWSTR) EIDAlloc(cbPasswordBuffer + sizeof(WCHAR));
+		cbPasswordAlloc = dwRoundNumber * dwBlockLen + sizeof(WCHAR);
+		*pszPassword = (PWSTR) EIDAlloc(cbPasswordAlloc);
 		if (!*pszPassword)
 		{
 			dwError = GetLastError();
 			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"EIDAlloc 0x%08x", GetLastError());
 			__leave;
 		}
+		// Zero it all: a failed CryptDecrypt leaves before the terminator is written, and the
+		// cleanup below must not depend on the buffer holding a terminated string.
+		SecureZeroMemory(*pszPassword, cbPasswordAlloc);
 		memcpy(*pszPassword, pEidPrivateData->Data + pEidPrivateData->dwPasswordOffset, pEidPrivateData->usPasswordLen);
 
 		for (DWORD dwI = 0; dwI < dwRoundNumber ; dwI++)
@@ -2207,7 +2485,9 @@ BOOL CStoredCredentialManager::GetPasswordFromCryptedChallengeResponse(__in DWOR
 		{
 			if (*pszPassword)  // NOSONAR - CONTROL-01: nested if kept for cleanup clarity
 			{
-				SecureZeroMemory(*pszPassword, wcslen(*pszPassword) * sizeof(WCHAR));
+				// Scrub by the allocation size, never by wcslen: on a decrypt failure the
+				// buffer is not a terminated string.
+				SecureZeroMemory(*pszPassword, cbPasswordAlloc);
 				EIDFree(*pszPassword);
 				*pszPassword = nullptr;
 			}
@@ -2229,7 +2509,6 @@ BOOL CStoredCredentialManager::GetPasswordFromCryptedChallengeResponse(__in DWOR
 		if (hProv)
 		{
 			CryptReleaseContext(hProv, 0);
-			CryptAcquireContext(&hProv,CREDENTIAL_CONTAINER,CREDENTIALPROVIDER,PROV_RSA_AES,CRYPT_DELETEKEYSET);
 		}
 		// L3: scrub the raw AES key material from the stack.
 		SecureZeroMemory(&bKey, sizeof(bKey));
@@ -2291,24 +2570,12 @@ BOOL CStoredCredentialManager::GetPasswordFromSignatureChallengeResponse(__in DW
 			__leave;
 		}
 		// import the public key
-		fStatus = CryptAcquireContext(&hProv,CREDENTIAL_CONTAINER,CREDENTIALPROVIDER,PROV_RSA_AES,0);
-		if(!fStatus)
+		fStatus = AcquireEphemeralProvider(&hProv);
+		if (!fStatus)
 		{
 			dwError = GetLastError();
-			if (dwError == NTE_BAD_KEYSET)
-			{
-				fStatus = CryptAcquireContext(&hProv,CREDENTIAL_CONTAINER,CREDENTIALPROVIDER,PROV_RSA_AES,CRYPT_NEWKEYSET);
-				dwError = GetLastError();
-			}
-			if (!fStatus)
-			{
-				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"CryptAcquireContext 0x%08x",dwError);
-				__leave;
-			}
-		}
-		else
-		{
-			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"Container already existed !!");
+			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"CryptAcquireContext 0x%08x",dwError);
+			__leave;
 		}
 		fStatus = CryptImportPublicKeyInfo(hProv, pCertContextVerif->dwCertEncodingType, &(pCertContextVerif->pCertInfo->SubjectPublicKeyInfo),&hKey);
 		if (!fStatus)
@@ -2379,9 +2646,10 @@ BOOL CStoredCredentialManager::GetPasswordFromSignatureChallengeResponse(__in DW
 		if (hProv)
 		{
 			CryptReleaseContext(hProv, 0);
-			CryptAcquireContext(&hProv,CREDENTIAL_CONTAINER,CREDENTIALPROVIDER,PROV_RSA_AES,CRYPT_DELETEKEYSET);
 		}
 	}
+	// LsaApLogonUserEx2 maps the failure from GetLastError().
+	SetLastError(dwError);
 	return fReturn;
 }
 
@@ -2439,24 +2707,12 @@ BOOL CStoredCredentialManager::GetPasswordFromDPAPIChallengeResponse(__in DWORD 
 			__leave;
 		}
 		// import the public key
-		fStatus = CryptAcquireContext(&hProv,CREDENTIAL_CONTAINER,CREDENTIALPROVIDER,PROV_RSA_AES,0);
-		if(!fStatus)
+		fStatus = AcquireEphemeralProvider(&hProv);
+		if (!fStatus)
 		{
 			dwError = GetLastError();
-			if (dwError == NTE_BAD_KEYSET)
-			{
-				fStatus = CryptAcquireContext(&hProv,CREDENTIAL_CONTAINER,CREDENTIALPROVIDER,PROV_RSA_AES,CRYPT_NEWKEYSET);
-				dwError = GetLastError();
-			}
-			if (!fStatus)
-			{
-				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"CryptAcquireContext 0x%08x",dwError);
-				__leave;
-			}
-		}
-		else
-		{
-			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"Container already existed !!");
+			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"CryptAcquireContext 0x%08x",dwError);
+			__leave;
 		}
 		fStatus = CryptImportPublicKeyInfo(hProv, pCertContextVerif->dwCertEncodingType, &(pCertContextVerif->pCertInfo->SubjectPublicKeyInfo),&hKey);
 		if (!fStatus)
@@ -2542,7 +2798,6 @@ BOOL CStoredCredentialManager::GetPasswordFromDPAPIChallengeResponse(__in DWORD 
 		if (hProv)
 		{
 			CryptReleaseContext(hProv, 0);
-			CryptAcquireContext(&hProv,CREDENTIAL_CONTAINER,CREDENTIALPROVIDER,PROV_RSA_AES,CRYPT_DELETEKEYSET);
 		}
 	}
 	SetLastError(dwError);
@@ -2602,24 +2857,12 @@ BOOL CStoredCredentialManager::VerifySignatureChallengeResponse(__in DWORD dwRid
 			__leave;
 		}
 		// import the public key
-		fStatus = CryptAcquireContext(&hProv,CREDENTIAL_CONTAINER,CREDENTIALPROVIDER,PROV_RSA_AES,0);
-		if(!fStatus)
+		fStatus = AcquireEphemeralProvider(&hProv);
+		if (!fStatus)
 		{
 			dwError = GetLastError();
-			if (dwError == NTE_BAD_KEYSET)
-			{
-				fStatus = CryptAcquireContext(&hProv,CREDENTIAL_CONTAINER,CREDENTIALPROVIDER,PROV_RSA_AES,CRYPT_NEWKEYSET);
-				dwError = GetLastError();
-			}
-			if (!fStatus)
-			{
-				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"CryptAcquireContext 0x%08x",dwError);
-				__leave;
-			}
-		}
-		else
-		{
-			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"Container already existed !!");
+			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"CryptAcquireContext 0x%08x",dwError);
+			__leave;
 		}
 		fStatus = CryptImportPublicKeyInfo(hProv, pCertContext->dwCertEncodingType, &(pCertContext->pCertInfo->SubjectPublicKeyInfo),&hKey);
 		if (!fStatus)
@@ -2669,7 +2912,6 @@ BOOL CStoredCredentialManager::VerifySignatureChallengeResponse(__in DWORD dwRid
 		if (hProv)
 		{
 			CryptReleaseContext(hProv, 0);
-			CryptAcquireContext(&hProv,CREDENTIAL_CONTAINER,CREDENTIALPROVIDER,PROV_RSA_AES,CRYPT_DELETEKEYSET);
 		}
 	}
 	return fReturn;
@@ -3053,7 +3295,15 @@ BOOL CStoredCredentialManager::RetrievePrivateData(__in DWORD dwRid, __out PEID_
 	__finally
 	{
 		if (LsaPolicyHandle) LsaClose(LsaPolicyHandle);
-		if (pData) LsaFreeMemory(pData);
+		if (pData)
+		{
+			// The whole stored secret: certificate, wrapped key, encrypted password.
+			if (pData->Buffer && pData->Length)
+			{
+				SecureZeroMemory(pData->Buffer, pData->Length);
+			}
+			LsaFreeMemory(pData);
+		}
 	}
 	SetLastError(dwError);
 	return fReturn;
@@ -3174,29 +3424,126 @@ SamrQueryInformationUser MySamrQueryInformationUser;  // NOSONAR - RUNTIME-01: F
 SamIFree_SAMPR_USER_INFO_BUFFER MySamIFree;  // NOSONAR - RUNTIME-01: Function pointer, resolved via GetProcAddress
 
 
-NTSTATUS LoadSamSrv()
+// samsrv.dll stays loaded in LSASS for its whole life. Resolve its exports once and never
+// unload it: concurrent CheckPassword calls used to load, overwrite and free these globals
+// under each other.
+static INIT_ONCE s_SamSrvInitOnce = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK LoadSamSrvOnce(PINIT_ONCE, PVOID, PVOID*)
 {
-	samsrvDll = EIDLoadSystemLibrary(L"samsrv.dll");
-	if (!samsrvDll)
+	HMODULE hSamSrv = EIDLoadSystemLibrary(L"samsrv.dll");
+	if (!hSamSrv)
 	{
 		EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"LoadSam failed 0x%08x",GetLastError());
-		return STATUS_FAIL_CHECK;
+		return FALSE;
 	}
-	MySamrConnect = (SamrConnect) GetProcAddress(samsrvDll,"SamIConnect");
-	MySamrCloseHandle = (SamrCloseHandle) GetProcAddress(samsrvDll,"SamrCloseHandle");
-	MySamrOpenDomain = (SamrOpenDomain) GetProcAddress(samsrvDll,"SamrOpenDomain");
-	MySamrOpenUser = (SamrOpenUser) GetProcAddress(samsrvDll,"SamrOpenUser");
-	MySamrQueryInformationUser = (SamrQueryInformationUser) GetProcAddress(samsrvDll,"SamrQueryInformationUser");
-	MySamIFree = (SamIFree_SAMPR_USER_INFO_BUFFER) GetProcAddress(samsrvDll,"SamIFree_SAMPR_USER_INFO_BUFFER");
+	MySamrConnect = (SamrConnect) GetProcAddress(hSamSrv,"SamIConnect");
+	MySamrCloseHandle = (SamrCloseHandle) GetProcAddress(hSamSrv,"SamrCloseHandle");
+	MySamrOpenDomain = (SamrOpenDomain) GetProcAddress(hSamSrv,"SamrOpenDomain");
+	MySamrOpenUser = (SamrOpenUser) GetProcAddress(hSamSrv,"SamrOpenUser");
+	MySamrQueryInformationUser = (SamrQueryInformationUser) GetProcAddress(hSamSrv,"SamrQueryInformationUser");
+	MySamIFree = (SamIFree_SAMPR_USER_INFO_BUFFER) GetProcAddress(hSamSrv,"SamIFree_SAMPR_USER_INFO_BUFFER");
 	if (!MySamrConnect || !MySamrCloseHandle || !MySamrOpenDomain || !MySamrOpenUser
 		|| !MySamrQueryInformationUser || !MySamIFree)
 	{
 		EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"Null pointer function");
-		FreeLibrary(samsrvDll);
-		samsrvDll = nullptr;
+		FreeLibrary(hSamSrv);
+		return FALSE;
+	}
+	samsrvDll = hSamSrv;
+	return TRUE;
+}
+
+NTSTATUS LoadSamSrv()
+{
+	if (!InitOnceExecuteOnce(&s_SamSrvInitOnce, LoadSamSrvOnce, nullptr, nullptr))
+	{
 		return STATUS_FAIL_CHECK;
 	}
 	return STATUS_SUCCESS;
+}
+
+// CheckPassword compares the password's NT hash with SAM's directly, so a wrong guess never
+// reaches SAM's bad-password count, lockout policy or logon auditing, and any user could
+// guess their own password through EIDCMCreateStoredCredential at full speed. Allow
+// EID_PWCHECK_MAX_FAILURES wrong passwords per RID within EID_PWCHECK_WINDOW_MS; after that
+// refuse to check that RID until the window has passed. Every wrong password is audited.
+constexpr DWORD EID_PWCHECK_MAX_FAILURES = 5;
+constexpr ULONGLONG EID_PWCHECK_WINDOW_MS = 15ULL * 60ULL * 1000ULL;
+struct EID_PWCHECK_FAILURES
+{
+	DWORD dwRid;
+	DWORD dwCount;
+	ULONGLONG ullFirstFailure;
+};
+static SRWLOCK s_PwCheckLock = SRWLOCK_INIT;
+static std::array<EID_PWCHECK_FAILURES, 32> s_PwCheckFailures {};
+
+// Caller holds s_PwCheckLock. Returns the slot for dwRid, or nullptr.
+static EID_PWCHECK_FAILURES* FindPasswordCheckSlot(DWORD dwRid, ULONGLONG ullNow)
+{
+	for (auto& slot : s_PwCheckFailures)
+	{
+		if (slot.dwCount != 0 && slot.dwRid == dwRid)
+		{
+			if (ullNow - slot.ullFirstFailure >= EID_PWCHECK_WINDOW_MS)
+			{
+				slot = {};
+				return nullptr;
+			}
+			return &slot;
+		}
+	}
+	return nullptr;
+}
+
+static BOOL IsPasswordCheckThrottled(DWORD dwRid)
+{
+	const ULONGLONG ullNow = GetTickCount64();
+	AcquireSRWLockExclusive(&s_PwCheckLock);
+	const EID_PWCHECK_FAILURES* pSlot = FindPasswordCheckSlot(dwRid, ullNow);
+	const BOOL fThrottled = pSlot && pSlot->dwCount >= EID_PWCHECK_MAX_FAILURES;
+	ReleaseSRWLockExclusive(&s_PwCheckLock);
+	return fThrottled;
+}
+
+static void RecordPasswordCheckResult(DWORD dwRid, BOOL fWrongPassword)
+{
+	const ULONGLONG ullNow = GetTickCount64();
+	AcquireSRWLockExclusive(&s_PwCheckLock);
+	EID_PWCHECK_FAILURES* pSlot = FindPasswordCheckSlot(dwRid, ullNow);
+	if (!fWrongPassword)
+	{
+		if (pSlot)
+		{
+			*pSlot = {};
+		}
+	}
+	else if (pSlot)
+	{
+		pSlot->dwCount++;
+	}
+	else
+	{
+		// New RID: take a free slot, else the one whose window started first.
+		EID_PWCHECK_FAILURES* pVictim = &s_PwCheckFailures[0];
+		for (auto& slot : s_PwCheckFailures)
+		{
+			if (slot.dwCount == 0)
+			{
+				pVictim = &slot;
+				break;
+			}
+			if (slot.ullFirstFailure < pVictim->ullFirstFailure)
+			{
+				pVictim = &slot;
+			}
+		}
+		pVictim->dwRid = dwRid;
+		pVictim->dwCount = 1;
+		pVictim->ullFirstFailure = ullNow;
+	}
+	ReleaseSRWLockExclusive(&s_PwCheckLock);
 }
 
 // SonarQube S134: Won't Fix - SEH-protected function (__try/__finally)
@@ -3211,12 +3558,26 @@ NTSTATUS CStoredCredentialManager::CheckPassword( __in DWORD dwRid, __in PWSTR s
  SAMPR_HANDLE hDomain = nullptr;
  SAMPR_HANDLE hUser = nullptr;
  PSAMPR_USER_INTERNAL1_INFORMATION UserInfo = nullptr;
-	std::array<unsigned char, 16> bHash;
+	std::array<unsigned char, 16> bHash {};
 	UNICODE_STRING EncryptedPassword;
 	EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"Enter");
 	__try
 	{
-        samsrvDll = nullptr;
+		// The byte length must fit the UNICODE_STRING's USHORT (it used to wrap at 32768 chars).
+		const size_t cchPassword = szPassword ? wcsnlen(szPassword, (USHRT_MAX / sizeof(WCHAR)) + 1) : 0;
+		if (!szPassword || cchPassword > USHRT_MAX / sizeof(WCHAR))
+		{
+			Status = STATUS_INVALID_PARAMETER;
+			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"password absent or too long");
+			__leave;
+		}
+		if (IsPasswordCheckThrottled(dwRid))
+		{
+			Status = STATUS_ACCOUNT_LOCKED_OUT;
+			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"password checks for rid 0x%x throttled",dwRid);
+			EIDSecurityAudit(SECURITY_AUDIT_FAILURE, L"[AUTH_PASSWORD_ERROR] Password check for rid 0x%x refused: too many wrong passwords, retry later", dwRid);
+			__leave;
+		}
 		memset(&connectionAttrib,0,sizeof(LSA_OBJECT_ATTRIBUTES));
         connectionAttrib.Length = sizeof(LSA_OBJECT_ATTRIBUTES);
 		Status = LoadSamSrv();
@@ -3261,8 +3622,8 @@ NTSTATUS CStoredCredentialManager::CheckPassword( __in DWORD dwRid, __in PWSTR s
 			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"SamrQueryInformationUser failed 0x%08x",Status);
 			__leave;
 		}
-		EncryptedPassword.Length = (USHORT) wcslen(szPassword) * sizeof(WCHAR);
-		EncryptedPassword.MaximumLength = (USHORT) wcslen(szPassword) * sizeof(WCHAR);
+		EncryptedPassword.Length = static_cast<USHORT>(cchPassword * sizeof(WCHAR));
+		EncryptedPassword.MaximumLength = EncryptedPassword.Length;
 		EncryptedPassword.Buffer = szPassword;
 		Status = SystemFunction007(&EncryptedPassword, bHash.data());
 		if (Status!= STATUS_SUCCESS)	
@@ -3270,20 +3631,28 @@ NTSTATUS CStoredCredentialManager::CheckPassword( __in DWORD dwRid, __in PWSTR s
 			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"SystemFunction007 failed 0x%08x",Status);
 			__leave;
 		}
+		// Constant time: compare every byte.
+		unsigned char bDiff = 0;
 		for (DWORD dwI = 0 ; dwI < 16; dwI++)
 		{
-			if (bHash[dwI] != UserInfo->EncryptedNtOwfPassword.data[dwI])
-			{
-				Status = STATUS_WRONG_PASSWORD;
-				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"STATUS_WRONG_PASSWORD");
-				break;
-			}
+			bDiff |= static_cast<unsigned char>(bHash[dwI] ^ UserInfo->EncryptedNtOwfPassword.data[dwI]);
 		}
+		if (bDiff != 0)
+		{
+			Status = STATUS_WRONG_PASSWORD;
+			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"STATUS_WRONG_PASSWORD");
+			EIDSecurityAudit(SECURITY_AUDIT_FAILURE, L"[AUTH_PASSWORD_ERROR] Password check for rid 0x%x failed: wrong password", dwRid);
+		}
+		RecordPasswordCheckResult(dwRid, bDiff != 0);
 	}
 	__finally
 	{
+		SecureZeroMemory(bHash.data(), bHash.size());
 		if (UserInfo)
+		{
+			SecureZeroMemory(UserInfo, sizeof(*UserInfo));
 			MySamIFree(UserInfo, UserInternal1Information);
+		}
 		if (hUser)
 			MySamrCloseHandle(&hUser);
 		if (hDomain)
@@ -3294,8 +3663,6 @@ NTSTATUS CStoredCredentialManager::CheckPassword( __in DWORD dwRid, __in PWSTR s
 			LsaFreeMemory(structInfoPolicy);
 		if (handlePolicy)
 			LsaClose(handlePolicy);
-		if (samsrvDll)
-			FreeLibrary(samsrvDll);
 	}
 	EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"Leave with status = 0x%08x",Status);
 	return Status;

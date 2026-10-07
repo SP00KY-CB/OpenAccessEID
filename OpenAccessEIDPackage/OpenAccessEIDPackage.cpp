@@ -53,6 +53,10 @@
 #include "../EIDCardLibrary/CSVConfig.h"
 
 
+// Package.cpp: allocator used by EIDAlloc/EIDFree for everything handed to LSA.
+void SetAlloc(PLSA_ALLOCATE_LSA_HEAP AllocateLsaHeap);
+void SetFree(PLSA_FREE_LSA_HEAP FreeHeap);
+
 extern "C"
 {
 	// Save LsaDispatchTable
@@ -164,8 +168,14 @@ extern "C"
 	// named by ClientInfo.LogonId. A caller impersonating an identification-
 	// level token of a victim (for example an S4U token) carries the victim's
 	// logon id but must not be able to act as the victim here.
-	BOOL MatchUserOrIsAdmin(__in DWORD dwRid)
+	// pfIsAdmin, when given, is set TRUE only when access was granted because the caller is an
+	// administrator (not because it is the account itself).
+	BOOL MatchUserOrIsAdmin(__in DWORD dwRid, __out_opt PBOOL pfIsAdmin = nullptr)
 	{
+		if (pfIsAdmin)
+		{
+			*pfIsAdmin = FALSE;
+		}
 		BOOL fReturn = FALSE;
 		SECPKG_CLIENT_INFO ClientInfo;
 		NTSTATUS status;  // NOSONAR - EXPLICIT-TYPE-01: NTSTATUS visible for security audit
@@ -182,6 +192,13 @@ extern "C"
 			if (STATUS_SUCCESS != MyLsaDispatchTable->GetClientInfo(&ClientInfo))
 			{
 				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"GetClientInfo");
+				__leave;
+			}
+			// A request that originates inside LSASS itself (for example Netlogon generic
+			// pass-through) has no client process whose identity could be checked here.
+			if (ClientInfo.ProcessID == GetCurrentProcessId())
+			{
+				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"Client is LSASS itself - denying rid 0x%x", dwRid);
 				__leave;
 			}
 			// Refuse restricted callers: the caller was deliberately sandboxed
@@ -390,6 +407,10 @@ extern "C"
 			{
 				dwError = 0;
 				fReturn = TRUE;
+				if (pfIsAdmin)
+				{
+					*pfIsAdmin = TRUE;
+				}
 			}
 			else
 			{
@@ -427,6 +448,15 @@ extern "C"
 		NTSTATUS Status = STATUS_SUCCESS;  // NOSONAR - EXPLICIT-TYPE-01: NTSTATUS visible for security audit
 
 		MyLsaDispatchTable = reinterpret_cast<PLSA_SECPKG_FUNCTION_TABLE>(LsaDispatchTable);  // NOSONAR - CAST-01: Win32/COM interop cast, layout-verified
+		// Everything this package hands to LSA must come from the LSA heap. SpInitialize sets
+		// these too when the DLL is also loaded as a security package; set them here as well so
+		// the authentication package never depends on that. (LSA_DISPATCH_TABLE has the heap
+		// routines; ImpersonateClient is only in the SSP function table.)
+		if (LsaDispatchTable)
+		{
+			SetAlloc(LsaDispatchTable->AllocateLsaHeap);
+			SetFree(LsaDispatchTable->FreeLsaHeap);
+		}
 
 		*AuthenticationPackageName = LsaInitializeString(AUTHENTICATIONPACKAGENAME);
 
@@ -500,13 +530,16 @@ extern "C"
 		NTSTATUS statusError;  // NOSONAR - EXPLICIT-TYPE-01: NTSTATUS visible for security audit
 		PCCERT_CONTEXT pCertContext = NULL;
 		PWSTR szUsername = NULL;
+		PWSTR pwszPasswordToWipe = NULL;
+		BOOL fCallerIsAdmin = FALSE;
 		UNREFERENCED_PARAMETER(ClientRequest);
-		UNREFERENCED_PARAMETER(ReturnBufferLength);
-		UNREFERENCED_PARAMETER(ProtocolReturnBuffer);
 		__try
 		{
 			EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"Enter");
 			*ProtocolStatus = STATUS_SUCCESS;
+			// No message returns a buffer: results go back through CopyToClientBuffer.
+			*ProtocolReturnBuffer = NULL;
+			*ReturnBufferLength = 0;
 			// SECURITY: an untrusted caller controls the whole submit buffer; reject any buffer
 			// too small to hold the fixed message header before touching any field.
 			if (SubmitBufferLength < sizeof(EID_CALLPACKAGE_BUFFER))
@@ -517,12 +550,18 @@ extern "C"
 			}
 			PEID_CALLPACKAGE_BUFFER pBuffer = static_cast<PEID_CALLPACKAGE_BUFFER>(ProtocolSubmitBuffer);  // NOSONAR (EXPLICIT-TYPE-04) - Explicit type preferred for code clarity
 			pBuffer->dwError = 0;
+			// The cases below call through the manager without checking it.
+			if (!CStoredCredentialManager::Instance())
+			{
+				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"manager NULL");
+				return STATUS_INSUFFICIENT_RESOURCES;
+			}
 			
 			switch (pBuffer->MessageType)
 			{
 			case EIDCMCreateStoredCredential:
 				EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"EIDCMCreateStoredCredential");
-				if (!MatchUserOrIsAdmin(pBuffer->dwRid))
+				if (!MatchUserOrIsAdmin(pBuffer->dwRid, &fCallerIsAdmin))
 				{
 					EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"Not authorized");
 					break;
@@ -539,6 +578,8 @@ extern "C"
 					break;
 				}
 				pBuffer->wszPassword = reinterpret_cast<PWSTR>(pPointer);  // NOSONAR - CAST-01: Win32/COM interop cast, layout-verified
+				// Wiped from this LSASS copy of the request once the message is handled.
+				pwszPasswordToWipe = pBuffer->wszPassword;
 				pPointer = RebaseAndBoundCheck(pBuffer->pbCertificate, ClientBufferBase, pBuffer, pBuffer->dwCertificateSize, SubmitBufferLength);
 				if (!pPointer)
 				{
@@ -565,6 +606,25 @@ extern "C"
 					break;
 				}
 				EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"Certificate created in memory");
+				// SECURITY: a caller enrolling their own account must prove they hold the
+				// certificate's key; certificates are public, so without this anyone could bind
+				// someone else's certificate to their own account before its owner enrols it.
+				if (!fCallerIsAdmin)
+				{
+					pPointer = (pBuffer->usEnrolmentSignatureSize != 0)
+						? RebaseAndBoundCheck(pBuffer->pbEnrolmentSignature, ClientBufferBase, pBuffer, pBuffer->usEnrolmentSignatureSize, SubmitBufferLength)
+						: NULL;
+					if (!pPointer || !EIDVerifyEnrolmentProof(pBuffer->dwRid, pCertContext, &pBuffer->ftEnrolmentTime, pPointer, pBuffer->usEnrolmentSignatureSize))
+					{
+						pBuffer->dwError = NTE_BAD_SIGNATURE;
+						EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"enrolment proof of possession missing or invalid - rejecting");
+						EIDSecurityAudit(SECURITY_AUDIT_FAILURE, L"[ENROL_REJECT] Refused to enrol a certificate for rid 0x%x: no valid proof that the caller holds its key", pBuffer->dwRid);
+						status = STATUS_SUCCESS;
+						CertFreeCertificateContext(pCertContext);
+						pCertContext = NULL;
+						break;
+					}
+				}
 				fStatus = CStoredCredentialManager::Instance()->CreateCredential(pBuffer->dwRid,pCertContext,pBuffer->wszPassword, 0, pBuffer->fEncryptPassword, TRUE);
 				if (!fStatus)
 				{
@@ -573,6 +633,7 @@ extern "C"
 				}
 				status = STATUS_SUCCESS;
 				CertFreeCertificateContext(pCertContext);
+				pCertContext = NULL;
 				break;
 			case EIDCMRemoveStoredCredential:
 				EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"EIDCMRemoveStoredCredential");
@@ -667,6 +728,8 @@ extern "C"
 					EIDFree(szUsername);
 					status = STATUS_SUCCESS;
 				}
+				CertFreeCertificateContext(pCertContext);
+				pCertContext = NULL;
 				EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"copy back");
 				// copy error back to original buffer
 				MyLsaDispatchTable->CopyToClientBuffer(ClientRequest, sizeof(DWORD), ((PBYTE)&(pBuffer->dwRid))  + (ULONG_PTR) ClientBufferBase - (ULONG_PTR) pBuffer, &(pBuffer->dwRid));
@@ -674,6 +737,12 @@ extern "C"
 			
 			default:
 				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"Invalid message %d",pBuffer->MessageType);
+			}
+			if (pwszPasswordToWipe)
+			{
+				// Bounded: RebaseWStringAndBoundCheck found its terminator inside the buffer.
+				SecureZeroMemory(pwszPasswordToWipe, wcslen(pwszPasswordToWipe) * sizeof(WCHAR));
+				pwszPasswordToWipe = NULL;
 			}
 			EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"Done in LSA memory - preparing response");
 			// copy error back to original buffer
@@ -1100,9 +1169,28 @@ extern "C"
 	  __out  PULONG ReturnBufferLength,
 	  __out  PNTSTATUS ProtocolStatus
 	) {
-		EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"");
-		return LsaApCallPackageUntrusted(ClientRequest,ProtocolSubmitBuffer,ClientBufferBase,
-			SubmitBufferLength,ProtocolReturnBuffer,ReturnBufferLength,ProtocolStatus);
+		// Generic pass-through (Netlogon, on a domain controller) delivers data from the
+		// network, with no local client whose identity the credential-management messages
+		// could check. Nothing in this product uses it: refuse it.
+		UNREFERENCED_PARAMETER(ClientRequest);
+		UNREFERENCED_PARAMETER(ProtocolSubmitBuffer);
+		UNREFERENCED_PARAMETER(ClientBufferBase);
+		UNREFERENCED_PARAMETER(SubmitBufferLength);
+		if (ProtocolReturnBuffer)
+		{
+			*ProtocolReturnBuffer = NULL;
+		}
+		if (ReturnBufferLength)
+		{
+			*ReturnBufferLength = 0;
+		}
+		if (ProtocolStatus)
+		{
+			*ProtocolStatus = STATUS_NOT_SUPPORTED;
+		}
+		EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"pass-through call refused");
+		EIDSecurityAudit(SECURITY_AUDIT_WARNING, L"[IPC_REJECT] Refused a generic pass-through call to the package");
+		return STATUS_NOT_SUPPORTED;
 	}
 
 	/** Called when a logon session ends to permit the authentication package 
@@ -1918,6 +2006,31 @@ extern "C"
 		}
 
 		return hr;
+	}
+
+	// EIDResealStoredCredential - re-seals an enrolled account's stored credential
+	// with its new password. Exported for the password filter
+	// (EIDPasswordChangeNotification.dll): it runs in the same LSASS but links its
+	// own copy of EIDCardLibrary, so its own re-seal would not share the lock that
+	// serialises enrolment, removal and SpAcceptCredentials in this DLL. Calling
+	// through here does.
+	BOOL WINAPI EIDResealStoredCredential(DWORD dwRid, PWSTR szPassword, USHORT usPasswordLen)
+	{
+		BOOL fReturn = FALSE;
+		__try
+		{
+			CStoredCredentialManager* manager = CStoredCredentialManager::Instance();
+			if (manager && szPassword && usPasswordLen > 0)
+			{
+				fReturn = manager->UpdateCredential(dwRid, szPassword, usPasswordLen);
+			}
+		}
+		__except(EIDExceptionHandler(GetExceptionInformation()))
+		{
+			EIDCardLibraryTrace(WINEVENT_LEVEL_ERROR,L"NT exception in EIDResealStoredCredential: 0x%08x",GetExceptionCode());
+			fReturn = FALSE;
+		}
+		return fReturn;
 	}
 
 	// CleanupEIDCertificates - Removes the EID root CA (certificate + machine key

@@ -1017,6 +1017,120 @@ DWORD GetCurrentRid()
 		return 0;
 	}
 
+BOOL EIDBuildEnrolmentStatement(DWORD dwRid, const FILETIME* pftTime, PCCERT_CONTEXT pCertContext, PBYTE pbStatement, DWORD cbStatement)
+{
+	static const char s_szPurpose[] = "OpenAccessEID enrolment proof v1";
+	static_assert(sizeof(s_szPurpose) - 1 == 32, "the purpose string is 32 bytes");
+	if (!pftTime || !pCertContext || !pbStatement || cbStatement != EID_ENROLMENT_STATEMENT_SIZE)
+	{
+		SetLastError(ERROR_INVALID_PARAMETER);
+		return FALSE;
+	}
+	PBYTE p = pbStatement;
+	memcpy(p, s_szPurpose, 32);
+	p += 32;
+	for (int i = 0; i < 4; i++)
+	{
+		*p++ = static_cast<BYTE>(dwRid >> (8 * i));
+	}
+	for (int i = 0; i < 4; i++)
+	{
+		*p++ = static_cast<BYTE>(pftTime->dwLowDateTime >> (8 * i));
+	}
+	for (int i = 0; i < 4; i++)
+	{
+		*p++ = static_cast<BYTE>(pftTime->dwHighDateTime >> (8 * i));
+	}
+	DWORD cbHash = 32;
+	if (!CryptHashCertificate(NULL, CALG_SHA_256, 0, pCertContext->pbCertEncoded, pCertContext->cbCertEncoded, p, &cbHash) || cbHash != 32)
+	{
+		if (GetLastError() == 0)
+		{
+			SetLastError(ERROR_INVALID_DATA);
+		}
+		return FALSE;
+	}
+	return TRUE;
+}
+
+// Signs the enrolment statement with the certificate's key on the card, through a fresh
+// non-silent context so that the card's provider asks for the PIN itself.
+static BOOL SignEnrolmentStatement(PCRYPT_KEY_PROV_INFO pProvInfo, const BYTE* pbStatement, DWORD cbStatement, PBYTE* ppbSignature, DWORD* pcbSignature)
+{
+	HCRYPTPROV hProv = NULL;  // Windows handle type - keep as NULL
+	HCRYPTHASH hHash = NULL;  // Windows handle type - keep as NULL
+	PBYTE pbSignature = nullptr;
+	DWORD cbSignature = 0;
+	DWORD dwError = 0;
+	BOOL fReturn = FALSE;
+	*ppbSignature = nullptr;
+	*pcbSignature = 0;
+	__try
+	{
+		if (!pProvInfo || !pProvInfo->pwszProvName)
+		{
+			dwError = NTE_NO_KEY;
+			__leave;
+		}
+		if (!CryptAcquireContextW(&hProv, pProvInfo->pwszContainerName, pProvInfo->pwszProvName, pProvInfo->dwProvType,
+			pProvInfo->dwFlags & CRYPT_MACHINE_KEYSET))
+		{
+			dwError = GetLastError();
+			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"CryptAcquireContext 0x%08x",dwError);
+			__leave;
+		}
+		if (!CryptCreateHash(hProv, CALG_SHA, NULL, 0, &hHash) || !CryptHashData(hHash, pbStatement, cbStatement, 0))
+		{
+			dwError = GetLastError();
+			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"hash 0x%08x",dwError);
+			__leave;
+		}
+		if (!CryptSignHashW(hHash, pProvInfo->dwKeySpec, nullptr, 0, nullptr, &cbSignature) || cbSignature == 0 || cbSignature > EID_MAX_ENROLMENT_SIGNATURE_SIZE)
+		{
+			dwError = GetLastError();
+			if (dwError == 0)
+			{
+				dwError = NTE_BAD_LEN;
+			}
+			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"CryptSignHash 0x%08x",dwError);
+			__leave;
+		}
+		pbSignature = static_cast<PBYTE>(EIDAlloc(cbSignature));
+		if (!pbSignature)
+		{
+			dwError = ERROR_OUTOFMEMORY;
+			__leave;
+		}
+		if (!CryptSignHashW(hHash, pProvInfo->dwKeySpec, nullptr, 0, pbSignature, &cbSignature))
+		{
+			dwError = GetLastError();
+			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"CryptSignHash 0x%08x",dwError);
+			__leave;
+		}
+		*ppbSignature = pbSignature;
+		*pcbSignature = cbSignature;
+		pbSignature = nullptr;
+		fReturn = TRUE;
+	}
+	__finally
+	{
+		if (pbSignature)
+		{
+			EIDFree(pbSignature);
+		}
+		if (hHash)
+		{
+			CryptDestroyHash(hHash);
+		}
+		if (hProv)
+		{
+			CryptReleaseContext(hProv, 0);
+		}
+	}
+	SetLastError(dwError);
+	return fReturn;
+}
+
 BOOL LsaEIDCreateStoredCredential(__in_opt PWSTR szUsername, __in PWSTR szPassword, __in PCCERT_CONTEXT pContext, __in BOOL fEncryptPassword)  // NOSONAR - API-01: signature dictated by Windows/callback API
 {
 	BOOL fReturn = FALSE;
@@ -1029,6 +1143,11 @@ BOOL LsaEIDCreateStoredCredential(__in_opt PWSTR szUsername, __in PWSTR szPasswo
 	DWORD dwBufferSize = 0;
 	DWORD dwError = 0;
 	PCRYPT_KEY_PROV_INFO pProvInfo = nullptr;
+	DWORD dwRid = 0;
+	FILETIME ftNow = {};
+	BYTE rgbStatement[EID_ENROLMENT_STATEMENT_SIZE];  // NOSONAR - LSASS-01: C-style buffer
+	PBYTE pbSignature = nullptr;
+	DWORD cbSignature = 0;
 	__try
 	{
 		if (!szPassword) 
@@ -1055,8 +1174,27 @@ BOOL LsaEIDCreateStoredCredential(__in_opt PWSTR szUsername, __in PWSTR szPasswo
 			}
 		}
 	
+		dwRid = szUsername ? GetRidFromUsername(szUsername) : GetCurrentRid();
+		if (!dwRid)
+		{
+			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"dwRid = 0");
+			dwError = ERROR_INVALID_PARAMETER;
+			__leave;
+		}
+		// Prove possession of the certificate's key. The package requires this unless the
+		// caller is an administrator; if signing fails the request goes without it and the
+		// package decides.
+		GetSystemTimeAsFileTime(&ftNow);
+		if (!EIDBuildEnrolmentStatement(dwRid, &ftNow, pContext, rgbStatement, sizeof(rgbStatement))
+			|| !SignEnrolmentStatement(pProvInfo, rgbStatement, sizeof(rgbStatement), &pbSignature, &cbSignature))
+		{
+			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"no enrolment proof of possession 0x%08x", GetLastError());
+			pbSignature = nullptr;
+			cbSignature = 0;
+		}
+
 		dwPasswordSize = (DWORD) (wcslen(szPassword) + 1) * sizeof(WCHAR);
-		dwBufferSize = (DWORD) (sizeof(EID_CALLPACKAGE_BUFFER) + dwPasswordSize + pContext->cbCertEncoded);
+		dwBufferSize = (DWORD) (sizeof(EID_CALLPACKAGE_BUFFER) + dwPasswordSize + pContext->cbCertEncoded + cbSignature);
 
 		pBuffer = (PEID_CALLPACKAGE_BUFFER) EIDAlloc(dwBufferSize);
 		if( !pBuffer) 
@@ -1065,16 +1203,8 @@ BOOL LsaEIDCreateStoredCredential(__in_opt PWSTR szUsername, __in PWSTR szPasswo
 			dwError = ERROR_OUTOFMEMORY;
 			__leave;
 		}
-		if (!szUsername) 
-		{
-			EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"szUsername null");
-			pBuffer->dwRid = GetCurrentRid();
-		}
-		else
-		{
-			EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"szUsername = %s", szUsername);
-			pBuffer->dwRid = GetRidFromUsername(szUsername);
-		}
+		memset(pBuffer, 0, sizeof(EID_CALLPACKAGE_BUFFER));
+		pBuffer->dwRid = dwRid;
 		pBuffer->MessageType = EIDCMCreateStoredCredential;
 		pBuffer->usPasswordLen = 0;
 		pPointer = (PBYTE) &(pBuffer[1]);
@@ -1096,12 +1226,14 @@ BOOL LsaEIDCreateStoredCredential(__in_opt PWSTR szUsername, __in PWSTR szPasswo
 		pBuffer->pbCertificate = pPointer;
 		memcpy(pPointer, pContext->pbCertEncoded, pBuffer->dwCertificateSize);
 		pPointer += pBuffer->dwCertificateSize;
-	
-		if (!pBuffer->dwRid)
+
+		pBuffer->ftEnrolmentTime = ftNow;
+		pBuffer->usEnrolmentSignatureSize = static_cast<USHORT>(cbSignature);
+		pBuffer->pbEnrolmentSignature = cbSignature ? pPointer : nullptr;
+		if (cbSignature)
 		{
-			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"dwRid = 0");
-			dwError = ERROR_INVALID_PARAMETER;
-			__leave;
+			memcpy(pPointer, pbSignature, cbSignature);
+			pPointer += cbSignature;
 		}
 
 		status = LsaConnectUntrusted(&hLsa);
@@ -1147,6 +1279,7 @@ BOOL LsaEIDCreateStoredCredential(__in_opt PWSTR szUsername, __in PWSTR szPasswo
 			EIDFree(pBuffer);
 		}
 		if (pProvInfo) EIDFree(pProvInfo);
+		if (pbSignature) EIDFree(pbSignature);
 	}
 	SetLastError(dwError);
 	return fReturn;

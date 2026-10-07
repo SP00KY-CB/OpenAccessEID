@@ -186,7 +186,12 @@ struct EID_CALLPACKAGE_BUFFER
 	USHORT dwCertificateSize;
 	std::array<UCHAR, CERT_HASH_LENGTH> Hash; // to get challenge
 	BOOL fEncryptPassword;
-
+	// EIDCMCreateStoredCredential: proof that the caller holds the certificate's key - the
+	// card's signature over EIDBuildEnrolmentStatement(dwRid, ftEnrolmentTime, certificate),
+	// stored in the buffer like pbCertificate. Required unless the caller is an administrator.
+	FILETIME ftEnrolmentTime;
+	PBYTE pbEnrolmentSignature;
+	USHORT usEnrolmentSignatureSize;
 };
 using PEID_CALLPACKAGE_BUFFER = EID_CALLPACKAGE_BUFFER*;
 
@@ -195,6 +200,14 @@ using PEID_CALLPACKAGE_BUFFER = EID_CALLPACKAGE_BUFFER*;
 // uses USHORT offsets/sizes, so an oversized certificate must be refused before
 // any size arithmetic is done on it.
 constexpr DWORD EID_MAX_CERTIFICATE_SIZE = 16384;
+
+// Enrolment proof of possession: the statement the card signs (SHA-1, CryptSignHash) is
+// "OpenAccessEID enrolment proof v1" (32 bytes), the RID (4 bytes, little endian), the
+// FILETIME (8 bytes) and the SHA-256 of the DER certificate (32 bytes).
+constexpr DWORD EID_ENROLMENT_STATEMENT_SIZE = 32 + 4 + 8 + 32;
+// An RSA-4096 signature is 512 bytes.
+constexpr DWORD EID_MAX_ENROLMENT_SIGNATURE_SIZE = 512;
+BOOL EIDBuildEnrolmentStatement(DWORD dwRid, const FILETIME* pftTime, PCCERT_CONTEXT pCertContext, PBYTE pbStatement, DWORD cbStatement);
 
 struct EID_MSGINA_AUTHENTICATION_CHALLENGE_REQUEST
 {

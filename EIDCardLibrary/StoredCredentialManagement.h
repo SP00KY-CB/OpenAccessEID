@@ -36,18 +36,17 @@ struct EID_PRIVATE_DATA
 };
 using PEID_PRIVATE_DATA = EID_PRIVATE_DATA*;
 
+// Checks the enrolment proof of possession carried by EIDCMCreateStoredCredential: a signature
+// with the certificate's own key over EIDBuildEnrolmentStatement, made within a few minutes.
+BOOL EIDVerifyEnrolmentProof(__in DWORD dwRid, __in PCCERT_CONTEXT pCertContext, __in const FILETIME* pftTime,
+	__in_bcount(cbSignature) const BYTE* pbSignature, __in DWORD cbSignature);
+
  class CStoredCredentialManager
  {
     // constructeurs/destructeur de OnlyOne accessibles au Singleton
 public:
-	static CStoredCredentialManager* Instance()
-     {
-         if (!theSingleInstance)
-		 {
-			 theSingleInstance = new CStoredCredentialManager;  // NOSONAR - OWNERSHIP-01: singleton instance intentionally persists for process lifetime
-		 }
-		 return theSingleInstance;
-     }
+	// Thread-safe; returns NULL only when the instance cannot be allocated.
+	static CStoredCredentialManager* Instance();
 
     BOOL GetUsernameFromCertContext(__in PCCERT_CONTEXT pContext, __out PWSTR *szUsername, __out PDWORD pdwRid);
 	BOOL GetCertContextFromHash(__in PBYTE pbHash, __out PCCERT_CONTEXT* ppContext, __out PDWORD pdwRid);
@@ -67,6 +66,7 @@ public:
 	BOOL VerifySignatureChallengeResponse(__in DWORD dwRid, __in PBYTE ppChallenge, __in DWORD dwChallengeSize, __in PBYTE pResponse, __in DWORD dwResponseSize);
  private:
 	static CStoredCredentialManager* theSingleInstance;
+	static BOOL CALLBACK CreateInstanceOnce(PINIT_ONCE, PVOID, PVOID*);
 	BOOL GetResponseFromCryptedChallenge(__in PBYTE ppChallenge, __in DWORD dwChallengeSize, __in PCCERT_CONTEXT pCertContext, __in PWSTR szPin, __out PBYTE *ppResponse, __out PDWORD pdwResponseSize);
 	BOOL GetPasswordFromCryptedChallengeResponse(__in DWORD dwRid, __in PBYTE ppChallenge, __in DWORD dwChallengeSize, __in PBYTE pResponse, __in DWORD dwResponseSize, __out PWSTR *pszPassword);
 	BOOL GetPasswordFromSignatureChallengeResponse(__in DWORD dwRid, __in PBYTE ppChallenge, __in DWORD dwChallengeSize, __in PBYTE pResponse, __in DWORD dwResponseSize, __out PWSTR *pszPassword);

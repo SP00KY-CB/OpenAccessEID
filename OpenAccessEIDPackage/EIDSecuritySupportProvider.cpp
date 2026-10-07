@@ -290,6 +290,10 @@ extern "C"
 	{
 		EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"Enter for account name = %wZ type=%d",AccountName, LogonType);
 		UNREFERENCED_PARAMETER(SupplementalCredentials);
+		// LSA calls this for every logon and credential update on the machine;
+		// an exception escaping into LSA here would fail far more than our package.
+		__try
+		{
 		if ( PrimaryCredentials && (PrimaryCredentials->Flags & PRIMARY_CRED_UPDATE) 
 								&& (PrimaryCredentials->Flags & PRIMARY_CRED_CLEAR_PASSWORD))
 		{
@@ -303,8 +307,15 @@ extern "C"
 			// into LSASS.exe while a notification package requires a reboot.
 			EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"Password change with flag 0x%x", PrimaryCredentials->Flags);
 			CStoredCredentialManager* manager = CStoredCredentialManager::Instance();
-			manager->UpdateCredential(&(PrimaryCredentials->LogonId), &(PrimaryCredentials->Password));
-			
+			if (manager)
+			{
+				manager->UpdateCredential(&(PrimaryCredentials->LogonId), &(PrimaryCredentials->Password));
+			}
+		}
+		}
+		__except(EIDExceptionHandler(GetExceptionInformation()))
+		{
+			EIDCardLibraryTrace(WINEVENT_LEVEL_ERROR,L"NT exception in SpAcceptCredentials: 0x%08x",GetExceptionCode());
 		}
 		return STATUS_SUCCESS;
 	}

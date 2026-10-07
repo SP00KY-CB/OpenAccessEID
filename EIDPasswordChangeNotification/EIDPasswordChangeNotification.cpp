@@ -30,6 +30,9 @@ using LSA_IMPERSONATE_CLIENT = NTSTATUS (NTAPI)(VOID);
 using PLSA_IMPERSONATE_CLIENT = LSA_IMPERSONATE_CLIENT*;
 void SetImpersonate(PLSA_IMPERSONATE_CLIENT Impersonate);
 
+// Exported by OpenAccessEIDPackage.dll (see EIDResealStoredCredential there).
+using EIDResealStoredCredentialFn = BOOL (WINAPI*)(DWORD dwRid, PWSTR szPassword, USHORT usPasswordLen);
+
 NTSTATUS NTAPI Impersonate (VOID)
 {
 	return STATUS_SUCCESS;
@@ -84,13 +87,37 @@ NTSTATUS WINAPI PasswordChangeNotify(
 {
 	EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"Enter");
 	EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"Username %wZ RelativeId %d",UserName,RelativeId);
-	CStoredCredentialManager* manager = CStoredCredentialManager::Instance();
-	// A blank password arrives as Length 0 with a possibly NULL Buffer; there is
-	// nothing to re-seal (UpdateCredential refuses it) and passing it on used to
-	// crash LSASS in wcslen.
-	if (manager && NewPassword && NewPassword->Buffer && NewPassword->Length > 0)
+	// SAM calls this inside LSASS; Microsoft asks password filters not to let
+	// an exception escape (an unhandled one can fail security system-wide).
+	__try
 	{
-		manager->UpdateCredential(RelativeId, NewPassword->Buffer, NewPassword->Length);
+		// A blank password arrives as Length 0 with a possibly NULL Buffer; there is
+		// nothing to re-seal (UpdateCredential refuses it) and passing it on used to
+		// crash LSASS in wcslen.
+		if (NewPassword && NewPassword->Buffer && NewPassword->Length > 0)
+		{
+			// Re-seal through the authentication package when it is loaded, so
+			// this runs under the same lock as enrolment and removal there
+			// (this DLL has its own copy of the library, and its own lock).
+			HMODULE hPackage = GetModuleHandleW(L"OpenAccessEIDPackage.dll");
+			EIDResealStoredCredentialFn pfnReseal = hPackage ? reinterpret_cast<EIDResealStoredCredentialFn>(GetProcAddress(hPackage, "EIDResealStoredCredential")) : nullptr;  // NOSONAR - CAST-01: Win32 GetProcAddress cast
+			if (pfnReseal)
+			{
+				pfnReseal(RelativeId, NewPassword->Buffer, NewPassword->Length);
+			}
+			else
+			{
+				CStoredCredentialManager* manager = CStoredCredentialManager::Instance();
+				if (manager)
+				{
+					manager->UpdateCredential(RelativeId, NewPassword->Buffer, NewPassword->Length);
+				}
+			}
+		}
 	}
-	return TRUE;
+	__except(EIDExceptionHandler(GetExceptionInformation()))
+	{
+		EIDCardLibraryTrace(WINEVENT_LEVEL_ERROR,L"NT exception in PasswordChangeNotify: 0x%08x",GetExceptionCode());
+	}
+	return STATUS_SUCCESS;
 }

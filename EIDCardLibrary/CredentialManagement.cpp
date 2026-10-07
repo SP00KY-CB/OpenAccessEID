@@ -584,7 +584,7 @@ NTSTATUS CSecurityContext::BuildChallengeMessage(PSecBufferDesc Buffer)
 			CertFreeCertificateContext(pCertContext);
 			pCertContext = nullptr;
 		}
-		if (!manager->GetCertContextFromHash(Hash, &pCertContext, &dwRid))
+		if (!manager || !manager->GetCertContextFromHash(Hash, &pCertContext, &dwRid))
 		{
 			Status = SEC_E_UNKNOWN_CREDENTIALS;
 			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"SEC_E_UNKNOWN_CREDENTIALS");
@@ -770,7 +770,7 @@ NTSTATUS CSecurityContext::BuildResponseMessage(PSecBufferDesc Buffer)
 		return DeriveStatus;
 	}
 	CStoredCredentialManager* manager = CStoredCredentialManager::Instance();
-	const BOOL fSigned = manager->GetResponseFromSignatureChallenge(pbToSign, dwChallengeSize, pCertContext,_pCredential->_szPin, &pbResponse, &dwResponseSize);
+	const BOOL fSigned = manager && manager->GetResponseFromSignatureChallenge(pbToSign, dwChallengeSize, pCertContext,_pCredential->_szPin, &pbResponse, &dwResponseSize);
 	SecureZeroMemory(pbToSign, dwChallengeSize);
 	EIDFree(pbToSign);
 	if (!fSigned)
@@ -862,7 +862,7 @@ NTSTATUS CSecurityContext::BuildCompleteMessage(PSecBufferDesc Buffer)  // NOSON
 		return SEC_E_LOGON_DENIED;
 	}
 	CStoredCredentialManager* manager = CStoredCredentialManager::Instance();
-	const BOOL fVerified = manager->VerifySignatureChallengeResponse(dwRid, pbSigned, dwChallengeSize, pbResponse, dwResponseSize);
+	const BOOL fVerified = manager && manager->VerifySignatureChallengeResponse(dwRid, pbSigned, dwChallengeSize, pbResponse, dwResponseSize);
 	SecureZeroMemory(pbSigned, dwChallengeSize);
 	EIDFree(pbSigned);
 	if (!fVerified)
