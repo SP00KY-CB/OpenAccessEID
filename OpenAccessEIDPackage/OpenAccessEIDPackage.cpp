@@ -1247,6 +1247,18 @@ extern "C"
 			{
 				if(CredUnprotected != protectionType)  // NOSONAR - COMPLEXITY-01: nested if kept separate for clarity
 				{
+					// CredUnprotectW(FALSE) decrypts with this thread's context,
+					// which is LSASS's own SYSTEM context. Only LogonUI (through
+					// winlogon, a TCB caller) produces protected PINs; CredUI
+					// sends them in clear. Refuse a protected blob from any other
+					// caller so LSASS cannot be used to decrypt it for them.
+					SECPKG_CLIENT_INFO ClientInfo = {};
+					if (STATUS_SUCCESS != MyLsaDispatchTable->GetClientInfo(&ClientInfo) || !ClientInfo.HasTcbPrivilege)
+					{
+						EIDSecurityAudit(SECURITY_AUDIT_FAILURE, L"[AUTH_PIN_ERROR] Smart card logon refused: protected PIN from a caller without TCB privilege (PID %u)", ClientInfo.ProcessID);
+						Status = STATUS_ACCESS_DENIED;
+						__leave;
+					}
 					if (!CredUnprotectW(FALSE,pwzPin,UNLEN,pwzPinUncrypted,&dPinUncrypted))
 					{
 						EIDLogErrorWithContext("CredUnprotectW", HRESULT_FROM_WIN32(GetLastError()), nullptr);
@@ -1324,6 +1336,9 @@ extern "C"
 		// returns after GetPassword() succeeded left the plaintext Windows
 		// password both unwiped AND unfreed on the LSASS heap.
 		PWSTR szPassword = NULL;
+		// The __except below turns any exception into a failed logon, and LSA
+		// ignores the outputs of a failed logon, so it releases these itself.
+		BOOL fSessionCreated = FALSE;
 		__try
 		{
 		// INNER SEH - do not remove. This function has eighteen early `return`
@@ -1331,8 +1346,7 @@ extern "C"
 		// success path at the very bottom and in the __except. Every one of the
 		// other seventeen exits - including the ORDINARY WRONG-PIN PATH, which
 		// an attacker can drive at will - left the plaintext PIN sitting in
-		// these stack buffers. Tracing writes a MiniDumpNormal, which captures
-		// thread stacks, so that residue is reachable on disk.
+		// these stack buffers, where any later dump of LSASS would find it.
 		//
 		// A __finally runs on normal fallthrough, on `return` unwinding, and on
 		// __leave, so wiring the cleanup here covers all eighteen exits without
@@ -1588,6 +1602,7 @@ extern "C"
 				DWORD dwError = GetLastError();
 				EIDLogErrorWithContext("RetrieveStoredCredential", HRESULT_FROM_WIN32(dwError), nullptr);
 				MyLsaDispatchTable->FreeLsaHeap(MyTokenInformation);
+				MyTokenInformation = NULL;
 				switch(dwError)
 				{
 					case NTE_BAD_KEYSET_PARAM:
@@ -1633,6 +1648,7 @@ extern "C"
 			{
 				MyLsaDispatchTable->FreeLsaHeap (*TokenInformation);
 				*TokenInformation = NULL;
+				MyTokenInformation = NULL;
 				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"No Memory logon_id");
 				return STATUS_INSUFFICIENT_RESOURCES;
 			}
@@ -1642,31 +1658,62 @@ extern "C"
 			{
 				MyLsaDispatchTable->FreeLsaHeap (*TokenInformation);
 				*TokenInformation = NULL;
+				MyTokenInformation = NULL;
 				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"CreateLogonSession %d",Status);
 				return Status;
 			}
+			fSessionCreated = TRUE;
 			EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"CreateLogonSession OK");
 
 			// create profile
 
 			// undocumented feature : if this buffer (which is not mandatory) is not filled
 			// vista login WILL crash
+			*ProfileBuffer = NULL;
+			*ProfileBufferLength = 0;
 			Status = UserNameToProfile(*AccountName,(PLSA_DISPATCH_TABLE)MyLsaDispatchTable,
 						ClientRequest,(PEID_INTERACTIVE_PROFILE*)ProfileBuffer,ProfileBufferLength);
-			EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"ProfileBuffer OK Status = %d",Status);
-
-			// create primary credentials
-			PSID pSid = MyTokenInformation->User.User.Sid;
-			Status = CompletePrimaryCredential(*AuthenticatingAuthority,*AccountName,pSid,LogonId,szPassword,PrimaryCredentials);
-			EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"CompletePrimaryCredential OK Status = %d",Status);
-			*SupplementalCredentials = static_cast<PSECPKG_SUPPLEMENTAL_CRED_ARRAY>(EIDAlloc(sizeof(SECPKG_SUPPLEMENTAL_CRED_ARRAY)));
-			if (*SupplementalCredentials)
+			EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"ProfileBuffer Status = 0x%08X",Status);
+			if (Status == STATUS_SUCCESS)
 			{
-				(*SupplementalCredentials)->CredentialCount = 0;
+				// create primary credentials
+				PSID pSid = MyTokenInformation->User.User.Sid;
+				Status = CompletePrimaryCredential(*AuthenticatingAuthority,*AccountName,pSid,LogonId,szPassword,PrimaryCredentials);
+				EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"CompletePrimaryCredential Status = 0x%08X",Status);
+			}
+			if (Status == STATUS_SUCCESS)
+			{
+				*SupplementalCredentials = static_cast<PSECPKG_SUPPLEMENTAL_CRED_ARRAY>(EIDAlloc(sizeof(SECPKG_SUPPLEMENTAL_CRED_ARRAY)));
+				if (*SupplementalCredentials)
+				{
+					(*SupplementalCredentials)->CredentialCount = 0;
+				}
+				else
+				{
+					Status = STATUS_INSUFFICIENT_RESOURCES;
+				}
+			}
+			if (Status != STATUS_SUCCESS)
+			{
+				// A logon without a profile or without primary credentials is
+				// not usable (and the primary credentials are handed to every
+				// other package). Undo the session and the token.
+				EIDSecurityAudit(SECURITY_AUDIT_FAILURE, L"[AUTH_ERROR] Smart card logon failed for user '%wZ': could not build the logon profile or credentials (0x%08x)", *AccountName, Status);
+				if (*ProfileBuffer)
+				{
+					MyLsaDispatchTable->FreeClientBuffer(ClientRequest, *ProfileBuffer);
+					*ProfileBuffer = NULL;
+					*ProfileBufferLength = 0;
+				}
+				MyLsaDispatchTable->DeleteLogonSession(LogonId);
+				fSessionCreated = FALSE;
+				MyLsaDispatchTable->FreeLsaHeap(*TokenInformation);
+				*TokenInformation = NULL;
+				MyTokenInformation = NULL;
+				return Status;
 			}
 			// szPassword is wiped and freed by the __finally below, on this path
 			// and on every other exit.
-			Status = STATUS_SUCCESS;
 
 			// Log successful authentication to both ETW and CSV
 			EIDSecurityAudit(SECURITY_AUDIT_SUCCESS, L"[AUTH_SUCCESS] Smart card logon succeeded for user '%wZ'", *AccountName);
@@ -1731,9 +1778,20 @@ extern "C"
 		__except(EIDExceptionHandler(GetExceptionInformation()))
 		{
 			// The inner __finally has already wiped the PIN and password by the
-			// time this runs.
+			// time this runs (the filter no longer writes a dump; fatal codes
+			// such as access violations are not handled here at all).
 			EIDCardLibraryTrace(WINEVENT_LEVEL_ERROR,L"NT exception in LsaApLogonUserEx2: 0x%08x",GetExceptionCode());
 			EIDLogStackTrace(GetExceptionCode());
+			if (fSessionCreated)
+			{
+				MyLsaDispatchTable->DeleteLogonSession(LogonId);
+			}
+			if (MyTokenInformation)
+			{
+				MyLsaDispatchTable->FreeLsaHeap(MyTokenInformation);
+				MyTokenInformation = NULL;
+			}
+			*TokenInformation = NULL;
 			return STATUS_LOGON_FAILURE;
 		}
 	}

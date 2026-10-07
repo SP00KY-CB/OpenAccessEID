@@ -197,98 +197,54 @@ void EIDCardLibraryTraceEx(LPCSTR szFile, DWORD dwLine, LPCSTR szFunction, UCHAR
 }
 
 
+	// Exception codes that mean memory is already corrupt or the thread can no
+	// longer run safely. Inside LSASS these must not be swallowed: carrying on
+	// after a fault lets a caller probe the fault again and again without the
+	// machine restarting, and leaves heap and loader locks in an unknown state.
+	static BOOL EIDIsFatalException(DWORD dwCode)
+	{
+		switch (dwCode)
+		{
+		case EXCEPTION_ACCESS_VIOLATION:
+		case EXCEPTION_IN_PAGE_ERROR:
+		case EXCEPTION_ILLEGAL_INSTRUCTION:
+		case EXCEPTION_PRIV_INSTRUCTION:
+		case EXCEPTION_DATATYPE_MISALIGNMENT:
+		case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:
+		case EXCEPTION_STACK_OVERFLOW:
+		case EXCEPTION_GUARD_PAGE:
+		case 0xC0000374: // STATUS_HEAP_CORRUPTION
+		case 0xC0000409: // STATUS_STACK_BUFFER_OVERRUN
+			return TRUE;
+		default:
+			return FALSE;
+		}
+	}
+
 	// common exception handler
+	//
+	// This used to write a MiniDumpNormal from inside the filter. A filter runs
+	// before unwinding, so the dump caught the plaintext PIN still on the
+	// LsaApLogonUserEx2 stack (the wipe is in a __finally that runs later); it
+	// also called MiniDumpWriteDump in-process, which can deadlock on the
+	// loader or heap lock held at the fault, and wrote one file per exception
+	// with no limit. LSASS crash dumps are left to Windows Error Reporting
+	// (LocalDumps), which an administrator can turn on when needed.
 	LONG EIDExceptionHandlerDebug( PEXCEPTION_POINTERS pExceptPtrs, BOOL fMustCrash )
 	{
-		EIDCardLibraryTraceEx(__FILE__,__LINE__,__FUNCTION__,WINEVENT_LEVEL_WARNING,L"New Exception");  // NOSONAR - LOG-01: __FILE__ retained for logging macro
+		DWORD dwCode = (pExceptPtrs && pExceptPtrs->ExceptionRecord) ? pExceptPtrs->ExceptionRecord->ExceptionCode : 0;
+		EIDCardLibraryTraceEx(__FILE__,__LINE__,__FUNCTION__,WINEVENT_LEVEL_WARNING,L"New Exception 0x%08X", dwCode);  // NOSONAR - LOG-01: __FILE__ retained for logging macro
 		if (fMustCrash)
 		{
 			// crash on debug to allow kernel debugger to break where the exception was triggered
 			return EXCEPTION_CONTINUE_SEARCH;
 		}
-		else
+		if (EIDIsFatalException(dwCode))
 		{
-			// may contain sensitive information - generate a dump only if the debugging is active
-			if (IsTracingEnabled)
-			{
-				// The dump of LSASS can hold PIN/password residue, so it is never
-				// written to a world-readable location (it used to go to
-				// c:\EIDAuthenticateDump.dmp, then %TEMP%, with default security).
-				// It goes only into the product directory, and only when that
-				// directory is a real, SYSTEM/Administrators-owned directory with
-				// the protected DACL; the file itself gets a protected DACL for
-				// SYSTEM and Administrators only, a unique name, CREATE_NEW and
-				// FILE_FLAG_OPEN_REPARSE_POINT so nothing pre-planted is followed
-				// or overwritten.
-				HANDLE fileHandle = INVALID_HANDLE_VALUE;  // NOSONAR - EXPLICIT-TYPE-02: HANDLE visible for security audit
-				wchar_t szFileName[MAX_PATH];  // NOSONAR - LSASS-01: C-style buffer for LSASS safety
-				SYSTEMTIME stNow;
-				SECURITY_ATTRIBUTES saDump;
-				PSECURITY_DESCRIPTOR pDumpSD = nullptr;
-				GetSystemTime(&stNow);
-				if (!EnsureLogDirSecured(EID_CSV_CONFIG_DIR))
-				{
-					EIDCardLibraryTraceEx(__FILE__,__LINE__,__FUNCTION__,WINEVENT_LEVEL_WARNING,L"Dump directory is missing or not trusted - no minidump written");  // NOSONAR - LOG-01: __FILE__ retained for logging macro
-				}
-				else if (_snwprintf_s(szFileName, ARRAYSIZE(szFileName), _TRUNCATE,
-						L"%s\\EIDAuthenticateDump-%04u%02u%02u-%02u%02u%02u%03u-%lu-%lu.dmp", EID_CSV_CONFIG_DIR,
-						stNow.wYear, stNow.wMonth, stNow.wDay, stNow.wHour, stNow.wMinute, stNow.wSecond, stNow.wMilliseconds,
-						GetCurrentProcessId(), GetCurrentThreadId()) < 0)
-				{
-					EIDCardLibraryTraceEx(__FILE__,__LINE__,__FUNCTION__,WINEVENT_LEVEL_WARNING,L"Dump file name too long - no minidump written");  // NOSONAR - LOG-01: __FILE__ retained for logging macro
-				}
-				else if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(A;;FA;;;SY)(A;;FA;;;BA)", SDDL_REVISION_1, &pDumpSD, nullptr))
-				{
-					EIDCardLibraryTraceEx(__FILE__,__LINE__,__FUNCTION__,WINEVENT_LEVEL_WARNING,L"Unable to build the dump file security descriptor 0x%08X - no minidump written", GetLastError());  // NOSONAR - LOG-01: __FILE__ retained for logging macro
-				}
-				else
-				{
-					saDump.nLength = sizeof(saDump);
-					saDump.lpSecurityDescriptor = pDumpSD;
-					saDump.bInheritHandle = FALSE;
-					fileHandle = CreateFileW(szFileName, GENERIC_WRITE, 0, &saDump, CREATE_NEW,
-						FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
-					if (fileHandle != INVALID_HANDLE_VALUE)
-					{
-						EIDCardLibraryTraceEx(__FILE__,__LINE__,__FUNCTION__,WINEVENT_LEVEL_WARNING,L"Writing minidump file %s",szFileName);  // NOSONAR - LOG-01: __FILE__ retained for logging macro
-					}
-					LocalFree(pDumpSD);
-					pDumpSD = nullptr;
-				}
-				if (fileHandle == INVALID_HANDLE_VALUE)
-				{
-					EIDCardLibraryTraceEx(__FILE__,__LINE__,__FUNCTION__,WINEVENT_LEVEL_WARNING,L"Unable to create minidump file 0x%08X", GetLastError());  // NOSONAR - LOG-01: __FILE__ retained for logging macro
-				}
-				else
-				{
-					_MINIDUMP_EXCEPTION_INFORMATION dumpExceptionInfo;
-					dumpExceptionInfo.ThreadId = GetCurrentThreadId();
-					dumpExceptionInfo.ExceptionPointers = pExceptPtrs;
-					dumpExceptionInfo.ClientPointers = FALSE;
-
-					// SECURITY FIX: Use MiniDumpNormal instead of MiniDumpWithFullMemory
-					// MiniDumpWithFullMemory captures all process memory including secrets like:
-					// - Plaintext passwords and PINs
-					// - Cryptographic keys
-					// - Session tokens
-					// This was a critical security vulnerability (CWE-532)
-					// MiniDumpNormal captures only essential debugging info without sensitive data
-					BOOL fStatus = MiniDumpWriteDump(GetCurrentProcess(),
-										GetCurrentProcessId(),
-										fileHandle, MiniDumpNormal, (pExceptPtrs != nullptr) ? &dumpExceptionInfo : nullptr, nullptr, nullptr);
-					if (!fStatus)  // NOSONAR - COMPLEXITY-01: nesting and local declaration retained; logic verified
-					{
-						EIDCardLibraryTraceEx(__FILE__,__LINE__,__FUNCTION__,WINEVENT_LEVEL_WARNING,L"Unable to write minidump file 0x%08X", GetLastError());  // NOSONAR - LOG-01: __FILE__ retained for logging macro
-					}
-					else
-					{
-						EIDCardLibraryTraceEx(__FILE__,__LINE__,__FUNCTION__,WINEVENT_LEVEL_WARNING,L"minidump successfully created");  // NOSONAR - LOG-01: __FILE__ retained for logging macro
-					}
-					CloseHandle(fileHandle);
-				}
-			}
-			return EXCEPTION_EXECUTE_HANDLER;
+			// Let it reach the process's unhandled-exception path (and WER).
+			return EXCEPTION_CONTINUE_SEARCH;
 		}
+		return EXCEPTION_EXECUTE_HANDLER;
 	}
 
 	LONG EIDExceptionHandler( PEXCEPTION_POINTERS pExceptPtrs )

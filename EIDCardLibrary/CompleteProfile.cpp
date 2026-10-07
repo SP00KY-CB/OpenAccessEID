@@ -75,9 +75,14 @@ NTSTATUS UserNameToProfile(__in PLSA_UNICODE_STRING AccountName,  // NOSONAR - A
 	wcsncpy_s(UserName,ARRAYSIZE(UserName),AccountName->Buffer,AccountName->Length/2);
 	UserName[AccountName->Length/2]=0;
 	dwSize = ARRAYSIZE(DomainName);
-	GetComputerNameW(DomainName, &dwSize);
-	// fill info into a dummy structure
+	if (!GetComputerNameW(DomainName, &dwSize))
+	{
+		DomainName[0] = 0;
+	}
+	// fill info into a dummy structure. Zeroed so the padding between the
+	// members, which is copied to the client as is, carries no LSASS stack bytes.
 	EID_INTERACTIVE_PROFILE MyProfileBuffer;
+	SecureZeroMemory(&MyProfileBuffer, sizeof(MyProfileBuffer));
 	MyProfileBuffer.MessageType = EIDInteractiveProfile;
 	PUSER_INFO_4 pUserInfo = nullptr;
 	Status=NetUserGetInfo(nullptr, UserName, 4, (LPBYTE*)&pUserInfo);
@@ -134,6 +139,7 @@ NTSTATUS UserNameToProfile(__in PLSA_UNICODE_STRING AccountName,  // NOSONAR - A
 	if (Status)
 	{
 		EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"AllocateClientBuffer failed: 0x%08lx\n", Status);
+		NetApiBufferFree(pUserInfo);
 		if (ProfileBufferLength) *ProfileBufferLength=0;
 		return Status;
 	}
