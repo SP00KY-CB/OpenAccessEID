@@ -85,40 +85,11 @@ std::string EID_CSV_ConfigToJson(const EID_CSV_CONFIG& config)
 //
 // Constrain it to the product's own directory. Anything else - UNC, device
 // namespace, drive-relative, or traversal - is refused and the default kept.
+// The rules live in LogDirSecurity.h (EID_IsAcceptableLogPath), shared with the
+// EIDTraceConsumer service, which reads the same registry and policy values.
 static bool EID_CSV_IsAcceptableLogPath(const std::wstring& wsPath)
 {
-    if (wsPath.empty() || wsPath.length() >= MAX_PATH)
-    {
-        return false;
-    }
-    // UNC (\\server\share) and the device namespaces (\\?\ , \\.\).
-    if (wsPath.compare(0, 2, L"\\\\") == 0)
-    {
-        return false;
-    }
-    // Traversal in any form, and alternate data streams.
-    if (wsPath.find(L"..") != std::wstring::npos || wsPath.find(L'/') != std::wstring::npos)
-    {
-        return false;
-    }
-    // Must be a fully qualified path on a local drive: X:\...
-    if (wsPath.length() < 4 || wsPath[1] != L':' || wsPath[2] != L'\\')
-    {
-        return false;
-    }
-    // A colon anywhere after the drive letter would be an ADS.
-    if (wsPath.find(L':', 2) != std::wstring::npos)
-    {
-        return false;
-    }
-    // Must sit under the product's own config directory.
-    const std::wstring wsRoot = std::wstring(EID_CSV_CONFIG_DIR) + L"\\";
-    if (wsPath.length() <= wsRoot.length() ||
-        _wcsnicmp(wsPath.c_str(), wsRoot.c_str(), wsRoot.length()) != 0)
-    {
-        return false;
-    }
-    return true;
+    return wsPath.length() < MAX_PATH && EID_IsAcceptableLogPath(wsPath.c_str());
 }
 
 // ================================================================
@@ -228,33 +199,97 @@ HRESULT EID_CSV_JsonToConfig(const std::string& json, EID_CSV_CONFIG& config)
 // ================================================================
 // Load configuration from file
 // ================================================================
+// TRUE when no one but SYSTEM and Administrators may change the file: no allow ACE
+// for any other SID carries a write, append, delete or permission-change right.
+static bool EID_CSV_OnlyAdminsCanWrite(HANDLE hFile)
+{
+    PACL pDacl = nullptr;
+    PSECURITY_DESCRIPTOR pSD = nullptr;
+    if (GetSecurityInfo(hFile, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+            nullptr, nullptr, &pDacl, nullptr, &pSD) != ERROR_SUCCESS)
+    {
+        return false;
+    }
+    // A NULL DACL grants everyone everything.
+    bool fOnlyAdmins = (pDacl != nullptr);
+    const ACCESS_MASK maskWrite = FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES |
+        DELETE | WRITE_DAC | WRITE_OWNER | GENERIC_WRITE | GENERIC_ALL;
+    for (DWORD i = 0; fOnlyAdmins && i < pDacl->AceCount; i++)
+    {
+        PACE_HEADER pHeader = nullptr;
+        if (!GetAce(pDacl, i, reinterpret_cast<LPVOID*>(&pHeader)) || !pHeader)
+        {
+            fOnlyAdmins = false;
+            break;
+        }
+        if (pHeader->AceType != ACCESS_ALLOWED_ACE_TYPE)
+        {
+            continue;
+        }
+        const ACCESS_ALLOWED_ACE* pAce = reinterpret_cast<const ACCESS_ALLOWED_ACE*>(pHeader);
+        PSID pSid = const_cast<PSID>(static_cast<const void*>(&pAce->SidStart));
+        if ((pAce->Mask & maskWrite) != 0 &&
+            !(IsValidSid(pSid) && (IsWellKnownSid(pSid, WinLocalSystemSid) || IsWellKnownSid(pSid, WinBuiltinAdministratorsSid))))
+        {
+            fOnlyAdmins = false;
+        }
+    }
+    LocalFree(pSD);
+    return fOnlyAdmins;
+}
+
 HRESULT EID_CSV_LoadConfigFromFile(PCWSTR pwszPath, EID_CSV_CONFIG& config)
 {
-    // Check if file exists
-    DWORD dwAttrib = GetFileAttributesW(pwszPath);
-    if (dwAttrib == INVALID_FILE_ATTRIBUTES)  // NOSONAR - SCOPE-01: declaration kept at function scope for clarity
-        return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
-
-    // Read file content
-    std::wstring wpath(pwszPath);
-    std::string utf8Path = WideToUtf8(wpath);
-
-    std::ifstream file(utf8Path, std::ios::binary);
-    if (!file.is_open())
-        return HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED);
+    // Open once, without following links, and check and read through that one
+    // handle: it is not a reparse point, it is owned by SYSTEM/Administrators, it
+    // has a single link (a hard link to some user-writable file would pass the
+    // owner check) and only SYSTEM/Administrators may write it. The file used to
+    // be checked by path and then read by path.
+    HANDLE hFile = CreateFileW(pwszPath, GENERIC_READ | READ_CONTROL, FILE_SHARE_READ, nullptr,
+        OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE)
+    {
+        const DWORD dwError = GetLastError();
+        return HRESULT_FROM_WIN32(dwError == ERROR_PATH_NOT_FOUND ? ERROR_FILE_NOT_FOUND : dwError);
+    }
 
     std::string content;
-    try
+    HRESULT hrRead = S_OK;
+    BY_HANDLE_FILE_INFORMATION info = {};
+    LARGE_INTEGER liSize = {};
+    // logging.json is a few hundred bytes; refuse anything absurd.
+    constexpr LONGLONG cbMaxConfig = 64 * 1024;
+    if (!GetFileInformationByHandle(hFile, &info) || info.nNumberOfLinks != 1 ||
+        !EID_IsAdminOwnedNonReparseHandle(hFile) || !EID_CSV_OnlyAdminsCanWrite(hFile))
     {
-        content.assign(std::istreambuf_iterator<char>(file),
-                      std::istreambuf_iterator<char>());
+        EIDCardLibraryTrace(WINEVENT_LEVEL_ERROR,
+            L"[CONFIG_REJECT] logging.json is linked elsewhere, not owned by SYSTEM/Administrators, or writable by other users; ignored");
+        hrRead = HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED);
     }
-    catch (...)  // NOSONAR - EXCEPTION-01: catch-all is intentional guard
+    else if (!GetFileSizeEx(hFile, &liSize) || liSize.QuadPart < 0 || liSize.QuadPart > cbMaxConfig)
     {
-        file.close();
-        return E_FAIL;
+        hrRead = HRESULT_FROM_WIN32(ERROR_FILE_TOO_LARGE);
     }
-    file.close();
+    else
+    {
+        try
+        {
+            content.resize(static_cast<size_t>(liSize.QuadPart));
+        }
+        catch (...)  // NOSONAR - EXCEPTION-01: catch-all is intentional guard
+        {
+            hrRead = E_OUTOFMEMORY;
+        }
+        DWORD cbRead = 0;
+        if (SUCCEEDED(hrRead) && !content.empty() &&
+            (!ReadFile(hFile, content.data(), static_cast<DWORD>(content.size()), &cbRead, nullptr) || cbRead != content.size()))
+        {
+            hrRead = E_FAIL;
+        }
+    }
+    CloseHandle(hFile);
+    if (FAILED(hrRead))
+        return hrRead;
 
     // Parse JSON.
     //
@@ -663,6 +698,16 @@ HRESULT EID_CSV_LoadConfig(EID_CSV_CONFIG& config)
 
     // Group Policy overrides win over local file/registry config.
     EID_CSV_ApplyPolicyOverrides(config);
+
+    // The log path decides which directory a SYSTEM writer re-secures, renames in
+    // and deletes from. Only logging.json used to be held to the product directory;
+    // a CSVLogPath from the registry or from policy is held to it too.
+    if (config.szLogPath[0] != L'\0' && !EID_CSV_IsAcceptableLogPath(std::wstring(config.szLogPath)))
+    {
+        EIDCardLibraryTrace(WINEVENT_LEVEL_ERROR,
+            L"[CONFIG_REJECT] CSVLogPath is not inside %s; using the default log path", EID_CSV_CONFIG_DIR);
+        wcscpy_s(config.szLogPath, EID_CSV_DEFAULT_LOG_PATH);
+    }
     return hr;
 }
 

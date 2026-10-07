@@ -38,6 +38,27 @@ EID_CSV_CONFIG EIDCSVLogger::s_config;
 DWORD EIDCSVLogger::s_dwCurrentFileSize = 0;
 WCHAR EIDCSVLogger::s_szCurrentLogPath[MAX_PATH] = {0};  // NOSONAR - LSASS-01: C-style buffer for LSASS safety
 BOOL EIDCSVLogger::s_fHeaderWritten = FALSE;
+ULONGLONG EIDCSVLogger::s_ullOpenRetryTick = 0;
+ULONGLONG EIDCSVLogger::s_ullRotateRetryTick = 0;
+
+// How long to wait before trying again to open or rotate the log after a failure.
+static constexpr ULONGLONG EID_CSV_RETRY_INTERVAL_MS = 60 * 1000;
+
+// TRUE while the calling thread impersonates someone (in LSASS: the logon caller).
+// File work done then - creating, renaming or deleting log files, re-applying the
+// directory DACL - would run with the caller's rights, fail, and used to turn file
+// logging off for the life of the process. A thread whose token cannot be opened
+// at all counts as impersonating.
+static BOOL EIDIsThreadImpersonating()
+{
+    HANDLE hToken = nullptr;
+    if (OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &hToken))
+    {
+        CloseHandle(hToken);
+        return TRUE;
+    }
+    return GetLastError() != ERROR_NO_TOKEN;
+}
 
 // ================================================================
 // BUG 7: Thread-safe one-time creation of the logger critical section.
@@ -158,8 +179,8 @@ void EIDCSVLogger::RotateLogFile()
     if (!EID_IsLogDirSafeForRotation(s_szCurrentLogPath))
     {
         EIDCardLibraryTrace(WINEVENT_LEVEL_ERROR,
-            L"[CONFIG_REJECT] log directory is a reparse point or not owned by SYSTEM/Administrators; CSV file logging disabled");
-        s_config.fEnabled = FALSE;
+            L"[CONFIG_REJECT] log directory is a reparse point or not owned by SYSTEM/Administrators; CSV file logging suspended");
+        s_ullOpenRetryTick = GetTickCount64() + EID_CSV_RETRY_INTERVAL_MS;
         return;
     }
 
@@ -235,7 +256,13 @@ void EIDCSVLogger::RotateLogFile()
         else
         {
             EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING, L"cannot rename the live log (0x%08x) - rotation stopped", GetLastError());
+            // Keep appending to the live file, but do not retry on every row.
+            s_ullRotateRetryTick = GetTickCount64() + EID_CSV_RETRY_INTERVAL_MS;
         }
+    }
+    else
+    {
+        s_ullRotateRetryTick = GetTickCount64() + EID_CSV_RETRY_INTERVAL_MS;
     }
 
     // Open new file
@@ -249,6 +276,13 @@ BOOL EIDCSVLogger::EnsureLogFileOpen()
 {
     if (s_hLogFile != INVALID_HANDLE_VALUE)
         return TRUE;
+
+    // After a failure, wait before trying again rather than giving up for good.
+    if (GetTickCount64() < s_ullOpenRetryTick)
+    {
+        SetLastError(ERROR_RETRY);
+        return FALSE;
+    }
 
     // Create directory if needed
     WCHAR szDir[MAX_PATH];  // NOSONAR - LSASS-01: C-style buffer for LSASS safety
@@ -265,8 +299,8 @@ BOOL EIDCSVLogger::EnsureLogFileOpen()
         if (!EnsureLogDirSecured(szDir))
         {
             EIDCardLibraryTrace(WINEVENT_LEVEL_ERROR,
-                L"[CONFIG_REJECT] log directory is a reparse point or not owned by SYSTEM/Administrators; CSV file logging disabled");
-            s_config.fEnabled = FALSE;
+                L"[CONFIG_REJECT] log directory is a reparse point or not owned by SYSTEM/Administrators; CSV file logging suspended");
+            s_ullOpenRetryTick = GetTickCount64() + EID_CSV_RETRY_INTERVAL_MS;
             SetLastError(ERROR_ACCESS_DENIED);
             return FALSE;
         }
@@ -297,7 +331,12 @@ BOOL EIDCSVLogger::EnsureLogFileOpen()
     );
 
     if (s_hLogFile == INVALID_HANDLE_VALUE)
+    {
+        const DWORD dwOpenError = GetLastError();
+        s_ullOpenRetryTick = GetTickCount64() + EID_CSV_RETRY_INTERVAL_MS;
+        SetLastError(dwOpenError);
         return FALSE;
+    }
 
     // Get current file size
     LARGE_INTEGER liSize;
@@ -322,6 +361,34 @@ BOOL EIDCSVLogger::EnsureLogFileOpen()
     }
 
     return TRUE;
+}
+
+// ================================================================
+// Helper: is the open handle still the file at the live log path?
+// Several loggers share events.csv (this package, the password filter, LogonUI),
+// each with its own handle. When another one rotates, this handle follows the
+// renamed file (FILE_SHARE_DELETE) and would go on writing into an old, finally
+// deleted, generation. Compare file identities and reopen when they differ.
+// ================================================================
+BOOL EIDCSVLogger::IsHandleStillLiveFile()
+{
+    if (s_hLogFile == INVALID_HANDLE_VALUE)
+        return FALSE;
+    BY_HANDLE_FILE_INFORMATION infoOpen = {};
+    if (!GetFileInformationByHandle(s_hLogFile, &infoOpen))
+        return FALSE;
+    HANDLE hLive = CreateFileW(s_szCurrentLogPath, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+        FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (hLive == INVALID_HANDLE_VALUE)
+        return FALSE;
+    BY_HANDLE_FILE_INFORMATION infoLive = {};
+    const BOOL fSame = GetFileInformationByHandle(hLive, &infoLive)
+        && infoLive.dwVolumeSerialNumber == infoOpen.dwVolumeSerialNumber
+        && infoLive.nFileIndexHigh == infoOpen.nFileIndexHigh
+        && infoLive.nFileIndexLow == infoOpen.nFileIndexLow;
+    CloseHandle(hLive);
+    return fSame;
 }
 
 // ================================================================
@@ -365,6 +432,14 @@ HRESULT EIDCSVLogger::Initialize(const EID_CSV_CONFIG& config)
         // Reset state
         s_dwCurrentFileSize = 0;
         s_fHeaderWritten = FALSE;
+        s_ullOpenRetryTick = 0;
+        s_ullRotateRetryTick = 0;
+
+        // Initialisation can run on the first row LSASS writes, which may be written
+        // while impersonating the logon caller. Leave the file closed then; the next
+        // row written as ourselves opens it.
+        if (EIDIsThreadImpersonating())
+            return S_OK;
 
         // Open log file
         if (!EnsureLogFileOpen())
@@ -422,6 +497,8 @@ HRESULT EIDCSVLogger::UpdateConfig(const EID_CSV_CONFIG& config)
             wcscpy_s(s_szCurrentLogPath, config.szLogPath[0] ? config.szLogPath : EID_CSV_DEFAULT_LOG_PATH);
             s_dwCurrentFileSize = 0;
             s_fHeaderWritten = FALSE;
+            s_ullOpenRetryTick = 0;
+            s_ullRotateRetryTick = 0;
             if (!EnsureLogFileOpen())
                 return HRESULT_FROM_WIN32(GetLastError());
         }
@@ -457,7 +534,9 @@ EID_CSV_CONFIG EIDCSVLogger::GetConfig()
 // ================================================================
 BOOL EIDCSVLogger::IsEnabled()
 {
-    return s_config.fEnabled && s_hLogFile != INVALID_HANDLE_VALUE;
+    // Not tied to an open handle any more: a closed log is reopened by LogEvent
+    // (after the retry interval), so one failure no longer stops file logging.
+    return s_config.fEnabled && s_csInitialized;
 }
 
 // ================================================================
@@ -486,17 +565,39 @@ void EIDCSVLogger::LogEvent(  // NOSONAR - COMPLEXITY-01: refactor deferred; log
 
     __try
     {
-        // Ensure file is open
-        if (!EnsureLogFileOpen())
-            __leave;
-
-        // Check file rotation
-        ULONGLONG ullMaxBytes = static_cast<ULONGLONG>(s_config.dwMaxFileSizeMB) * 1024 * 1024;
-        if (s_dwCurrentFileSize >= ullMaxBytes)  // NOSONAR - SCOPE-01: declaration kept separate from if for readability
+        if (EIDIsThreadImpersonating())
         {
-            RotateLogFile();
+            // Writing through an open handle does not depend on the thread token, but
+            // opening, rotating or re-securing does: leave all of that to the next row
+            // written as ourselves. With no open handle the row is dropped.
+            if (s_hLogFile == INVALID_HANDLE_VALUE)
+                __leave;
+        }
+        else
+        {
+            // Another logger may have rotated the file under this handle.
+            if (s_hLogFile != INVALID_HANDLE_VALUE && !IsHandleStillLiveFile())
+            {
+                CloseHandle(s_hLogFile);
+                s_hLogFile = INVALID_HANDLE_VALUE;
+                s_fHeaderWritten = FALSE;
+            }
+
+            // Ensure file is open
             if (!EnsureLogFileOpen())
                 __leave;
+
+            // Check file rotation. The size comes from the file itself (shared with the
+            // other loggers, and 64-bit: the old DWORD counter wrapped at 4 GB).
+            const ULONGLONG ullMaxBytes = static_cast<ULONGLONG>(s_config.dwMaxFileSizeMB) * 1024 * 1024;
+            LARGE_INTEGER liSize = {};
+            const ULONGLONG ullSize = GetFileSizeEx(s_hLogFile, &liSize) ? static_cast<ULONGLONG>(liSize.QuadPart) : s_dwCurrentFileSize;
+            if (ullSize >= ullMaxBytes && GetTickCount64() >= s_ullRotateRetryTick)
+            {
+                RotateLogFile();
+                if (!EnsureLogFileOpen())
+                    __leave;
+            }
         }
 
         // Stack-allocated buffer for building log line

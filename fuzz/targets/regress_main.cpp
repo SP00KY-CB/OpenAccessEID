@@ -41,6 +41,7 @@
 #include "EIDCardLibrary.h"
 #include "StoredCredentialManagement.h"
 #include "InputValidation.h"
+#include "LogDirSecurity.h"
 
 namespace {
 
@@ -480,28 +481,20 @@ void TestPrivateData()
 // additionally drives EnsureLogDirSecured, which rewrites a directory's DACL
 // as SYSTEM, so an unconstrained path there is an arbitrary-ACL rewrite.
 //
-// Reimplemented here rather than linked: CSVConfig.cpp pulls in the tracing and
-// JSON machinery, which the standalone harness cannot host. These assert the
-// RULES, so a future divergence in the real loader shows up as a review
-// mismatch rather than passing silently.
+// The rotation clamp is reimplemented here rather than linked: CSVConfig.cpp pulls
+// in the tracing and JSON machinery, which the standalone harness cannot host. The
+// log path rule is the real one (EID_IsAcceptableLogPath in LogDirSecurity.h, a
+// self-contained header), shared by CSVConfig.cpp and EIDTraceConsumer.
 //-------------------------------------------------------------------------
 DWORD ClampRotation(long long llValue)
 {
 	return (llValue < 1) ? 1 : (llValue > 100 ? 100 : static_cast<DWORD>(llValue));
 }
 
-// Mirror of EID_CSV_IsAcceptableLogPath in CSVConfig.cpp. Keep in step with it.
+// EID_CSV_IsAcceptableLogPath in CSVConfig.cpp is this, plus a MAX_PATH bound.
 bool IsAcceptableLogPathRule(const std::wstring& wsPath)
 {
-	if (wsPath.empty() || wsPath.length() >= MAX_PATH) return false;
-	if (wsPath.compare(0, 2, L"\\\\") == 0) return false;
-	if (wsPath.find(L"..") != std::wstring::npos || wsPath.find(L'/') != std::wstring::npos) return false;
-	if (wsPath.length() < 4 || wsPath[1] != L':' || wsPath[2] != L'\\') return false;
-	if (wsPath.find(L':', 2) != std::wstring::npos) return false;
-	const std::wstring wsRoot = L"C:\\ProgramData\\OpenAccessEID\\";
-	if (wsPath.length() <= wsRoot.length() ||
-		_wcsnicmp(wsPath.c_str(), wsRoot.c_str(), wsRoot.length()) != 0) return false;
-	return true;
+	return wsPath.length() < MAX_PATH && EID_IsAcceptableLogPath(wsPath.c_str()) != FALSE;
 }
 
 void TestConfigLoader()
@@ -541,6 +534,7 @@ void TestConfigLoader()
 		L"C:\\ProgramData\\OpenAccessEIDEvil\\x.csv",      // prefix look-alike
 		L"x.csv",                                              // relative
 		L"C:\\ProgramData\\OpenAccessEID\\x.csv:ads",      // alternate data stream
+		L"C:\\ProgramData\\OpenAccessEID",                  // the directory itself
 	};
 	bool fRejectsOk = true;
 	for (size_t i = 0; i < ARRAYSIZE(rgBad); i++)
@@ -550,6 +544,15 @@ void TestConfigLoader()
 			printf("  FAIL  logPath accepted but should be refused: '%ls'\n", rgBad[i]);
 			fRejectsOk = false;
 		}
+	}
+	// A path with no room left for ".NNN" or "diagnostics.log" (string functions
+	// in the trace consumer used to abort the service on it).
+	std::wstring wsLong = L"C:\\ProgramData\\OpenAccessEID\\";
+	wsLong.append(MAX_PATH - wsLong.length() - 10, L'a');
+	if (IsAcceptableLogPathRule(wsLong))
+	{
+		printf("  FAIL  logPath with no room for rotation suffixes accepted\n");
+		fRejectsOk = false;
 	}
 	CheckAccepted("config: hostile logPath values refused", fRejectsOk);
 

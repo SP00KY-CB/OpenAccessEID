@@ -50,9 +50,14 @@ private:
     static DWORD s_dwCurrentFileSize;
     static WCHAR s_szCurrentLogPath[MAX_PATH];  // NOSONAR - LSASS-01: C-style buffer for LSASS safety
     static BOOL s_fHeaderWritten;
+    // GetTickCount64 values before which opening, or rotating, the log is not
+    // retried after a failure (a failure no longer turns file logging off for good).
+    static ULONGLONG s_ullOpenRetryTick;
+    static ULONGLONG s_ullRotateRetryTick;
 
     // Private helper methods
     static BOOL EnsureLogFileOpen();
+    static BOOL IsHandleStillLiveFile();
     static void RotateLogFile();
     static void WriteCSVHeader();
     static BOOL IsEventEnabled(EID_EVENT_ID eventId, EID_SEVERITY severity);

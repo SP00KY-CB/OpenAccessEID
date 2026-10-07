@@ -733,12 +733,9 @@ VOID EIDDebugPrintEIDUnlockLogonStruct(UCHAR dwLevel, PEID_INTERACTIVE_UNLOCK_LO
 	EIDCardLibraryTrace(dwLevel,L"LogonDomainName %d",pUnlockLogon->Logon.LogonDomainName.Length);
 	TraceCountedString(L"LogonDomainName", pUnlockLogon->Logon.LogonDomainName.Buffer, pUnlockLogon->Logon.LogonDomainName.Length);
 
-	// The PIN is copied but deliberately never traced.
-	EIDCardLibraryTrace(dwLevel,L"Pin %d",pUnlockLogon->Logon.Pin.Length);
-	if (pUnlockLogon->Logon.Pin.Buffer == nullptr)
-	{
-		EIDCardLibraryTrace(dwLevel,L"No Pin");
-	}
+	// The PIN is copied but deliberately never traced - nor its length, which
+	// narrows a guess and used to reach diagnostics.log at VERBOSE.
+	EIDCardLibraryTrace(dwLevel,L"Pin %s",(pUnlockLogon->Logon.Pin.Buffer && pUnlockLogon->Logon.Pin.Length) ? L"present" : L"absent");
 
 	EIDCardLibraryTrace(dwLevel,L"Flags %d",pUnlockLogon->Logon.Flags);
 	EIDCardLibraryTrace(dwLevel,L"MessageType %d",pUnlockLogon->Logon.MessageType);

@@ -93,6 +93,9 @@ BOOL g_fCsvEnabled = FALSE;  // NOSONAR - GLOBAL-01: runtime-mutable service sta
 HANDLE g_hDiagFile = INVALID_HANDLE_VALUE;  // NOSONAR - GLOBAL-01: handle assigned at runtime
 WCHAR  g_szDiagPath[MAX_PATH] = {0};  // NOSONAR - GLOBAL-01: runtime-mutable C-style path buffer
 DWORD  g_dwDiagFileSize = 0;  // NOSONAR - GLOBAL-01: runtime-mutable service state
+// GetTickCount64 value before which a rotation that could not rename the live
+// diagnostics log is not retried.
+ULONGLONG g_ullDiagRotateRetryTick = 0;  // NOSONAR - GLOBAL-01: runtime-mutable service state
 BOOL   g_fDiagnosticsEnabled = FALSE;  // NOSONAR - GLOBAL-01: runtime-mutable service state
 DWORD  g_dwDiagnosticsLevel = 4; // NOSONAR - GLOBAL-01: runtime-mutable; WINEVENT_LEVEL_INFO
 
@@ -147,11 +150,14 @@ BOOL LoadCsvConfiguration()
         g_fCsvEnabled = (dwEnabled != 0);
     }
 
-    // Read CSV log path
+    // Read CSV log path. RegGetValueW checks the type and guarantees termination
+    // (a REG_BINARY or unterminated value used to reach wcscpy_s/wcscat_s below and
+    // fast-fail the service), and the path must be one EID_IsAcceptableLogPath accepts:
+    // inside the product directory, with room for the suffixes rotation appends.
     dwSize = sizeof(g_szCsvPath);
-    err = RegQueryValueExW(hKey, L"CSVLogPath", nullptr, nullptr,
-                          reinterpret_cast<LPBYTE>(g_szCsvPath), &dwSize);  // NOSONAR - BYTE-01: BYTE buffer interops with Win32 API
-    if (err != ERROR_SUCCESS || g_szCsvPath[0] == L'\0')
+    err = RegGetValueW(hKey, nullptr, L"CSVLogPath", RRF_RT_REG_SZ, nullptr,
+                       g_szCsvPath, &dwSize);
+    if (err != ERROR_SUCCESS || !EID_IsAcceptableLogPath(g_szCsvPath))
     {
         wcscpy_s(g_szCsvPath, L"C:\\ProgramData\\OpenAccessEID\\logs\\events.csv");
     }
@@ -203,10 +209,13 @@ BOOL LoadCsvConfiguration()
 
         WCHAR szPolicyPath[MAX_PATH];  // NOSONAR - LSASS-01: C-style buffer for LSASS safety
         DWORD cbPath = sizeof(szPolicyPath);
-        if (RegQueryValueExW(hPolicy, L"CSVLogPath", nullptr, &dwType, reinterpret_cast<LPBYTE>(szPolicyPath), &cbPath) == ERROR_SUCCESS && dwType == REG_SZ && szPolicyPath[0] != L'\0')  // NOSONAR - BYTE-01: BYTE buffer interops with Win32 API
+        if (RegGetValueW(hPolicy, nullptr, L"CSVLogPath", RRF_RT_REG_SZ, nullptr, szPolicyPath, &cbPath) == ERROR_SUCCESS &&
+            szPolicyPath[0] != L'\0')
         {
-            szPolicyPath[MAX_PATH - 1] = L'\0';
-            wcscpy_s(g_szCsvPath, szPolicyPath);
+            if (EID_IsAcceptableLogPath(szPolicyPath))
+                wcscpy_s(g_szCsvPath, szPolicyPath);
+            else
+                wprintf(L"CSV logging: policy CSVLogPath is not inside %s; ignored\n", EID_CSV_CONFIG_DIR);
         }
 
         cb = sizeof(dw);
@@ -232,11 +241,14 @@ BOOL LoadCsvConfiguration()
             g_fCsvEnabled ? L"Enabled" : L"Disabled",
             g_szCsvPath, g_dwMaxFileSizeMB, g_dwFileCount);
 
-    // diagnostics.log lives in the same directory as the CSV log
+    // diagnostics.log lives in the same directory as the CSV log (the path check
+    // above leaves room for the name; _TRUNCATE keeps an overflow from aborting).
     wcscpy_s(g_szDiagPath, g_szCsvPath);
     WCHAR* pSlash = wcsrchr(g_szDiagPath, L'\\');
-    if (pSlash) { *(pSlash + 1) = L'\0'; wcscat_s(g_szDiagPath, L"diagnostics.log"); }  // NOSONAR - SCOPE-01: declaration kept outside if for readability
-    else        { wcscpy_s(g_szDiagPath, L"C:\\ProgramData\\OpenAccessEID\\logs\\diagnostics.log"); }
+    if (!pSlash || wcsncpy_s(pSlash + 1, ARRAYSIZE(g_szDiagPath) - (pSlash + 1 - g_szDiagPath), L"diagnostics.log", _TRUNCATE) != 0)
+    {
+        wcscpy_s(g_szDiagPath, L"C:\\ProgramData\\OpenAccessEID\\logs\\diagnostics.log");
+    }
 
     return g_fCsvEnabled;
 }
@@ -270,8 +282,9 @@ BOOL EnsureDiagFileOpen()
         return FALSE;
 
     LARGE_INTEGER liSize;
+    g_dwDiagFileSize = 0;
     if (GetFileSizeEx(g_hDiagFile, &liSize))  // NOSONAR - SCOPE-01: declaration kept outside if for readability
-        g_dwDiagFileSize = static_cast<DWORD>(liSize.QuadPart);
+        g_dwDiagFileSize = (liSize.QuadPart > MAXDWORD) ? MAXDWORD : static_cast<DWORD>(liSize.QuadPart);
 
     SetFilePointer(g_hDiagFile, 0, nullptr, FILE_END);
 
@@ -303,21 +316,50 @@ void RotateDiagFile()
         return;
     }
 
-    // Keep up to g_dwFileCount rotated generations (mirrors CSVLogger's rotation).
+    // The live file must be renameable before any generation is shifted: when some
+    // other handle denies delete sharing, the old code still deleted the oldest
+    // generation and shifted the rest on every event, then failed the last rename,
+    // so within a few events every older generation was gone. Retry later instead.
+    HANDLE hProbe = CreateFileW(g_szDiagPath, DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (hProbe == INVALID_HANDLE_VALUE)
+    {
+        g_ullDiagRotateRetryTick = GetTickCount64() + 60 * 1000;
+        return;
+    }
+    CloseHandle(hProbe);
+
+    // Keep up to g_dwFileCount rotated generations (mirrors CSVLogger's rotation):
+    // every step is checked, rotation stops at the first failure, and nothing is
+    // replaced except by the explicit delete of the oldest generation. _TRUNCATE
+    // keeps a long path from aborting the service; a truncated name stops rotation.
     // The i > 1 count-down cannot underflow when g_dwFileCount is 0 or 1.
     DWORD dwCount = g_dwFileCount ? g_dwFileCount : 1;
     WCHAR szOld[MAX_PATH], szNew[MAX_PATH];  // NOSONAR - LSASS-01: C-style buffer required by Win32 API
-    swprintf_s(szOld, L"%s.%03u", g_szDiagPath, dwCount);
-    DeleteFileW(szOld); // drop the oldest generation
-    for (DWORD i = dwCount; i > 1; i--)
+    BOOL fShifted = TRUE;
+    if (_snwprintf_s(szOld, ARRAYSIZE(szOld), _TRUNCATE, L"%s.%03u", g_szDiagPath, dwCount) < 0 ||
+        (!DeleteFileW(szOld) && GetLastError() != ERROR_FILE_NOT_FOUND)) // drop the oldest generation
     {
-        swprintf_s(szOld, L"%s.%03u", g_szDiagPath, i - 1);
-        swprintf_s(szNew, L"%s.%03u", g_szDiagPath, i);
-        MoveFileExW(szOld, szNew, MOVEFILE_REPLACE_EXISTING);
+        fShifted = FALSE;
     }
-    swprintf_s(szNew, L"%s.001", g_szDiagPath);
-    MoveFileExW(g_szDiagPath, szNew, MOVEFILE_REPLACE_EXISTING);
-    g_dwDiagFileSize = 0;
+    for (DWORD i = dwCount; fShifted && i > 1; i--)
+    {
+        if (_snwprintf_s(szOld, ARRAYSIZE(szOld), _TRUNCATE, L"%s.%03u", g_szDiagPath, i - 1) < 0 ||
+            _snwprintf_s(szNew, ARRAYSIZE(szNew), _TRUNCATE, L"%s.%03u", g_szDiagPath, i) < 0 ||
+            (!MoveFileExW(szOld, szNew, 0) && GetLastError() != ERROR_FILE_NOT_FOUND))
+        {
+            fShifted = FALSE;
+        }
+    }
+    if (fShifted &&
+        _snwprintf_s(szNew, ARRAYSIZE(szNew), _TRUNCATE, L"%s.001", g_szDiagPath) >= 0 &&
+        MoveFileExW(g_szDiagPath, szNew, 0))
+    {
+        g_dwDiagFileSize = 0;
+        return;
+    }
+    // Not rotated: keep appending to the live file and try again later.
+    g_ullDiagRotateRetryTick = GetTickCount64() + 60 * 1000;
 }
 
 void WriteDiagnosticLine(const WCHAR* timestamp, const WCHAR* severity, DWORD dwProcessId, const WCHAR* message)
@@ -326,7 +368,7 @@ void WriteDiagnosticLine(const WCHAR* timestamp, const WCHAR* severity, DWORD dw
         return;
 
     ULONGLONG ullMaxBytes = static_cast<ULONGLONG>(g_dwMaxFileSizeMB) * 1024 * 1024;
-    if (g_dwDiagFileSize >= ullMaxBytes)  // NOSONAR - SCOPE-01: declaration kept outside if for readability
+    if (g_dwDiagFileSize >= ullMaxBytes && GetTickCount64() >= g_ullDiagRotateRetryTick)  // NOSONAR - SCOPE-01: declaration kept outside if for readability
     {
         RotateDiagFile();
         if (!EnsureDiagFileOpen())
@@ -351,7 +393,8 @@ void WriteDiagnosticLine(const WCHAR* timestamp, const WCHAR* severity, DWORD dw
     {
         DWORD dwWritten = 0;
         WriteFile(g_hDiagFile, szLine, len, &dwWritten, nullptr);
-        g_dwDiagFileSize += dwWritten;
+        // Saturating: the size must not wrap back below the limit while rotation is failing.
+        g_dwDiagFileSize = (g_dwDiagFileSize > MAXDWORD - dwWritten) ? MAXDWORD : g_dwDiagFileSize + dwWritten;
     }
 }
 

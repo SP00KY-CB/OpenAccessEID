@@ -16,12 +16,44 @@
 
 // ================================================================
 // M5: Restrictive DACL for the log/config directory.
-// Full control to SYSTEM (SY) and Administrators (BA); Read&Execute only
-// (0x1200a9, no create/write) to Users (BU). PAI = protected, no inheritance
-// from the (Users-writable) ProgramData parent. Prevents a low-privileged
-// user from planting files/symlinks that a SYSTEM writer would follow.
+// Full control to SYSTEM (SY) and Administrators (BA), inherited by everything
+// below. Users (BU) may list the folder (0x1200a9, CI only: folders, not files)
+// but not read the files in it: the logs record logon activity, PIN failures
+// and attempts left, and a user holding a read handle on a log blocked its
+// rotation. PAI = protected, no inheritance from the (Users-writable)
+// ProgramData parent. Prevents a low-privileged user from planting
+// files/symlinks that a SYSTEM writer would follow. The installer applies the
+// same DACL (OAEID_DATA_DIR_SDDL in Installer/Installerx64.nsi).
 // ================================================================
-#define EID_LOG_DIR_SDDL            L"D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)"  // NOSONAR - MACRO-01: Windows-style macro constant retained for API/preprocessor use
+#define EID_LOG_DIR_SDDL            L"D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;CI;0x1200a9;;;BU)"  // NOSONAR - MACRO-01: Windows-style macro constant retained for API/preprocessor use
+// Explicit DACL for a log file that still carries the Users read ACE inherited
+// from the previous directory DACL.
+#define EID_LOG_FILE_SDDL           L"D:P(A;;FA;;;SY)(A;;FA;;;BA)"  // NOSONAR - MACRO-01: Windows-style macro constant retained for API/preprocessor use
+
+// Room a log path must leave below MAX_PATH for what is appended to it or to its
+// directory: ".NNN" for a rotated generation, or "diagnostics.log".
+#define EID_LOG_PATH_RESERVE        32  // NOSONAR - MACRO-01: Windows-style macro constant retained for API/preprocessor use
+
+// A configured log path (logging.json, the registry or Group Policy) decides which
+// directory a SYSTEM writer re-secures and renames and deletes in, so it is held to
+// the product directory: a fully qualified X:\ path under EID_CSV_CONFIG_DIR, with no
+// UNC or device prefix, no traversal, no forward slash and no alternate data stream,
+// short enough for the suffixes above. Anything else is refused and the default used.
+inline BOOL EID_IsAcceptableLogPath(PCWSTR pwszPath)
+{
+    if (!pwszPath)
+        return FALSE;
+    const size_t cch = wcsnlen(pwszPath, MAX_PATH);
+    if (cch < 4 || cch >= MAX_PATH - EID_LOG_PATH_RESERVE)
+        return FALSE;
+    if (pwszPath[0] == L'\\' || pwszPath[1] != L':' || pwszPath[2] != L'\\')
+        return FALSE;
+    if (wcsstr(pwszPath, L"..") || wcschr(pwszPath, L'/') || wcschr(pwszPath + 2, L':'))
+        return FALSE;
+    const size_t cchRoot = ARRAYSIZE(EID_CSV_CONFIG_DIR) - 1;
+    return (cch > cchRoot + 1 && _wcsnicmp(pwszPath, EID_CSV_CONFIG_DIR, cchRoot) == 0 &&
+            pwszPath[cchRoot] == L'\\') ? TRUE : FALSE;
+}
 
 // Build a SECURITY_ATTRIBUTES carrying the restrictive log-dir DACL above.
 // On success returns TRUE, fills *psa and hands back the security descriptor in
@@ -58,17 +90,9 @@ inline BOOL BuildLogDirSecurityAttributes(SECURITY_ATTRIBUTES* psa, PSECURITY_DE
 // The object itself is opened with FILE_FLAG_OPEN_REPARSE_POINT, so the check never
 // follows a link; FILE_FLAG_BACKUP_SEMANTICS lets the same call open a directory.
 // ================================================================
-inline BOOL EID_IsAdminOwnedNonReparse(PCWSTR pwszPath)
+// The same check on an object already open (with READ_CONTROL | FILE_READ_ATTRIBUTES).
+inline BOOL EID_IsAdminOwnedNonReparseHandle(HANDLE hObject)
 {
-    if (!pwszPath || pwszPath[0] == L'\0')
-        return FALSE;
-
-    HANDLE hObject = CreateFileW(pwszPath, READ_CONTROL | FILE_READ_ATTRIBUTES,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
-    if (hObject == INVALID_HANDLE_VALUE)
-        return FALSE;
-
     BOOL fTrusted = FALSE;
     BY_HANDLE_FILE_INFORMATION info = {};
     if (GetFileInformationByHandle(hObject, &info) &&
@@ -85,8 +109,92 @@ inline BOOL EID_IsAdminOwnedNonReparse(PCWSTR pwszPath)
             LocalFree(pOwnerSD);
         }
     }
+    return fTrusted;
+}
+
+inline BOOL EID_IsAdminOwnedNonReparse(PCWSTR pwszPath)
+{
+    if (!pwszPath || pwszPath[0] == L'\0')
+        return FALSE;
+
+    HANDLE hObject = CreateFileW(pwszPath, READ_CONTROL | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (hObject == INVALID_HANDLE_VALUE)
+        return FALSE;
+
+    const BOOL fTrusted = EID_IsAdminOwnedNonReparseHandle(hObject);
     CloseHandle(hObject);
     return fTrusted;
+}
+
+// TRUE when the DACL has an ACE for Users (BU) that files inherit - the layout
+// before the log files were closed to Users.
+inline BOOL EID_DaclLetsUsersReadFiles(PACL pDacl)
+{
+    if (!pDacl)
+        return FALSE;
+    for (DWORD i = 0; i < pDacl->AceCount; i++)
+    {
+        PACE_HEADER pHeader = nullptr;
+        if (!GetAce(pDacl, i, reinterpret_cast<LPVOID*>(&pHeader)) || !pHeader ||
+            pHeader->AceType != ACCESS_ALLOWED_ACE_TYPE || (pHeader->AceFlags & OBJECT_INHERIT_ACE) == 0)
+            continue;
+        PSID pSid = &reinterpret_cast<ACCESS_ALLOWED_ACE*>(pHeader)->SidStart;
+        if (IsValidSid(pSid) && IsWellKnownSid(pSid, WinBuiltinUsersSid))
+            return TRUE;
+    }
+    return FALSE;
+}
+
+// Give each existing file directly in the (pinned) directory an explicit
+// SYSTEM/Administrators-only DACL, removing the Users read ACE it inherited from
+// the previous directory DACL. Each file is opened without following links and
+// changed through that handle; reparse points, hard links (a link could lead to a
+// file elsewhere) and files not owned by SYSTEM/Administrators are left alone.
+inline void EID_CloseExistingLogFiles(PCWSTR pwszDir)
+{
+    PSECURITY_DESCRIPTOR pFileSD = nullptr;
+    PACL pFileDacl = nullptr;
+    BOOL fPresent = FALSE;
+    BOOL fDefaulted = FALSE;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(EID_LOG_FILE_SDDL, SDDL_REVISION_1, &pFileSD, nullptr))
+        return;
+    WCHAR szPattern[MAX_PATH];  // NOSONAR - LSASS-01: C-style buffer for LSASS safety
+    WIN32_FIND_DATAW fd;
+    HANDLE hFind = INVALID_HANDLE_VALUE;
+    if (GetSecurityDescriptorDacl(pFileSD, &fPresent, &pFileDacl, &fDefaulted) && fPresent &&
+        _snwprintf_s(szPattern, MAX_PATH, _TRUNCATE, L"%s\\*", pwszDir) >= 0)
+    {
+        hFind = FindFirstFileExW(szPattern, FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, 0);
+    }
+    if (hFind != INVALID_HANDLE_VALUE)
+    {
+        do
+        {
+            if (fd.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))
+                continue;
+            WCHAR szFile[MAX_PATH];  // NOSONAR - LSASS-01: C-style buffer for LSASS safety
+            if (_snwprintf_s(szFile, MAX_PATH, _TRUNCATE, L"%s\\%s", pwszDir, fd.cFileName) < 0)
+                continue;
+            HANDLE hFile = CreateFileW(szFile, READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+            if (hFile == INVALID_HANDLE_VALUE)
+                continue;
+            BY_HANDLE_FILE_INFORMATION info = {};
+            if (GetFileInformationByHandle(hFile, &info) && info.nNumberOfLinks == 1 &&
+                EID_IsAdminOwnedNonReparseHandle(hFile))
+            {
+                SetSecurityInfo(hFile, SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    nullptr, nullptr, pFileDacl, nullptr);
+            }
+            CloseHandle(hFile);
+        } while (FindNextFileW(hFind, &fd));
+        FindClose(hFind);
+    }
+    LocalFree(pFileSD);
 }
 
 // Create ONE directory with the restrictive DACL above, or - when it already exists -
@@ -117,25 +225,48 @@ inline BOOL EID_EnsureSecuredDirectory(PCWSTR pwszDir)
         // Created just now by this (SYSTEM/admin) process with the protected DACL.
         fSafe = TRUE;
     }
-    else if (GetLastError() == ERROR_ALREADY_EXISTS && EID_IsAdminOwnedNonReparse(pwszDir))
+    else if (GetLastError() == ERROR_ALREADY_EXISTS)
     {
-        PACL pDacl = nullptr;
-        BOOL fDaclPresent = FALSE;
-        BOOL fDaclDefaulted = FALSE;
-        // SetNamedSecurityInfoW takes a non-const path; hand it a local copy rather
-        // than casting away const. It is used (not the handle-based SetSecurityInfo)
-        // because it also pushes the protected DACL down to existing children.
-        WCHAR szDirCopy[MAX_PATH];  // NOSONAR - LSASS-01: C-style buffer for LSASS safety
-        if (GetSecurityDescriptorDacl(pSD, &fDaclPresent, &pDacl, &fDaclDefaulted) && fDaclPresent &&
-            wcsncpy_s(szDirCopy, MAX_PATH, pwszDir, _TRUNCATE) == 0)
+        // Check and change the directory through ONE handle, so the directory that
+        // is checked is the one whose DACL is written. It used to be checked through a
+        // handle and then changed by path, and a directory swapped for a junction in
+        // between had its target re-ACLed as SYSTEM. The handle is opened without
+        // FILE_SHARE_DELETE, which also stops the directory (and the folders above it)
+        // being renamed while the files in it are fixed up below.
+        HANDLE hDir = CreateFileW(pwszDir, READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        if (hDir != INVALID_HANDLE_VALUE)
         {
-            // PROTECTED_DACL_SECURITY_INFORMATION matches the SDDL's "PAI" - it severs
-            // inheritance from ProgramData rather than merging with it. Only a directory
-            // whose DACL was actually replaced counts as safe: an admin-owned directory
-            // that still carries an inherited Users-writable ACL is not.
-            fSafe = (SetNamedSecurityInfoW(szDirCopy, SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                nullptr, nullptr, pDacl, nullptr) == ERROR_SUCCESS) ? TRUE : FALSE;
+            PACL pDacl = nullptr;
+            BOOL fDaclPresent = FALSE;
+            BOOL fDaclDefaulted = FALSE;
+            if (EID_IsAdminOwnedNonReparseHandle(hDir) &&
+                GetSecurityDescriptorDacl(pSD, &fDaclPresent, &pDacl, &fDaclDefaulted) && fDaclPresent)
+            {
+                // Files inherited Users read from the DACL before this one.
+                BOOL fFixFiles = FALSE;
+                PACL pOldDacl = nullptr;
+                PSECURITY_DESCRIPTOR pOldSD = nullptr;
+                if (GetSecurityInfo(hDir, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                        nullptr, nullptr, &pOldDacl, nullptr, &pOldSD) == ERROR_SUCCESS)
+                {
+                    fFixFiles = EID_DaclLetsUsersReadFiles(pOldDacl);
+                    LocalFree(pOldSD);
+                }
+                // PROTECTED_DACL_SECURITY_INFORMATION matches the SDDL's "PAI" - it severs
+                // inheritance from ProgramData rather than merging with it. Only a directory
+                // whose DACL was actually replaced counts as safe: an admin-owned directory
+                // that still carries an inherited Users-writable ACL is not.
+                fSafe = (SetSecurityInfo(hDir, SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    nullptr, nullptr, pDacl, nullptr) == ERROR_SUCCESS) ? TRUE : FALSE;
+                if (fSafe && fFixFiles)
+                {
+                    EID_CloseExistingLogFiles(pwszDir);
+                }
+            }
+            CloseHandle(hDir);
         }
     }
     LocalFree(pSD);
