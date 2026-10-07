@@ -59,9 +59,25 @@ CCredential* CCredential::CreateCredential(PLUID LogonIdToUse, PCERT_CREDENTIAL_
 		return nullptr;
 	}
 
+	// insert can throw std::bad_alloc: catch it here, so it neither unwinds into
+	// LSA nor leaves g_CredentialLock held.
+	bool fInserted = false;
 	EnterCriticalSection(&g_CredentialLock);
-	Credentials.insert(credential);
+	try
+	{
+		Credentials.insert(credential);
+		fInserted = true;
+	}
+	catch (...)  // NOSONAR - EXCEPTION-01: must not escape into LSASS
+	{
+		EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"No memory to register the credential");
+	}
 	LeaveCriticalSection(&g_CredentialLock);
+	if (!fInserted)
+	{
+		delete credential;  // NOSONAR - OWNERSHIP-01: manual Win32 lifetime management
+		return nullptr;
+	}
 
 	return credential;
 }
@@ -200,9 +216,24 @@ CSecurityContext* CSecurityContext::CreateContext(CCredential* pCredential)
 		return nullptr;
 	}
 
+	// As in CCredential::CreateCredential: push_back can throw while the lock is held.
+	bool fInserted = false;
 	EnterCriticalSection(&g_CredentialLock);
-	Contexts.push_back(context);
+	try
+	{
+		Contexts.push_back(context);
+		fInserted = true;
+	}
+	catch (...)  // NOSONAR - EXCEPTION-01: must not escape into LSASS
+	{
+		EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"No memory to register the context");
+	}
 	LeaveCriticalSection(&g_CredentialLock);
+	if (!fInserted)
+	{
+		delete context;  // NOSONAR - OWNERSHIP-01: manual Win32 lifetime management
+		return nullptr;
+	}
 
 	return context;
 }
@@ -943,8 +974,20 @@ NTSTATUS CUsermodeContext::AddContextInfo(ULONG_PTR pHandle, PEID_SSP_CALLBACK_M
 	if (!pContext)  // NOSONAR - SCOPE-01: local scoped to block; init-statement refactor deferred
 	{
 		EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"Inserting context %p", reinterpret_cast<PVOID>(pHandle));
-		pContext = new CUsermodeContext(pMessage);  // NOSONAR - COM-01: User mode context requires heap allocation
-		UserModeContexts.insert(std::pair<ULONG_PTR,CUsermodeContext*> (pHandle, pContext));
+		pContext = new (std::nothrow) CUsermodeContext(pMessage);  // NOSONAR - COM-01: User mode context requires heap allocation
+		if (!pContext)
+		{
+			return STATUS_INSUFFICIENT_RESOURCES;
+		}
+		try
+		{
+			UserModeContexts.insert(std::pair<ULONG_PTR,CUsermodeContext*> (pHandle, pContext));
+		}
+		catch (...)  // NOSONAR - EXCEPTION-01: must not escape into the SSPI caller
+		{
+			delete pContext;  // NOSONAR - OWNERSHIP-01: manual Win32 lifetime management
+			return STATUS_INSUFFICIENT_RESOURCES;
+		}
 	}
 	return Status ;
 }

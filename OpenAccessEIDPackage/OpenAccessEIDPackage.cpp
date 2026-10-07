@@ -56,6 +56,7 @@
 // Package.cpp: allocator used by EIDAlloc/EIDFree for everything handed to LSA.
 void SetAlloc(PLSA_ALLOCATE_LSA_HEAP AllocateLsaHeap);
 void SetFree(PLSA_FREE_LSA_HEAP FreeHeap);
+void SetImpersonate(PLSA_IMPERSONATE_CLIENT Impersonate);
 
 extern "C"
 {
@@ -450,12 +451,14 @@ extern "C"
 		MyLsaDispatchTable = reinterpret_cast<PLSA_SECPKG_FUNCTION_TABLE>(LsaDispatchTable);  // NOSONAR - CAST-01: Win32/COM interop cast, layout-verified
 		// Everything this package hands to LSA must come from the LSA heap. SpInitialize sets
 		// these too when the DLL is also loaded as a security package; set them here as well so
-		// the authentication package never depends on that. (LSA_DISPATCH_TABLE has the heap
-		// routines; ImpersonateClient is only in the SSP function table.)
+		// the authentication package never depends on that. The impersonation hook comes from
+		// the full function table this package already uses (GetClientInfo, above): without it
+		// EIDImpersonate is a no-op and card work would run as SYSTEM instead of the caller.
 		if (LsaDispatchTable)
 		{
 			SetAlloc(LsaDispatchTable->AllocateLsaHeap);
 			SetFree(LsaDispatchTable->FreeLsaHeap);
+			SetImpersonate(MyLsaDispatchTable->ImpersonateClient);
 		}
 
 		*AuthenticationPackageName = LsaInitializeString(AUTHENTICATIONPACKAGENAME);
@@ -918,6 +921,14 @@ extern "C"
 			{
 				response.dwError = GetLastError();
 				EIDCardLibraryTrace(WINEVENT_LEVEL_ERROR,L"GetChallenge 0x%08X", response.dwError);
+				// Nothing from a failed GetChallenge goes back to the caller.
+				if (pbChallenge)
+				{
+					SecureZeroMemory(pbChallenge, dwChallengeSize);
+					EIDFree(pbChallenge);
+				}
+				pbChallenge = NULL;
+				dwChallengeSize = 0;
 				__leave;
 			}
 			// SECURITY: GINA authentication is refused for crypted (card-bound)
@@ -976,7 +987,11 @@ extern "C"
 				}
 				*ReturnBufferLength = sizeof(EID_MSGINA_AUTHENTICATION_CHALLENGE_ANSWER) + dwChallengeSize;
 			}
-			if (pbChallenge) EIDFree(pbChallenge);
+			if (pbChallenge)
+			{
+				SecureZeroMemory(pbChallenge, dwChallengeSize);
+				EIDFree(pbChallenge);
+			}
 		}
 		EIDCardLibraryTrace(WINEVENT_LEVEL_INFO,L"return 0x%08X",StatusReturned);
 		return StatusReturned;

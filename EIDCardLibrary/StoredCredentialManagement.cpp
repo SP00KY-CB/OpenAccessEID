@@ -862,6 +862,12 @@ BOOL CStoredCredentialManager::CreateCredential(__in DWORD dwRid, __in PCCERT_CO
 		SetLastError(ERROR_ACCESS_DENIED);
 		return FALSE;
 	}
+	if (!fEncryptPassword)
+	{
+		// Allowed (the policy is off by default so signature-only cards can enrol), but the
+		// password is then recoverable by anyone who can read LSA secrets - make it visible.
+		EIDSecurityAudit(SECURITY_AUDIT_WARNING, L"[CRED_NOT_CARD_BOUND] Creating a credential for rid 0x%x that is not wrapped by the card (DPAPI); set RequireCardBoundCredentials to refuse these", dwRid);
+	}
 
 	BOOL fReturn = FALSE;
 	BOOL fStatus;
