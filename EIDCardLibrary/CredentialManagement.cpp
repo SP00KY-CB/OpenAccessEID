@@ -11,6 +11,7 @@
 #include <LM.h>
 #include <set>
 #include <map>
+#include <new>
 #include "../EIDCardLibrary/EIDCardLibrary.h"
 #include "../EIDCardLibrary/Tracing.h"
 #include "../EIDCardLibrary/StoredCredentialManagement.h"
@@ -50,7 +51,13 @@ CCredential* CCredential::CreateCredential(PLUID LogonIdToUse, PCERT_CREDENTIAL_
 	}
 
 	EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"new Credential");
-	credential = new CCredential(LogonIdToUse,pCertInfo,szPin, CredentialUseFlags);  // NOSONAR - COM-01: Credential lifecycle requires heap allocation
+	// nothrow: a C++ exception must never unwind out of an LSA entry point.
+	credential = new (std::nothrow) CCredential(LogonIdToUse,pCertInfo,szPin, CredentialUseFlags);  // NOSONAR - COM-01: Credential lifecycle requires heap allocation
+	if (!credential)
+	{
+		EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"No memory for credential");
+		return nullptr;
+	}
 
 	EnterCriticalSection(&g_CredentialLock);
 	Credentials.insert(credential);
@@ -64,8 +71,15 @@ CCredential::CCredential(PLUID LogonIdToUse, PCERT_CREDENTIAL_INFO pCertInfo,PWS
 	if (szPin)
 	{
 		_dwLen = (DWORD) wcslen(szPin) + 1;
-		_szPin = new WCHAR[_dwLen];  // NOSONAR - COM-01: PIN buffer requires heap allocation
-		wcscpy_s(_szPin,_dwLen, szPin);
+		_szPin = new (std::nothrow) WCHAR[_dwLen];  // NOSONAR - COM-01: PIN buffer requires heap allocation
+		if (_szPin)
+		{
+			wcscpy_s(_szPin,_dwLen, szPin);
+		}
+		else
+		{
+			_dwLen = 0;
+		}
 	}
 	else
 	{
@@ -91,7 +105,10 @@ CCredential::CCredential(PLUID LogonIdToUse, PCERT_CREDENTIAL_INFO pCertInfo,PWS
 		memset(_rgbHashOfCert, 0, sizeof(_rgbHashOfCert));
 		memcpy_s(_rgbHashOfCert, sizeof(_rgbHashOfCert), pCertInfo->rgbHashOfCert, SDK_CERT_HASH_LENGTH);
 		_pCertInfo = (PCERT_CREDENTIAL_INFO) EIDAlloc(pCertInfo->cbSize);
-		memcpy(_pCertInfo, pCertInfo, pCertInfo->cbSize);
+		if (_pCertInfo)
+		{
+			memcpy(_pCertInfo, pCertInfo, pCertInfo->cbSize);
+		}
 	}
 	else
 	{
@@ -176,7 +193,12 @@ CSecurityContext* CSecurityContext::CreateContext(CCredential* pCredential)
 		EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"pCredential NULL");
 		return nullptr;
 	}
-	context = new CSecurityContext(pCredential);  // NOSONAR - COM-01: Security context requires heap allocation
+	context = new (std::nothrow) CSecurityContext(pCredential);  // NOSONAR - COM-01: Security context requires heap allocation
+	if (!context)
+	{
+		EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"No memory for context");
+		return nullptr;
+	}
 
 	EnterCriticalSection(&g_CredentialLock);
 	Contexts.push_back(context);
@@ -491,6 +513,8 @@ NTSTATUS CSecurityContext::BuildNegociateMessage(PSecBufferDesc Buffer)
 	static_assert(sizeof(Hash) == sizeof(_pCredential->_rgbHashOfCert), "Hash buffer sizes must match");
 	memcpy_s(Hash, sizeof(Hash), _pCredential->_rgbHashOfCert, sizeof(Hash));
 	memcpy_s(message->Hash.data(), message->Hash.size(), _pCredential->_rgbHashOfCert, message->Hash.size());
+	// Report only the bytes written: the caller otherwise gets back its whole buffer.
+	Buffer->pBuffers[0].cbBuffer = sizeof(EID_NEGOCIATE_MESSAGE);
 	_State = EID_MESSAGE_STATE::EIDMSNegociate;
 	return SEC_I_CONTINUE_NEEDED;
 }
@@ -637,7 +661,11 @@ NTSTATUS CSecurityContext::BuildChallengeMessage(PSecBufferDesc Buffer)
 	}
 	__finally
 	{
-		// SEH cleanup - no action needed
+		if (pInfo)
+		{
+			NetApiBufferFree(pInfo);
+			pInfo = nullptr;
+		}
 	}
 	// Return Status, not a hardcoded success. Every __leave above sets a failure
 	// code and this function used to discard all of them, so an out-of-memory or
@@ -811,8 +839,11 @@ NTSTATUS CSecurityContext::ReceiveResponseMessage(PSecBufferDesc Buffer)
 
 NTSTATUS CSecurityContext::BuildCompleteMessage(PSecBufferDesc Buffer)  // NOSONAR - API-01: signature must match class declaration
 {
-	// v�rification du challenge
-	UNREFERENCED_PARAMETER(Buffer);
+	// The final leg sends no token back.
+	if (TokenBufferIsPresent(Buffer))
+	{
+		Buffer->pBuffers[0].cbBuffer = 0;
+	}
 	// Only ever verify a signature over a nonce THIS context generated. If the
 	// challenge came from the peer, an attacker chose it, and verifying against
 	// it turns any captured (challenge, response) pair into a permanent bearer

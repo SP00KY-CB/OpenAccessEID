@@ -61,10 +61,8 @@ extern "C"
 	// 0x2B,0x06,0x01,0x04,0x01,0x88,0xB8,0x01
 	const UCHAR GssOid[] = {0x2B,0x06,0x01,0x04,0x01,0x88,0xB8,0x01};  // NOSONAR - OID constant
 	const DWORD GssOidLen = ARRAYSIZE(GssOid);
-	// guid for negoEx
-	// 6550d49b-a716-484e-8955-a8e666df45d1
-	const UCHAR AUTHENTICATIONNAGOTIATEGUID[16] =
-			{0x65,0x50,0xd4,0x9b,0xa7,0x16,0x48,0x4e,0x89,0x55,0xa8,0xe6,0x66,0xdf,0x45,0xd1};
+	// The NegoEx auth scheme GUID (6550d49b-a716-484e-8955-a8e666df45d1) is no longer
+	// advertised: SpGetExtendedInformation(SecpkgNego2Info) is refused.
 
 
 	const TimeStamp Forever = {0x7fffffff,0xfffffff};
@@ -148,14 +146,13 @@ extern "C"
 		static SEC_WCHAR s_szPackageName[] = TEXT("OpenAccessEIDPackage");
 		static SEC_WCHAR s_szPackageComment[] = TEXT("OpenAccessEIDPackage");
 
+		// Not NEGOTIABLE/NEGOTIABLE2/GSS_COMPATIBLE: network authentication is refused (see
+		// SpAcquireCredentialsHandleDisabled), so Negotiate and NegoEx must not offer it.
 		PackageInfo->fCapabilities = SECPKG_FLAG_LOGON |
 			SECPKG_FLAG_MULTI_REQUIRED|
 			SECPKG_FLAG_CLIENT_ONLY|
 			SECPKG_FLAG_IMPERSONATION|
-			SECPKG_FLAG_NEGOTIABLE|
-			SECPKG_FLAG_NEGOTIABLE2 |
-			SECPKG_FLAG_ACCEPT_WIN32_NAME |
-			SECPKG_FLAG_GSS_COMPATIBLE;
+			SECPKG_FLAG_ACCEPT_WIN32_NAME;
 		PackageInfo->wVersion = SECURITY_SUPPORT_PROVIDER_INTERFACE_VERSION;
 		PackageInfo->wRPCID = SECPKG_ID_NONE;
 		PackageInfo->cbMaxToken = 5000;
@@ -177,6 +174,7 @@ extern "C"
 		{
 			case SecpkgGssInfo:
 				*ppInformation = static_cast<PSECPKG_EXTENDED_INFORMATION>(EIDAlloc(sizeof(SECPKG_EXTENDED_INFORMATION)+GssOidLen));
+				if (!*ppInformation) { Status = STATUS_NO_MEMORY; break; }
 				(*ppInformation)->Class = SecpkgGssInfo;
 				(*ppInformation)->Info.GssInfo.EncodedIdLength = GssOidLen;
 				memcpy((*ppInformation)->Info.GssInfo.EncodedId, GssOid,GssOidLen);
@@ -184,18 +182,21 @@ extern "C"
 				break;
 			case SecpkgContextThunks:
 				*ppInformation = static_cast<PSECPKG_EXTENDED_INFORMATION>(EIDAlloc(sizeof(SECPKG_EXTENDED_INFORMATION)));
+				if (!*ppInformation) { Status = STATUS_NO_MEMORY; break; }
 				(*ppInformation)->Class = SecpkgContextThunks;
 				(*ppInformation)->Info.ContextThunks.InfoLevelCount = 0; 
 				Status = STATUS_SUCCESS; 
 				break;
 			case SecpkgMutualAuthLevel:
 				*ppInformation = static_cast<PSECPKG_EXTENDED_INFORMATION>(EIDAlloc(sizeof(SECPKG_EXTENDED_INFORMATION)));
+				if (!*ppInformation) { Status = STATUS_NO_MEMORY; break; }
 				(*ppInformation)->Class = SecpkgMutualAuthLevel;
 				(*ppInformation)->Info.MutualAuthLevel.MutualAuthLevel = MutualAuthLevel; 
 				Status = STATUS_SUCCESS; 
 				break;
 			case SecpkgWowClientDll:
 				*ppInformation = static_cast<PSECPKG_EXTENDED_INFORMATION>(EIDAlloc(sizeof(SECPKG_EXTENDED_INFORMATION)));
+				if (!*ppInformation) { Status = STATUS_NO_MEMORY; break; }
 				(*ppInformation)->Class = SecpkgWowClientDll;
 				(*ppInformation)->Info.WowClientDll.WowClientDllPath.Buffer = NULL; 
 				(*ppInformation)->Info.WowClientDll.WowClientDllPath.Length = 0;
@@ -204,16 +205,14 @@ extern "C"
 				break;
 			case SecpkgExtraOids:
 				*ppInformation = static_cast<PSECPKG_EXTENDED_INFORMATION>(EIDAlloc(sizeof(SECPKG_EXTENDED_INFORMATION)));
+				if (!*ppInformation) { Status = STATUS_NO_MEMORY; break; }
 				(*ppInformation)->Class = SecpkgExtraOids;
 				(*ppInformation)->Info.ExtraOids.OidCount = 0; 
 				Status = STATUS_SUCCESS;
 				break;
 			case SecpkgNego2Info:
-				*ppInformation = static_cast<PSECPKG_EXTENDED_INFORMATION>(EIDAlloc(sizeof(SECPKG_EXTENDED_INFORMATION)));
-				(*ppInformation)->Class = SecpkgNego2Info;
-				(*ppInformation)->Info.Nego2Info.PackageFlags = 0;
-				memcpy((*ppInformation)->Info.Nego2Info.AuthScheme,AUTHENTICATIONNAGOTIATEGUID,16);
-				Status = STATUS_SUCCESS;
+				// No NegoEx auth scheme: network authentication is refused.
+				Status = SEC_E_UNSUPPORTED_FUNCTION;
 				break;
 		}
 		EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"Leave with Status = 0x%08X", Status);
@@ -974,9 +973,9 @@ extern "C"
 		UNREFERENCED_PARAMETER(ContextRequirements);
 		EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"Enter TargetName = %wZ",TargetName);
 		NTSTATUS Status = STATUS_SUCCESS;  // NOSONAR - EXPLICIT-TYPE-01: NTSTATUS visible for security audit
+		CSecurityContext* newContext = NULL;
 		__try
 		{
-			CSecurityContext* newContext = NULL;
 			*MappedContext = FALSE;
 			*ContextAttributes = ASC_REQ_CONNECTION | ASC_REQ_REPLAY_DETECT;
 			Status = ResolveLsaModeContext(CredentialHandle, ContextHandle, SECPKG_CRED_OUTBOUND, &newContext, NewContextHandle);
@@ -1005,7 +1004,13 @@ extern "C"
 		}
 		__finally
 		{
-			// NOSONAR - SEH-01: Empty __finally required for SEH completeness
+			// A context created by this call is the package's to delete when the call fails:
+			// the caller gets no handle back, so nothing else would ever free it.
+			if (ContextHandle == NULL && newContext && static_cast<LONG>(Status) < 0)
+			{
+				CSecurityContext::Delete(reinterpret_cast<ULONG_PTR>(newContext));
+				*NewContextHandle = 0;
+			}
 		}
 		EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"Leave with Status = 0x%08X",Status);
 		return Status;
@@ -1158,9 +1163,9 @@ extern "C"
 		HANDLE hToken = NULL;  // NOSONAR - EXPLICIT-TYPE-02: HANDLE visible for security audit
 		LARGE_INTEGER AccountExpiration;
 		AccountExpiration.QuadPart = MAXLONGLONG;
+		CSecurityContext* newContext = NULL;
 		__try
 		{
-			CSecurityContext* newContext = NULL;
 			*MappedContext = FALSE;
 			*ContextAttributes = ASC_REQ_CONNECTION | ASC_REQ_REPLAY_DETECT;
 			Status = ResolveLsaModeContext(CredentialHandle, ContextHandle, SECPKG_CRED_INBOUND, &newContext, NewContextHandle);
@@ -1240,6 +1245,12 @@ extern "C"
 			// (and the logon session it pins) per accepted context.
 			if (hToken && hToken != INVALID_HANDLE_VALUE)
 				CloseHandle(hToken);
+			// See SpInitLsaModeContext: a context created by a failed first call is ours to delete.
+			if (ContextHandle == NULL && newContext && static_cast<LONG>(Status) < 0)
+			{
+				CSecurityContext::Delete(reinterpret_cast<ULONG_PTR>(newContext));
+				*NewContextHandle = 0;
+			}
 		}
 		EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"Status = 0x%08X",Status);
 		return Status;
@@ -1385,6 +1396,110 @@ extern "C"
 		return Status;
 	}
 
+	// Network (SSP) authentication is not supported in this build (README) and nothing in the
+	// product initiates or accepts it. The handshake code (SpAcquireCredentialsHandle,
+	// SpInitLsaModeContext, SpAcceptLsaModeContext and CSecurityContext) lets any local caller
+	// drive LSASS state shared across concurrent calls on one handle, without a per-context
+	// lock, with credentials referenced by raw pointer and with handles that are LSASS heap
+	// addresses. Until that is reworked (per-context lock, reference counting, opaque handles),
+	// the function table points these three entries at refusals, so no credential or context
+	// is ever created; the remaining Sp* functions then only ever see handles they do not know.
+	static NTSTATUS NTAPI SpAcquireCredentialsHandleDisabled(
+		  __in   PUNICODE_STRING PrincipalName,
+		  __in   ULONG CredentialUseFlags,
+		  __in   PLUID LogonId,
+		  __in   PVOID AuthorizationData,
+		  __in   PVOID GetKeyFunction,
+		  __in   PVOID GetKeyArgument,
+		  __out  PLSA_SEC_HANDLE pCredentialHandle,
+		  __out  PTimeStamp ExpirationTime
+		)
+	{
+		UNREFERENCED_PARAMETER(PrincipalName);
+		UNREFERENCED_PARAMETER(CredentialUseFlags);
+		UNREFERENCED_PARAMETER(LogonId);
+		UNREFERENCED_PARAMETER(AuthorizationData);
+		UNREFERENCED_PARAMETER(GetKeyFunction);
+		UNREFERENCED_PARAMETER(GetKeyArgument);
+		UNREFERENCED_PARAMETER(ExpirationTime);
+		if (pCredentialHandle)
+		{
+			*pCredentialHandle = 0;
+		}
+		EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"Network authentication is not supported: AcquireCredentialsHandle refused");
+		return SEC_E_UNSUPPORTED_FUNCTION;
+	}
+
+	static NTSTATUS NTAPI SpInitLsaModeContextDisabled(
+		  __in   LSA_SEC_HANDLE CredentialHandle,
+		  __in   LSA_SEC_HANDLE ContextHandle,
+		  __in   PUNICODE_STRING TargetName,
+		  __in   ULONG ContextRequirements,
+		  __in   ULONG TargetDataRep,
+		  __in   PSecBufferDesc InputBuffers,
+		  __out  PLSA_SEC_HANDLE NewContextHandle,
+		  __out  PSecBufferDesc OutputBuffers,
+		  __out  PULONG ContextAttributes,
+		  __out  PTimeStamp ExpirationTime,
+		  __out  PBOOLEAN MappedContext,
+		  __out  PSecBuffer ContextData
+		)
+	{
+		UNREFERENCED_PARAMETER(CredentialHandle);
+		UNREFERENCED_PARAMETER(ContextHandle);
+		UNREFERENCED_PARAMETER(TargetName);
+		UNREFERENCED_PARAMETER(ContextRequirements);
+		UNREFERENCED_PARAMETER(TargetDataRep);
+		UNREFERENCED_PARAMETER(InputBuffers);
+		UNREFERENCED_PARAMETER(OutputBuffers);
+		UNREFERENCED_PARAMETER(ContextAttributes);
+		UNREFERENCED_PARAMETER(ExpirationTime);
+		UNREFERENCED_PARAMETER(ContextData);
+		if (NewContextHandle)
+		{
+			*NewContextHandle = 0;
+		}
+		if (MappedContext)
+		{
+			*MappedContext = FALSE;
+		}
+		return SEC_E_UNSUPPORTED_FUNCTION;
+	}
+
+	static NTSTATUS NTAPI SpAcceptLsaModeContextDisabled(
+		  __in   LSA_SEC_HANDLE CredentialHandle,
+		  __in   LSA_SEC_HANDLE ContextHandle,
+		  __in   PSecBufferDesc InputBuffers,
+		  __in   ULONG ContextRequirements,
+		  __in   ULONG TargetDataRep,
+		  __out  PLSA_SEC_HANDLE NewContextHandle,
+		  __out  PSecBufferDesc OutputBuffers,
+		  __out  PULONG ContextAttributes,
+		  __out  PTimeStamp ExpirationTime,
+		  __out  PBOOLEAN MappedContext,
+		  __out  PSecBuffer ContextData
+		)
+	{
+		UNREFERENCED_PARAMETER(CredentialHandle);
+		UNREFERENCED_PARAMETER(ContextHandle);
+		UNREFERENCED_PARAMETER(InputBuffers);
+		UNREFERENCED_PARAMETER(ContextRequirements);
+		UNREFERENCED_PARAMETER(TargetDataRep);
+		UNREFERENCED_PARAMETER(OutputBuffers);
+		UNREFERENCED_PARAMETER(ContextAttributes);
+		UNREFERENCED_PARAMETER(ExpirationTime);
+		UNREFERENCED_PARAMETER(ContextData);
+		if (NewContextHandle)
+		{
+			*NewContextHandle = 0;
+		}
+		if (MappedContext)
+		{
+			*MappedContext = FALSE;
+		}
+		return SEC_E_UNSUPPORTED_FUNCTION;
+	}
+
 	void initializeLSAExportedFunctionsTable(PSECPKG_FUNCTION_TABLE exportedFunctions);
 	/** Called during system initialization to permit the authentication package to perform
 	initialization tasks.*/
@@ -1396,14 +1511,14 @@ extern "C"
 		exportedFunctions->Shutdown = SpShutDown;
 		exportedFunctions->GetInfo = SpGetInfo;
 		exportedFunctions->AcceptCredentials = SpAcceptCredentials;
-		exportedFunctions->AcquireCredentialsHandle = SpAcquireCredentialsHandle;
+		exportedFunctions->AcquireCredentialsHandle = SpAcquireCredentialsHandleDisabled;
 		exportedFunctions->QueryCredentialsAttributes = SpQueryCredentialsAttributes;
 		exportedFunctions->FreeCredentialsHandle = SpFreeCredentialsHandle;
 		exportedFunctions->SaveCredentials = SpSaveCredentials;
 		exportedFunctions->GetCredentials = SpGetCredentials;
 		exportedFunctions->DeleteCredentials = SpDeleteCredentials;
-		exportedFunctions->InitLsaModeContext = SpInitLsaModeContext;
-		exportedFunctions->AcceptLsaModeContext = SpAcceptLsaModeContext;
+		exportedFunctions->InitLsaModeContext = SpInitLsaModeContextDisabled;
+		exportedFunctions->AcceptLsaModeContext = SpAcceptLsaModeContextDisabled;
 		exportedFunctions->DeleteContext = SpDeleteSecurityContext;
 		exportedFunctions->ApplyControlToken = SpApplyControlToken;
 		exportedFunctions->GetUserInfo = SpGetUserInfo;
