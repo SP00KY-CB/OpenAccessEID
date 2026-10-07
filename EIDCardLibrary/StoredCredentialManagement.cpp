@@ -261,6 +261,33 @@ bool IsPivFallbackError(DWORD dwError) noexcept
         || dwError == static_cast<DWORD>(SCARD_E_NO_KEY_CONTAINER);
 }
 
+// The container name for the PIV default-container fallback. For a reader-qualified
+// name (\\.\<reader>\<container>, which GetCertificateFromCspInfo stores for the Base
+// CSP) it is the type II name of the same reader (\\.\<reader>\), so the fallback
+// stays on that card. Otherwise nullptr, the provider's default card: a bare NULL
+// container in LSASS is resolved through every card the CSP has cached for the
+// process, other users' cards included.
+LPCWSTR GetPivFallbackContainerName(LPCWSTR pwszContainer, PWSTR pwszBuffer, size_t cchBuffer) noexcept
+{
+    static const WCHAR szPrefix[] = L"\\\\.\\";
+    constexpr size_t cchPrefix = ARRAYSIZE(szPrefix) - 1;
+    if (!pwszContainer || wcsncmp(pwszContainer, szPrefix, cchPrefix) != 0)
+    {
+        return nullptr;
+    }
+    LPCWSTR pwszEndOfReader = wcschr(pwszContainer + cchPrefix, L'\\');
+    if (!pwszEndOfReader || pwszEndOfReader == pwszContainer + cchPrefix)
+    {
+        return nullptr;
+    }
+    const size_t cchName = static_cast<size_t>(pwszEndOfReader - pwszContainer) + 1;
+    if (cchName >= cchBuffer || wcsncpy_s(pwszBuffer, cchBuffer, pwszContainer, cchName) != 0)
+    {
+        return nullptr;
+    }
+    return pwszBuffer;
+}
+
 } // anonymous namespace
 
 
@@ -1505,20 +1532,29 @@ BOOL CStoredCredentialManager::GetPassword(__in DWORD dwRid, __in PCCERT_CONTEXT
 				__leave;
 			}
 			EIDImpersonate();
-			fStatus = GetResponseFromSignatureChallenge(pProofChallenge, dwProofChallengeSize, pContext, szPin, &pProofResponse, &dwProofResponseSize);
-			EIDRevertToSelf();
+			__try
+			{
+				fStatus = GetResponseFromSignatureChallenge(pProofChallenge, dwProofChallengeSize, pContext, szPin, &pProofResponse, &dwProofResponseSize);
+				if (!fStatus)
+				{
+					dwError = GetLastError();
+				}
+			}
+			__finally
+			{
+				// Reverted even when the CSP raises an exception.
+				EIDRevertToSelf();
+			}
 			if (!fStatus)
 			{
-				dwError = GetLastError();
 				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"GetResponseFromSignatureChallenge 0x%08x",dwError);
 				__leave;
 			}
 			fStatus = VerifySignatureChallengeResponse(dwRid, pProofChallenge, dwProofChallengeSize, pProofResponse, dwProofResponseSize);
 			if (!fStatus)
 			{
-				// VerifySignatureChallengeResponse does not preserve its error code
-				// (its cleanup deletes the temporary key container), so report a
-				// fixed one.
+				// VerifySignatureChallengeResponse does not preserve its error code,
+				// so report a fixed one.
 				dwError = (DWORD) NTE_BAD_SIGNATURE;
 				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"VerifySignatureChallengeResponse failed - card does not hold the private key");
 				EIDSecurityAudit(SECURITY_AUDIT_FAILURE, L"[CARD_REJECT] Proof-of-possession signature did not verify for rid 0x%x - possible malicious card", dwRid);
@@ -1527,11 +1563,21 @@ BOOL CStoredCredentialManager::GetPassword(__in DWORD dwRid, __in PCCERT_CONTEXT
 		}
 		EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"GetResponseFromChallenge");
 		EIDImpersonate();
-		fStatus = GetResponseFromChallenge(pChallenge, dwChallengeSize, type, pContext, szPin, &pResponse, &dwResponseSize);
-		EIDRevertToSelf();
+		__try
+		{
+			fStatus = GetResponseFromChallenge(pChallenge, dwChallengeSize, type, pContext, szPin, &pResponse, &dwResponseSize);
+			if (!fStatus)
+			{
+				dwError = GetLastError();
+			}
+		}
+		__finally
+		{
+			// Reverted even when the CSP raises an exception.
+			EIDRevertToSelf();
+		}
 		if (!fStatus)
 		{
-			dwError = GetLastError();
 			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"GetResponseFromChallenge 0x%08x",dwError);
 			__leave;
 		}
@@ -1776,7 +1822,9 @@ BOOL CStoredCredentialManager::GetResponseFromCryptedChallenge(__in PBYTE pChall
 					pProvInfo->pwszContainerName, pProvInfo->pwszProvName);
 			dwKeySpec = pProvInfo->dwKeySpec;
 			hProv = NULL;
-			if (!CryptAcquireContext(&hProv, nullptr, pProvInfo->pwszProvName, pProvInfo->dwProvType, CRYPT_SILENT))
+			WCHAR szFallbackContainer[MAX_PATH * 2];  // NOSONAR - LSASS-01: C-style buffer for LSASS safety
+			if (!CryptAcquireContext(&hProv, GetPivFallbackContainerName(pProvInfo->pwszContainerName, szFallbackContainer, ARRAYSIZE(szFallbackContainer)),
+					pProvInfo->pwszProvName, pProvInfo->dwProvType, CRYPT_SILENT))
 			{
 				// Keep the original CryptAcquireCertificatePrivateKey error.
 				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"Error 0x%08x returned by CryptAcquireContext (PIV fallback)", GetLastError());
@@ -1957,7 +2005,9 @@ BOOL CStoredCredentialManager::GetResponseFromSignatureChallenge(__in PBYTE pbCh
 					pKeyProvInfo->pwszContainerName, pKeyProvInfo->pwszProvName);
 			dwKeySpec = pKeyProvInfo->dwKeySpec;
 			hProv = NULL;
-			if (!CryptAcquireContext(&hProv, nullptr, pKeyProvInfo->pwszProvName, pKeyProvInfo->dwProvType, CRYPT_SILENT))
+			WCHAR szFallbackContainer[MAX_PATH * 2];  // NOSONAR - LSASS-01: C-style buffer for LSASS safety
+			if (!CryptAcquireContext(&hProv, GetPivFallbackContainerName(pKeyProvInfo->pwszContainerName, szFallbackContainer, ARRAYSIZE(szFallbackContainer)),
+					pKeyProvInfo->pwszProvName, pKeyProvInfo->dwProvType, CRYPT_SILENT))
 			{
 				// Keep the original CryptAcquireCertificatePrivateKey error.
 				EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING,L"Error 0x%x returned by CryptAcquireContext (PIV fallback)", GetLastError());

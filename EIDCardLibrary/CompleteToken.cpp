@@ -39,6 +39,8 @@
 #include "CompleteToken.h"
 
 BOOL NameToSid(WCHAR* UserName, PSID* pUserSid);
+static BOOL IsSidInDomain(PSID pSid, PSID pDomainSid);
+static BOOL IsLocalGroupSid(PSID pSid, PSID pAccountDomainSid);
 BOOL GetGroups(WCHAR* UserName,PGROUP_USERS_INFO_1 *lpGroupInfo, LPDWORD pTotalEntries);
 BOOL GetLocalGroups(WCHAR* UserName,PGROUP_USERS_INFO_0 *lpGroupInfo, LPDWORD pTotalEntries);
 BOOL GetPrimaryGroupSidFromUserSid(PSID UserSID, PSID *PrimaryGroupSID);
@@ -67,6 +69,7 @@ void DebugPrintSid(const WCHAR* Name, PSID Sid);
 	PBYTE Offset;
 	DWORD i;
 	LARGE_INTEGER ExpirationTime;
+	PSID pAccountDomainSid = nullptr;
 	// convert AccountName to WSTR
 	EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE, L"Convert");
 	WCHAR UserName[UNLEN+1];  // NOSONAR - LSASS-01: C-style buffer for LSASS safety
@@ -88,6 +91,7 @@ void DebugPrintSid(const WCHAR* Name, PSID Sid);
 		if (pGroupInfo) NetApiBufferFree(pGroupInfo);
 		if (pLocalGroupInfo) NetApiBufferFree(pLocalGroupInfo);
 		if (TokenInformation) EIDFree(TokenInformation);
+		if (pAccountDomainSid) EIDFree(pAccountDomainSid);
 	};
 
 	wcsncpy_s(UserName, ARRAYSIZE(UserName), AccountName->Buffer, AccountName->Length / 2);
@@ -161,6 +165,19 @@ void DebugPrintSid(const WCHAR* Name, PSID Sid);
 	// lift a Deny ACE that names it. Skipped entries stay NULL in pGroupSid
 	// and are compacted out when TOKEN_GROUPS is built, so the array has no
 	// holes; dwResolvedGroups is its real count.
+	//
+	// Groups are resolved by name, and LookupAccountName searches well-known
+	// names, BUILTIN, the account domain and then trusted domains. A local
+	// user's groups live only in BUILTIN or this machine's account domain, so
+	// a name that resolves anywhere else fails the logon rather than putting
+	// some other group's SID in the token.
+	pAccountDomainSid = EIDGetAccountDomainSid();
+	if (!pAccountDomainSid)
+	{
+		EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING, L"Account domain SID unavailable");
+		cleanup();
+		return EID::make_unexpected(HRESULT_FROM_WIN32(ERROR_INVALID_DATA));
+	}
 	DWORD dwResolvedGroups = 0;
 	for (i = 0; i < NumberOfGroups; i++)
 	{
@@ -180,6 +197,12 @@ void DebugPrintSid(const WCHAR* Name, PSID Sid);
 			}
 			pGroupSid[i] = nullptr;
 			continue;
+		}
+		if (!IsLocalGroupSid(pGroupSid[i], pAccountDomainSid))
+		{
+			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING, L"group %s resolved outside BUILTIN and the account domain - failing the logon", pGroupInfo[i].grui1_name);
+			cleanup();
+			return EID::make_unexpected(HRESULT_FROM_WIN32(ERROR_INVALID_DATA));
 		}
 		Size += GetLengthSid(pGroupSid[i]);
 		dwResolvedGroups++;
@@ -202,6 +225,12 @@ void DebugPrintSid(const WCHAR* Name, PSID Sid);
 			}
 			pGroupSid[NumberOfGroups + i] = nullptr;
 			continue;
+		}
+		if (!IsLocalGroupSid(pGroupSid[NumberOfGroups + i], pAccountDomainSid))
+		{
+			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING, L"local group %s resolved outside BUILTIN and the account domain - failing the logon", pLocalGroupInfo[i].grui0_name);
+			cleanup();
+			return EID::make_unexpected(HRESULT_FROM_WIN32(ERROR_INVALID_DATA));
 		}
 		Size += GetLengthSid(pGroupSid[NumberOfGroups + i]);
 		dwResolvedGroups++;
@@ -498,6 +527,41 @@ void DebugPrintSid(const WCHAR* Name, PSID Sid)
 	LocalFree(chSID);
 }
 
+// TRUE when this computer's NetBIOS name is one of the comma-separated names
+// in a usri4_workstations list. Fails closed if the name cannot be read.
+static BOOL IsComputerInWorkstationList(LPCWSTR pwszList)
+{
+	WCHAR szComputer[MAX_COMPUTERNAME_LENGTH + 1];  // NOSONAR - LSASS-01: C-style buffer for LSASS safety
+	DWORD cchComputer = ARRAYSIZE(szComputer);
+	if (!GetComputerNameW(szComputer, &cchComputer))
+	{
+		return FALSE;
+	}
+	LPCWSTR p = pwszList;
+	while (*p)
+	{
+		while (*p == L',' || *p == L' ')
+		{
+			p++;
+		}
+		LPCWSTR pStart = p;
+		while (*p && *p != L',')
+		{
+			p++;
+		}
+		LPCWSTR pEnd = p;
+		while (pEnd > pStart && pEnd[-1] == L' ')
+		{
+			pEnd--;
+		}
+		if (static_cast<DWORD>(pEnd - pStart) == cchComputer && _wcsnicmp(pStart, szComputer, cchComputer) == 0)
+		{
+			return TRUE;
+		}
+	}
+	return FALSE;
+}
+
 // Internal function using Result<T> for type-safe error handling
 // Marked noexcept for LSASS compatibility
 // Returns expiration time on success, HRESULT error on failure
@@ -630,6 +694,17 @@ void DebugPrintSid(const WCHAR* Name, PSID Sid)
 		}
 	}
 
+	// "Log On To" restriction: usri4_workstations is a comma-separated list of
+	// NetBIOS computer names, empty for any computer. (usri4_logon_server, checked
+	// below, is the logon server - always \\* for a local account - and was the
+	// only thing checked here, so the restriction was never applied to card logons.)
+	if (pUserInfo->usri4_workstations && pUserInfo->usri4_workstations[0] && !IsComputerInWorkstationList(pUserInfo->usri4_workstations))
+	{
+		EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING, L"STATUS_INVALID_WORKSTATION (Log On To)");
+		*SubStatus = STATUS_INVALID_WORKSTATION;
+		return EID::make_unexpected(HRESULT_FROM_NT(STATUS_ACCOUNT_RESTRICTION));
+	}
+
 	if (wcscmp(pUserInfo->usri4_logon_server, L"\\\\*") != 0)  // NOSONAR - STRING-01: escaped literal retained to preserve exact comparison
 	{
 		EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING, L"STATUS_INVALID_WORKSTATION");
@@ -658,24 +733,97 @@ NTSTATUS CheckAuthorization(PWSTR UserName, NTSTATUS *SubStatus, LARGE_INTEGER *
 	return EIDFailureHResultToNtStatus(result.error());
 }
 
+// TRUE for a SID directly in pDomainSid (the domain SID plus one RID).
+static BOOL IsSidInDomain(PSID pSid, PSID pDomainSid)
+{
+	if (!pSid || !pDomainSid || !IsValidSid(pSid) || !IsValidSid(pDomainSid))
+	{
+		return FALSE;
+	}
+	const UCHAR cDomain = *GetSidSubAuthorityCount(pDomainSid);
+	if (*GetSidSubAuthorityCount(pSid) != cDomain + 1
+		|| memcmp(GetSidIdentifierAuthority(pSid), GetSidIdentifierAuthority(pDomainSid), sizeof(SID_IDENTIFIER_AUTHORITY)) != 0)
+	{
+		return FALSE;
+	}
+	for (UCHAR i = 0; i < cDomain; i++)
+	{
+		if (*GetSidSubAuthority(pSid, i) != *GetSidSubAuthority(pDomainSid, i))
+		{
+			return FALSE;
+		}
+	}
+	return TRUE;
+}
 
+// TRUE for a group SID in BUILTIN (S-1-5-32-x) or in this machine's account domain.
+static BOOL IsLocalGroupSid(PSID pSid, PSID pAccountDomainSid)
+{
+	if (!pSid || !IsValidSid(pSid))
+	{
+		return FALSE;
+	}
+	static SID_IDENTIFIER_AUTHORITY NtAuthority = SECURITY_NT_AUTHORITY;
+	if (*GetSidSubAuthorityCount(pSid) == 2
+		&& memcmp(GetSidIdentifierAuthority(pSid), &NtAuthority, sizeof(NtAuthority)) == 0
+		&& *GetSidSubAuthority(pSid, 0) == SECURITY_BUILTIN_DOMAIN_RID)
+	{
+		return TRUE;
+	}
+	return IsSidInDomain(pSid, pAccountDomainSid);
+}
 
+PSID EIDGetAccountDomainSid()
+{
+	LSA_HANDLE hPolicy = nullptr;
+	PPOLICY_ACCOUNT_DOMAIN_INFO pDomainInfo = nullptr;
+	PSID pDomainSid = nullptr;
+	LSA_OBJECT_ATTRIBUTES ObjectAttributes;
+	memset(&ObjectAttributes, 0, sizeof(ObjectAttributes));
+	NTSTATUS status = LsaOpenPolicy(nullptr, &ObjectAttributes, POLICY_VIEW_LOCAL_INFORMATION, &hPolicy);  // NOSONAR - EXPLICIT-TYPE-01: NTSTATUS visible for security audit
+	if (status != STATUS_SUCCESS)
+	{
+		EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING, L"LsaOpenPolicy 0x%08x", status);
+		return nullptr;
+	}
+	status = LsaQueryInformationPolicy(hPolicy, PolicyAccountDomainInformation, reinterpret_cast<PVOID*>(&pDomainInfo));
+	if (status == STATUS_SUCCESS && pDomainInfo && pDomainInfo->DomainSid && IsValidSid(pDomainInfo->DomainSid))
+	{
+		const DWORD cbSid = GetLengthSid(pDomainInfo->DomainSid);
+		pDomainSid = static_cast<PSID>(EIDAlloc(cbSid));
+		if (pDomainSid && !CopySid(cbSid, pDomainSid, pDomainInfo->DomainSid))
+		{
+			EIDFree(pDomainSid);
+			pDomainSid = nullptr;
+		}
+	}
+	else
+	{
+		EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING, L"LsaQueryInformationPolicy 0x%08x", status);
+	}
+	if (pDomainInfo)
+	{
+		LsaFreeMemory(pDomainInfo);
+	}
+	LsaClose(hPolicy);
+	return pDomainSid;
+}
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+BOOL EIDGetLocalAccountRid(__in PSID pSid, __out PDWORD pdwRid)
+{
+	*pdwRid = 0;
+	PSID pDomainSid = EIDGetAccountDomainSid();
+	if (!pDomainSid)
+	{
+		SetLastError(ERROR_NONE_MAPPED);
+		return FALSE;
+	}
+	const BOOL fInDomain = IsSidInDomain(pSid, pDomainSid);
+	if (fInDomain)
+	{
+		*pdwRid = *GetSidSubAuthority(pSid, *GetSidSubAuthorityCount(pDomainSid));
+	}
+	EIDFree(pDomainSid);
+	SetLastError(fInDomain ? ERROR_SUCCESS : ERROR_NONE_MAPPED);
+	return fInDomain;
+}

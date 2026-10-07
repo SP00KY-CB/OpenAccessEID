@@ -137,6 +137,12 @@ BOOL CheckChainTrustStatus(__in PCCERT_CHAIN_CONTEXT pChainContext, __out DWORD*
 
     // Soft failures only - log and continue
     EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING, L"Chain has soft failures (0x%08x) - continuing", dwStatus);
+    if (dwStatus & (CERT_TRUST_REVOCATION_STATUS_UNKNOWN | CERT_TRUST_IS_OFFLINE_REVOCATION))
+    {
+        // Accepted only because RequireRevocationCheck is off. Make that visible:
+        // a certificate revoked at the CA still logs on until its CRL is imported.
+        EIDSecurityAudit(SECURITY_AUDIT_WARNING, L"[CERT_REVOCATION_UNKNOWN] Smart card certificate accepted without a revocation check (no current CRL installed, chain status 0x%08x); set RequireRevocationCheck to refuse it", dwStatus);
+    }
     return TRUE;
 }
 
@@ -193,6 +199,15 @@ BOOL IsPolicySoftFailure(__in DWORD dwPolicyError)
         return GetPolicyValue(GPOPolicy::RequireRevocationCheck) == 0;
 
     return FALSE;
+}
+
+// The named container is not on the card: the case the PIV default-container
+// fallback exists for (same set as IsPivFallbackError in StoredCredentialManagement.cpp).
+BOOL IsMissingContainerError(__in DWORD dwError)
+{
+    return dwError == static_cast<DWORD>(NTE_BAD_KEYSET)
+        || dwError == static_cast<DWORD>(NTE_KEYSET_NOT_DEF)
+        || dwError == static_cast<DWORD>(SCARD_E_NO_KEY_CONTAINER);
 }
 
 } // anonymous namespace
@@ -259,25 +274,47 @@ void InitChainValidationParams(ChainValidationParams* params)
 	DWORD DataSize = ARRAYSIZE(Data);
 	HCRYPTKEY phUserKey = NULL;  // Windows handle type - keep as NULL
 	BOOL fResult;
+	// The AllowSignatureOnlyKeys and CSP allow-list policies are checked by
+	// GetCertificateFromCspInfo before it impersonates the caller.
 
-	// check input
-	if (GetPolicyValue(GPOPolicy::AllowSignatureOnlyKeys) == 0 && pCspInfo->KeySpec == AT_SIGNATURE)
+	// For the Base CSP, name the reader as well as the container (\\.\<reader>\<container>).
+	// A bare container name, and above all the NULL-container fallback, is resolved
+	// through the cards the Base CSP has already cached for this process - in LSASS,
+	// other users' cards too - so the PIN could be tried on a card in another reader.
+	LPCTSTR szReaderName = EIDCspInfoStringAt(pCspInfo, dwCspDataLength, pCspInfo->nReaderNameOffset);
+	// (The credential provider sends the bare name PP_ENUMCONTAINERS returns; one that
+	// is already qualified is used as is.)
+	const BOOL fQualifyWithReader = (szReaderName && szReaderName[0] && szContainerName[0] != TEXT('\\')
+		&& _tcscmp(szProviderName, MS_SCARD_PROV) == 0);
+	TCHAR szQualifiedContainer[MAX_PATH * 2];  // NOSONAR - LSASS-01: C-style buffer for LSASS safety
+	TCHAR szReaderOnly[MAX_PATH * 2];  // NOSONAR - LSASS-01: C-style buffer for LSASS safety
+	LPCTSTR szAcquireName = szContainerName;
+	LPCTSTR szFallbackName = nullptr;
+	if (fQualifyWithReader)
 	{
-		EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING, L"Policy denies AT_SIGNATURE Key");
-		return EID::make_unexpected(HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED));
+		if (_sntprintf_s(szQualifiedContainer, ARRAYSIZE(szQualifiedContainer), _TRUNCATE, TEXT("\\\\.\\%s\\%s"), szReaderName, szContainerName) < 0
+			|| _sntprintf_s(szReaderOnly, ARRAYSIZE(szReaderOnly), _TRUNCATE, TEXT("\\\\.\\%s\\"), szReaderName) < 0)
+		{
+			EIDCardLibraryTrace(WINEVENT_LEVEL_ERROR, L"GetCertificateFromCspInfoInternal: reader or container name too long");
+			return EID::make_unexpected(E_INVALIDARG);
+		}
+		szAcquireName = szQualifiedContainer;
+		// Type II name: the default container of the card in that reader only.
+		szFallbackName = szReaderOnly;
 	}
-	// Security: Validate CSP provider before loading
-	if (!IsAllowedCSPProvider(szProviderName))
-	{
-		EIDCardLibraryTrace(WINEVENT_LEVEL_ERROR, L"CSP provider '%s' not allowed", szProviderName);
-		return EID::make_unexpected(HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED));
-	}
-	fResult = CryptAcquireContext(&hProv, szContainerName, szProviderName, PROV_RSA_FULL, CRYPT_SILENT);
+	fResult = CryptAcquireContext(&hProv, szAcquireName, szProviderName, PROV_RSA_FULL, CRYPT_SILENT);
 	if (!fResult)
 	{
-		EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING, L"CryptAcquireContext : 0x%08x container='%s' provider='%s'", GetLastError(), szContainerName, szProviderName);
+		const DWORD dwAcquireError = GetLastError();
+		EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING, L"CryptAcquireContext : 0x%08x container='%s' provider='%s'", dwAcquireError, szAcquireName, szProviderName);
+		// Fall back to the default container only when the named one does not exist
+		// (PIV cards), not on any error.
+		if (!IsMissingContainerError(dwAcquireError))
+		{
+			return EID::make_unexpected(HRESULT_FROM_WIN32(dwAcquireError));
+		}
 		EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE, L"PIV fallback");
-		fResult = CryptAcquireContext(&hProv, nullptr, szProviderName, PROV_RSA_FULL, CRYPT_SILENT);
+		fResult = CryptAcquireContext(&hProv, szFallbackName, szProviderName, PROV_RSA_FULL, CRYPT_SILENT);
 		if (!fResult)
 		{
 			EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING, L"CryptAcquireContext : 0x%08x", GetLastError());
@@ -318,8 +355,9 @@ void InitChainValidationParams(ChainValidationParams* params)
 		CryptReleaseContext(hProv, 0);
 		return EID::make_unexpected(hr);
 	}
-	// save reference to CSP (else we can't access private key)
-	if (!SetupCertificateContextWithKeyInfo(pCertContext, hProv, szProviderName, szContainerName, pCspInfo->KeySpec))
+	// save reference to CSP (else we can't access private key). The reader-qualified
+	// name is stored, so a later re-acquire from the key-prov info stays on this reader.
+	if (!SetupCertificateContextWithKeyInfo(pCertContext, hProv, szProviderName, szAcquireName, pCspInfo->KeySpec))
 	{
 		HRESULT hr = HRESULT_FROM_WIN32(GetLastError());
 		CertFreeCertificateContext(pCertContext);
@@ -339,20 +377,67 @@ void InitChainValidationParams(ChainValidationParams* params)
 	return pCertContext;
 }
 
+// The card work, run as the caller. Separate from GetCertificateFromCspInfo,
+// which needs __try/__finally: that cannot share a function with the Result<>.
+static PCCERT_CONTEXT GetCertificateFromCspInfoAsCaller(__in PEID_SMARTCARD_CSP_INFO pCspInfo, __in ULONG dwCspDataLength, __out PDWORD pdwError) noexcept
+{
+	auto result = GetCertificateFromCspInfoInternal(pCspInfo, dwCspDataLength);
+	if (result.has_value())
+	{
+		*pdwError = ERROR_SUCCESS;
+		return *result;
+	}
+	*pdwError = static_cast<DWORD>(result.error());
+	return nullptr;
+}
+
 // Exported wrapper maintaining PCCERT_CONTEXT return type with SetLastError
 PCCERT_CONTEXT GetCertificateFromCspInfo(__in PEID_SMARTCARD_CSP_INFO pCspInfo, __in ULONG dwCspDataLength)
 {
-	EIDImpersonate();
-	auto result = GetCertificateFromCspInfoInternal(pCspInfo, dwCspDataLength);
-	EIDRevertToSelf();
-
-	if (result.has_value())
+	PCCERT_CONTEXT pCertContext = nullptr;
+	DWORD dwError = ERROR_SUCCESS;
+	if (!EIDValidateCspInfo(pCspInfo, dwCspDataLength))
 	{
-		SetLastError(ERROR_SUCCESS);
-		return *result;
+		EIDCardLibraryTrace(WINEVENT_LEVEL_ERROR, L"GetCertificateFromCspInfo: CSP info layout rejected (CspDataLength=%u)", dwCspDataLength);
+		SetLastError(static_cast<DWORD>(E_INVALIDARG));
+		return nullptr;
 	}
-	SetLastError(static_cast<DWORD>(result.error()));
-	return nullptr;
+	LPCTSTR szProviderName = EIDCspInfoStringAt(pCspInfo, dwCspDataLength, pCspInfo->nCSPNameOffset);
+	if (!szProviderName)
+	{
+		SetLastError(static_cast<DWORD>(E_INVALIDARG));
+		return nullptr;
+	}
+	// The policies are read here, as LSASS, before impersonating. Read with a
+	// caller token that cannot open the policy key, they came back as "not
+	// configured", which switched both checks off.
+	if (GetPolicyValue(GPOPolicy::AllowSignatureOnlyKeys) == 0 && pCspInfo->KeySpec == AT_SIGNATURE)
+	{
+		EIDCardLibraryTrace(WINEVENT_LEVEL_WARNING, L"Policy denies AT_SIGNATURE Key");
+		SetLastError(static_cast<DWORD>(HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED)));
+		return nullptr;
+	}
+	// Security: Validate CSP provider before loading
+	if (!IsAllowedCSPProvider(szProviderName))
+	{
+		EIDCardLibraryTrace(WINEVENT_LEVEL_ERROR, L"CSP provider '%s' not allowed", szProviderName);
+		SetLastError(static_cast<DWORD>(HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED)));
+		return nullptr;
+	}
+	// Impersonate for terminal-server smart card redirection. The __finally
+	// reverts even when the CSP or minidriver raises an exception; otherwise
+	// the LSA thread would go on running as the caller.
+	EIDImpersonate();
+	__try
+	{
+		pCertContext = GetCertificateFromCspInfoAsCaller(pCspInfo, dwCspDataLength, &dwError);
+	}
+	__finally
+	{
+		EIDRevertToSelf();
+	}
+	SetLastError(dwError);
+	return pCertContext;
 }
 
 #define ERRORTOTEXT(ERROR) case ERROR: pszName = TEXT(#ERROR);                 break;
@@ -521,13 +606,16 @@ BOOL IsTrustedCertificate(__in PCCERT_CONTEXT pCertContext, __in_opt DWORD dwFla
 
 		// Build certificate chain using helper.
 		// Revocation (M1): check the chain (excluding the root) using ONLY locally cached/installed
-		// CRLs - CACHE_ONLY_URL_RETRIEVAL never touches the network, so this works on isolated
-		// machines where CRLs are distributed offline (e.g. via "EIDMigrate import-crl"). A revoked
-		// cert then fails hard (CERT_TRUST_IS_REVOKED); "revocation unknown" (no CRL cached) is
-		// soft-failed unless the RequireRevocationCheck policy is set (see CheckChainTrustStatus /
-		// IsPolicySoftFailure).
+		// CRLs, so this works on isolated machines where CRLs are distributed offline (e.g. via
+		// "EIDMigrate import-crl") and an LSA thread never waits on a CDP or OCSP URL named in the
+		// certificate. CACHE_ONLY_URL_RETRIEVAL alone does not do that: it covers AIA issuer
+		// retrieval only, and revocation still went to the network (15 s per URL) until
+		// REVOCATION_CHECK_CACHE_ONLY was added. A revoked cert fails hard (CERT_TRUST_IS_REVOKED);
+		// "revocation unknown" (no CRL cached) is soft-failed and audited unless the
+		// RequireRevocationCheck policy is set (see CheckChainTrustStatus / IsPolicySoftFailure).
 		DWORD dwChainFlags = CERT_CHAIN_ENABLE_PEER_TRUST
 			| CERT_CHAIN_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT
+			| CERT_CHAIN_REVOCATION_CHECK_CACHE_ONLY
 			| CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL;
 		pChainContext = BuildCertificateChain(hChainEngine, pCertContext, &params.ChainPara, dwChainFlags);
 		if (!pChainContext)
@@ -730,11 +818,10 @@ BOOL IsAllowedCSPProvider(__in LPCWSTR pwszProviderName)
 		// Microsoft Base Smart Card CSPs
 		L"Microsoft Base Smart Card Crypto Provider",
 		L"Microsoft Smart Card Key Storage Provider",
-		// Legacy Microsoft CSPs that may be used with smart cards
-		L"Microsoft Enhanced RSA and AES Cryptographic Provider",
-		L"Microsoft Enhanced Cryptographic Provider v1.0",
-		L"Microsoft Strong Cryptographic Provider",
-		L"Microsoft Base Cryptographic Provider v1.0",
+		// The general-purpose Microsoft software CSPs used to be listed here.
+		// They hold keys in the caller's profile, not on a card, so with the
+		// policy on they would still have allowed a "smart card" logon with no
+		// card. Enforcement now admits smart card providers only.
 		// Common third-party smart card CSPs
 		L"SafeNet RSA Full Cryptographic Provider",
 		L"Gemalto Classic Card CSP",

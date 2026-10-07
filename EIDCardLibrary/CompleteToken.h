@@ -30,3 +30,9 @@ NTSTATUS UserNameToToken(__in PLSA_UNICODE_STRING AccountName,
 // in *SubStatus; *ExpirationTime receives the latest time the resulting
 // logon may last. Every path that issues a token for an account must call it.
 NTSTATUS CheckAuthorization(PWSTR UserName, NTSTATUS *SubStatus, LARGE_INTEGER *ExpirationTime);
+
+// This machine's account-domain SID, in EIDAlloc memory (EIDFree it), or NULL.
+PSID EIDGetAccountDomainSid();
+// The RID of a SID directly in this machine's account domain (domain SID plus
+// one RID). FALSE, with ERROR_NONE_MAPPED, for any other SID.
+BOOL EIDGetLocalAccountRid(__in PSID pSid, __out PDWORD pdwRid);

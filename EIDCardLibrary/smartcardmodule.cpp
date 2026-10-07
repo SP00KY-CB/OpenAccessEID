@@ -393,6 +393,9 @@ MgScCardAuthenticatePin(
     
     LPSTR szPin = nullptr;
     DWORD cbPin = 0;
+    // Allocation size of szPin, kept apart from cbPin (which the second
+    // conversion overwrites) so the whole buffer can be wiped.
+    DWORD cbPinAlloc = 0;
 
     __try
     {
@@ -415,6 +418,7 @@ MgScCardAuthenticatePin(
         }
 
         CHECK_ALLOC(szPin = (LPSTR) _Alloc(cbPin));
+        cbPinAlloc = cbPin;
 
         if (0 == (cbPin = WideCharToMultiByte(
             CP_UTF8,
@@ -498,7 +502,11 @@ MgScCardAuthenticatePin(
     __finally
     {
         if (nullptr != szPin)
+        {
+            // The plaintext PIN must not stay behind in freed LSASS heap.
+            SecureZeroMemory(szPin, cbPinAlloc);
             _Free(szPin);
+        }
     }
 
     return status;
@@ -922,9 +930,18 @@ DWORD GetPinAttemptsAfterWrongPinIfPossible(PEID_SMARTCARD_CSP_INFO pCspInfo, UL
 	{
 		return 0xFFFFFFFF;
 	}
+	DWORD dwAttempts = 0xFFFFFFFF;
+	// The __finally reverts even if winscard or the card raises an exception, so
+	// the LSA thread never goes on running as the caller.
 	EIDImpersonate();
-	DWORD dwAttempts = GetPivPinAttempts(szReaderName);
-	EIDRevertToSelf();
+	__try
+	{
+		dwAttempts = GetPivPinAttempts(szReaderName);
+	}
+	__finally
+	{
+		EIDRevertToSelf();
+	}
 	return dwAttempts;
 }
 
@@ -964,10 +981,21 @@ NTSTATUS CheckPINandGetRemainingAttemptsIfPossible(PEID_SMARTCARD_CSP_INFO pCspI
 	{
 		return 0;
 	}
+	BOOL fReturn = FALSE;
+	DWORD dwError = 0;
+	dwAttempts = 0;
+	// Reverted in __finally: the minidriver is third-party code, and an
+	// exception in it must not leave the LSA thread impersonating the caller.
 	EIDImpersonate();
-	BOOL fReturn = CheckPINandGetRemainingAttempts(szReaderName, szCardName, szPin, &dwAttempts);
-	DWORD dwError = GetLastError();
-	EIDRevertToSelf();
+	__try
+	{
+		fReturn = CheckPINandGetRemainingAttempts(szReaderName, szCardName, szPin, &dwAttempts);
+		dwError = GetLastError();
+	}
+	__finally
+	{
+		EIDRevertToSelf();
+	}
 	if (fReturn)
 	{
 		return STATUS_SUCCESS;

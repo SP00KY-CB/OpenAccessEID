@@ -1592,6 +1592,18 @@ extern "C"
 			
 			EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"TokenInformation OK substatus = 0x%08X",*SubStatus);
 			*SubStatus = STATUS_SUCCESS;
+			// The token was built from the account NAME. Before that account's password is
+			// released, check it is the local account whose RID the certificate is bound to.
+			{
+				DWORD dwTokenRid = 0;
+				if (!EIDGetLocalAccountRid(MyTokenInformation->User.User.Sid, &dwTokenRid) || dwTokenRid != dwRid)
+				{
+					EIDSecurityAudit(SECURITY_AUDIT_FAILURE, L"[AUTH_ERROR] Smart card logon failed for user '%wZ': token account (rid 0x%x) is not the enrolled account (rid 0x%x)", *AccountName, dwTokenRid, dwRid);
+					MyLsaDispatchTable->FreeLsaHeap(MyTokenInformation);
+					MyTokenInformation = NULL;
+					return STATUS_LOGON_FAILURE;
+				}
+			}
 
 
 			EIDCardLibraryTrace(WINEVENT_LEVEL_VERBOSE,L"RID = 0x%x", dwRid);
